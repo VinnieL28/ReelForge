@@ -17,6 +17,7 @@ import re
 import copy
 import glob
 import time
+import logging
 import threading
 import traceback
 import tempfile
@@ -3765,7 +3766,12 @@ def _boot_admin_once() -> None:
             "\n  Sign in and change it under Admin > Users."
             "\n" + "=" * 66 + "\n"
         )
+        # Both stdout and the logger. print() alone is not reliable enough for
+        # the one credential the operator cannot recover any other way: it can
+        # sit in a buffer behind a redirect, and `docker logs` and a Windows
+        # service capture stderr more consistently than stdout.
         print(banner, flush=True)
+        logging.getLogger("reelforge.auth").warning(banner)
         st.session_state["_auth_first_run"] = True
 
 
