@@ -29,7 +29,18 @@ for the jar. Pick a template by hand if you'd rather.
 | ④ Balance Scale | One pan loads instantly and stops, the other loads slowly and never stops; the beam flips on the beat and wobbles as it settles |
 | ⑤ Gravity Funnel | A mote circling a throat, the orbit tightening and accelerating until it is gone in three frames |
 | ⑥ Domino Chain | Six tiles, each 1.46× the last, falling faster as they go — the final one is 6.6× the first |
-| ⑦ Dynamic AI Scene | Gemini writes the geometry from scratch: paths, followed dots, bars, text |
+| ⑦ Comparison Split | Three tiers doing the same work at three rates — only the bottom one finishes |
+| ⑧ The Steep Staircase | A figure walking up labelled stages, each lighting as it is passed |
+| ⑨ The Delusion Mirror | A plain figure beside the glowing, flexing version it sees in the mirror |
+| ⑩ The Chain & Anchor | A figure hauling named dead weight, until the chain lets go and it walks |
+| ⑪ Growth & Consistency | A figure watering at the same rate while a seed becomes a canopy |
+| ⑫ Dynamic AI Scene | Gemini writes the geometry from scratch: paths, followed dots, bars, text |
+
+Templates ⑦–⑪ put a stick figure on screen, drawn by `character_rig.py`. The
+model reaches for those when the concept is about a person doing something and
+for the abstract ones when it is about a quantity or a shape of change —
+verified live: 5/5 person-shaped topics chose a figure, 2/2 abstract chose a
+shape.
 
 Every scene runs the same three-beat structure, so the picture and the sound
 design cannot drift apart:
@@ -177,6 +188,7 @@ app.py            Streamlit UI, login gate, all five studios
 auth.py           password hashing, roles, user store, login rate limiting
 paths.py          project-relative paths and cross-platform font resolution
 motion_engine.py  the vector animation engine (Minimalist Motion)
+character_rig.py  the stick-figure rig: six poses, solved by forward kinematics
 video_engine.py   reframing, looping, captions, the duel engine
 audio_engine.py   TTS, synthesized music beds, SFX, ducking
 gemini_engine.py  scripts, scene specs, video grounding

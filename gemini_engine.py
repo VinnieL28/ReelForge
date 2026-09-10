@@ -594,6 +594,11 @@ def build_scene_prompt(concept: str, template: str = "auto",
             "concept. Do not default to the first one; a compounding idea wants "
             "a filling vessel, a trade-off wants two diverging paths, a "
             "cascade wants dominoes.\n\n"
+            "Five of them put a stick figure on screen. Reach for those when the "
+            "concept is about a person doing something — straining, climbing, "
+            "comparing themselves to someone, dragging something, tending "
+            "something — and for the abstract ones when it is about a quantity "
+            "or a shape of change.\n\n"
             f'  "metaphor_type": one of:\n{catalogue}\n\n'
         )
     else:
@@ -622,6 +627,16 @@ def build_scene_prompt(concept: str, template: str = "auto",
         '     balance_scale      {"left","right"}       what sits in each pan\n'
         '     gravity_funnel     {"pull"}               what is doing the pulling\n'
         '     domino_chain       {"first","last"}       the small cause, the large effect\n'
+        '     comparison_split   {"tier1","tier2","tier3"}   three approaches, worst '
+        "to best, e.g. BASIC / HARD / SMART\n"
+        '     steep_staircase    {"stage1".."stage5","summit"}   the five stages of '
+        "progression, and what waits at the top\n"
+        '     delusion_mirror    {"real","imagined","gap"}   what someone is, what '
+        "they picture, and the distance between\n"
+        '     chain_anchor       {"anchor1","anchor2","freed"}   the two dead weights '
+        "being dragged, and the state after letting go\n"
+        '     growth_consistency {"input","output"}   the unchanging effort, and what '
+        "it compounded into\n"
         "   Write these for THIS concept. Generic defaults exist and will be "
         "used if you leave them out, which is worse than filling them in.\n"
         '  "publish": {"title": high-CTR YouTube Shorts title under 70 chars, '

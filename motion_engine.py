@@ -30,6 +30,7 @@ from typing import Any, Callable, Sequence
 import numpy as np
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
+import character_rig as rig
 from paths import resolve_font
 from video_engine import _SCRATCH_RENDERS, purge_scratch_renders, video_encoder
 
@@ -562,6 +563,13 @@ LABEL_SLOTS: dict[str, dict[str, str]] = {
     "balance_scale": {"left": "NOW", "right": "LATER"},
     "gravity_funnel": {"pull": "PULL"},
     "domino_chain": {"first": "ONE PUSH", "last": "EVERYTHING"},
+    "comparison_split": {"tier1": "BASIC", "tier2": "HARD", "tier3": "SMART"},
+    "steep_staircase": {"stage1": "DAY 1", "stage2": "WEEK 1", "stage3": "MONTH 1",
+                        "stage4": "YEAR 1", "stage5": "YEAR 5", "summit": "MASTERY"},
+    "delusion_mirror": {"real": "WHO YOU ARE", "imagined": "WHO YOU THINK",
+                        "gap": "THE GAP"},
+    "chain_anchor": {"anchor1": "EXCUSES", "anchor2": "FEAR", "freed": "FREE"},
+    "growth_consistency": {"input": "SAME EFFORT", "output": "COMPOUNDED"},
     "custom": {},
 }
 
@@ -1200,6 +1208,365 @@ def scene_dominoes(frame: Frame, t: float, spec: dict[str, Any], duration: float
                mix(WHITE, fade(t, ph.impact - 0.5, 0.6)), tracking=4)
 
 
+# ---------------------------------------------------------------------------
+# Character metaphors
+#
+# The five below put the stick-figure rig on screen. The difference from the
+# geometric templates is not decoration: a figure straining against a chain
+# argues something an abstract curve cannot, because the viewer reads effort
+# from a body before they read it from a slope.
+# ---------------------------------------------------------------------------
+
+def _track(frame: Frame, x0: float, x1: float, y: float, fill: float,
+           colour: tuple[int, int, int], height: float = 26.0) -> None:
+    """A horizontal progress rail with a filled portion."""
+    frame.rect((x0, y - height / 2, x1, y + height / 2), DIM, width=3, radius=height / 2)
+    if fill > 0.004:
+        frame.rect((x0, y - height / 2, x0 + (x1 - x0) * clamp(fill), y + height / 2),
+                   colour, radius=height / 2)
+
+
+# --- 1. Comparison Split ----------------------------------------------------
+
+_TIERS = (
+    # (floor y, pose, label slot, share of the rail it reaches, facing)
+    (760.0, "idle", "tier1", 0.22),
+    (1090.0, "pushing", "tier2", 0.55),
+    (1420.0, "flexing", "tier3", 1.00),
+)
+_TIER_FIGURE_H = 200.0
+
+
+def scene_comparison(frame: Frame, t: float, spec: dict[str, Any], duration: float) -> None:
+    """Three tiers doing the same work at three different rates."""
+    ph = phases_of(spec, duration)
+    draw_ambient(frame, t, ph, spec)
+
+    for index, (floor, pose, slot, reach) in enumerate(_TIERS):
+        # Tiers arrive one after another so the comparison builds rather than
+        # appearing all at once.
+        appear = ph.lead + index * 0.55
+        alpha = fade(t, appear, 0.6)
+        if alpha <= 0.02:
+            continue
+
+        best = index == len(_TIERS) - 1
+        colour = mix(WHITE if best else GREY, alpha)
+
+        frame.line((90, floor), (990, floor), mix(DIM, alpha), 3)
+        rig.draw_figure(frame, pose, phase=(t * 0.9 + index * 0.3) % 1.0,
+                        anchor=(210, floor), height=_TIER_FIGURE_H,
+                        colour=colour, weight=5.0)
+
+        # Each tier moves at its own rate, and only the last one finishes.
+        progress = clamp((t - appear - 0.3) / max(ph.impact - appear - 0.3, 0.4))
+        fill = reach * (ease_out_cubic(progress) if best else ease_in_out(progress))
+        _track(frame, 360, 950, floor - 46, fill, colour)
+
+        frame.text(label(spec, slot), (380, floor - 122), 32,
+                   mix(WHITE if best else GREY, alpha), tracking=4)
+        if best and ph.after(t, 0.5) > 0:
+            frame.text("100%", (930, floor - 122), 30,
+                       mix(WHITE, ph.after(t, 0.5)), tracking=3)
+
+
+# --- 2. The Steep Staircase -------------------------------------------------
+
+_CLIMB_STEPS = 5
+_CLIMB_BOX = (150.0, 940.0, 640.0, 1420.0)      # left, right, top, floor
+
+
+def _climb_points() -> list[tuple[float, float]]:
+    left, right, top, floor = _CLIMB_BOX
+    run = (right - left) / _CLIMB_STEPS
+    rise = (floor - top) / _CLIMB_STEPS
+    points = [(left - 60, floor)]
+    for i in range(_CLIMB_STEPS):
+        x = left + i * run
+        y = floor - i * rise
+        points += [(x, y), (x, y - rise), (x + run, y - rise)]
+    return points
+
+
+def scene_climb(frame: Frame, t: float, spec: dict[str, Any], duration: float) -> None:
+    """A figure walking up labelled stages, one step at a time."""
+    ph = phases_of(spec, duration)
+    draw_ambient(frame, t, ph, spec)
+
+    left, right, top, floor = _CLIMB_BOX
+    run = (right - left) / _CLIMB_STEPS
+    rise = (floor - top) / _CLIMB_STEPS
+    steps = _climb_points()
+
+    reveal = ph.draw(t)
+    lengths = arc_lengths(steps)
+    frame.polyline(steps, DIM, 6)
+    frame.polyline(slice_to(steps, lengths, reveal), WHITE, 7)
+
+    # Stage labels on each tread, lighting as the figure passes them.
+    walk = ph.travel(t, ease_in_out)
+    reached = walk * _CLIMB_STEPS
+    slots = ("stage1", "stage2", "stage3", "stage4", "stage5")
+    for i in range(_CLIMB_STEPS):
+        text = label(spec, slots[i])
+        if not text:
+            continue
+        lit = clamp(reached - i)
+        frame.text(text, (left + i * run + run / 2, floor - i * rise - 42),
+                   28, mix(WHITE if lit > 0.5 else DIM, 0.35 + 0.65 * lit), tracking=3)
+
+    # The figure climbs tread by tread rather than gliding up the diagonal.
+    step_index = min(_CLIMB_STEPS - 1, int(reached))
+    within = reached - step_index
+    x = left + step_index * run + run * (0.25 + 0.5 * within)
+    y = floor - (step_index + 1) * rise
+    rig.draw_figure(frame, "walking", phase=(t * 1.5) % 1.0, anchor=(x, y),
+                    height=210, colour=WHITE, weight=6.0)
+
+    # At the top: the pose changes to say arrival.
+    if ph.after(t, 0.5) > 0.4:
+        # The upper-left is the empty quadrant of a rising staircase, and the
+        # figure finishes on the top tread at the right -- so the summit label
+        # goes left, not above it.
+        frame.text(label(spec, "summit"), (360, top + 90), 42,
+                   mix(WHITE, ph.after(t, 1.0)), tracking=6)
+
+
+# --- 3. The Delusion Mirror -------------------------------------------------
+
+_MIRROR_BOX = (560.0, 660.0, 960.0, 1400.0)     # left, top, right, bottom
+
+
+def scene_mirror(frame: Frame, t: float, spec: dict[str, Any], duration: float) -> None:
+    """What the figure is, beside what the figure believes it is."""
+    ph = phases_of(spec, duration)
+    draw_ambient(frame, t, ph, spec)
+
+    left, top, right, bottom = _MIRROR_BOX
+    grow = ph.travel(t, ease_out_cubic)
+
+    # The real figure, unchanged throughout.
+    rig.draw_figure(frame, "idle", phase=(t * 0.35) % 1.0, anchor=(300, 1400),
+                    height=330, colour=GREY, weight=6.0, facing=1)
+    frame.text(label(spec, "real"), (300, 1470), 34,
+               mix(GREY, fade(t, ph.lead + 0.3, 0.6)), tracking=4)
+
+    # The mirror.
+    frame.rect((left, top, right, bottom), mix(WHITE, 0.75), width=7, radius=14)
+    frame.rect((left + 16, top + 16, right - 16, bottom - 16), mix(WHITE, 0.18), width=3, radius=8)
+
+    # The reflection: bigger, brighter and flexing, and it keeps growing.
+    reflection_h = 300 + 190 * grow
+    glow_level = 0.45 + 0.55 * grow
+    skeleton = rig.draw_figure(
+        frame, "flexing", phase=(t * 0.8) % 1.0,
+        anchor=((left + right) / 2, bottom - 60), height=reflection_h,
+        colour=mix(WHITE, glow_level), weight=6.0 + 3.0 * grow, facing=-1,
+    )
+    # A halo that reads as self-flattery rather than as light.
+    for ring in range(3):
+        frame.circle(skeleton.head, skeleton.head_radius * (1.7 + ring * 0.85),
+                     mix(WHITE, glow_level * 0.30 / (ring + 1)), 3)
+
+    frame.text(label(spec, "imagined"), ((left + right) / 2, bottom + 48), 36,
+               mix(WHITE, fade(t, ph.lead + 0.8, 0.6) * glow_level), tracking=4)
+
+    # The gap between them, stated at the beat.
+    gap = ph.after(t, 0.8)
+    if gap > 0:
+        frame.line((380, 1160), (left - 30, 1160), mix(WHITE, gap * 0.7), 4)
+        frame.text(label(spec, "gap"), ((380 + left) / 2, 1120), 30,
+                   mix(WHITE, gap), tracking=4)
+
+
+# --- 4. The Chain & Anchor --------------------------------------------------
+
+_ANCHOR_SLOTS = ("anchor1", "anchor2")
+
+
+def _chain(frame: Frame, start: tuple[float, float], end: tuple[float, float],
+           links: int, colour: tuple[int, int, int], sag: float, width: float = 4.0) -> None:
+    """A run of links between two points, sagging when slack."""
+    for i in range(links):
+        u = (i + 0.5) / links
+        x = start[0] + (end[0] - start[0]) * u
+        y = start[1] + (end[1] - start[1]) * u + math.sin(math.pi * u) * sag
+        frame.ellipse((x, y), 15, 9, colour, width)
+
+
+def _anchor_block(frame: Frame, centre: tuple[float, float], size: float,
+                  colour: tuple[int, int, int], text: str, alpha: float,
+                  text_drop: float = 0.0) -> None:
+    """A dead weight with its name on it."""
+    x, y = centre
+    half = size / 2
+    top, base = half * 0.72, half
+    frame.polygon([(x - top, y - half * 0.7), (x + top, y - half * 0.7),
+                   (x + base, y + half * 0.7), (x - base, y + half * 0.7)],
+                  mix(WHITE, 0.10 * alpha))
+    frame.polyline([(x - top, y - half * 0.7), (x + top, y - half * 0.7),
+                    (x + base, y + half * 0.7), (x - base, y + half * 0.7),
+                    (x - top, y - half * 0.7)], colour, 6)
+    # A shackle on top and hatching inside: an outline alone reads as an empty
+    # crate, and the whole point is that the thing is heavy.
+    frame.circle((x, y - half * 0.7 - 22), 18, colour, 5)
+    frame.line((x - 18, y - half * 0.7 - 22), (x + 18, y - half * 0.7 - 22), colour, 4)
+    for k in range(1, 4):
+        share = k / 4
+        band_y = y - half * 0.7 + half * 1.4 * share
+        inset = top + (base - top) * share
+        frame.line((x - inset, band_y), (x + inset, band_y), mix(colour, 0.42), 3)
+    if text:
+        frame.text(text, (x, y + half * 0.7 + 52 + text_drop), 26, colour, tracking=2)
+
+
+def scene_chains(frame: Frame, t: float, spec: dict[str, Any], duration: float) -> None:
+    """Hauling named dead weight, until it lets go."""
+    ph = phases_of(spec, duration)
+    draw_ambient(frame, t, ph, spec)
+
+    floor = 1300.0
+    frame.line((60, floor), (1020, floor), mix(WHITE, 0.45), 6)
+
+    strain = ph.travel(t, ease_in_out)
+    snapped = ph.after(t, 1.1)
+
+    # The figure inches forward while it drags, then straightens once free.
+    x = 660 + strain * 120 + snapped * 130
+    pose = "struggling_chained" if snapped <= 0 else "walking"
+    skeleton = rig.draw_figure(
+        frame, pose, phase=(t * 1.3) % 1.0, anchor=(x, floor), height=460,
+        colour=WHITE, weight=8.0,
+    )
+
+    grip = min(skeleton.hand_l, skeleton.hand_r, key=lambda p: p[0])
+    anchors = [(300.0, floor - 96, 220.0), (120.0, floor - 74, 176.0)]
+
+    for index, (ax, ay, size) in enumerate(anchors):
+        alpha = fade(t, ph.lead + 0.3 + index * 0.25, 0.6)
+        if alpha <= 0.02:
+            continue
+        # After the snap the weights stay put and the links scatter.
+        colour = mix(GREY if snapped <= 0 else DIM, alpha)
+        _anchor_block(frame, (ax, ay), size, colour,
+                      label(spec, _ANCHOR_SLOTS[index]), alpha,
+                      text_drop=index * 46.0)
+
+        if snapped <= 0:
+            # Taut as the strain builds: the sag is what shows the effort, and
+            # it sags upward-bounded so a link never drops through the floor.
+            _chain(frame, (ax + size / 2, ay - size * 0.55), grip, 8 + index,
+                   mix(WHITE, 0.55 + 0.45 * strain), sag=42 * (1.0 - strain))
+        else:
+            for k in range(6):
+                spread = snapped * (90 + k * 26)
+                frame.ellipse((ax + size / 2 + spread, ay - size * 0.55 - spread * 0.55),
+                              15, 9, mix(GREY, (1.0 - snapped) * 0.8), 4)
+
+    if snapped > 0.25:
+        frame.text(label(spec, "freed"), (x + 40, floor - 540), 42,
+                   mix(WHITE, clamp((snapped - 0.25) / 0.5)), tracking=5)
+
+
+# --- 5. Growth & Consistency ------------------------------------------------
+
+_PLANT_ROOT = (700.0, 1380.0)
+
+
+def _tree(frame: Frame, root: tuple[float, float], growth: float,
+          colour: tuple[int, int, int]) -> None:
+    """
+    Seed to sapling to canopy, driven by one 0..1 parameter.
+
+    Branches are placed from a fixed table rather than a random walk: the same
+    growth value must draw the same tree on every frame, or it flickers.
+    """
+    x, y = root
+    if growth < 0.06:
+        frame.circle((x, y - 10), 12 * (0.4 + growth * 8), colour)
+        return
+
+    trunk = 60 + 430 * ease_out(growth)
+    frame.line((x, y), (x, y - trunk), colour, 7 + 5 * growth)
+
+    stages = (
+        # (height up the trunk, angle from vertical, length share, when it appears)
+        (0.42, -0.72, 0.40, 0.22), (0.42, 0.72, 0.40, 0.26),
+        (0.66, -0.60, 0.34, 0.42), (0.66, 0.60, 0.34, 0.46),
+        (0.86, -0.48, 0.26, 0.62), (0.86, 0.48, 0.26, 0.66),
+    )
+    for height, angle, share, appears in stages:
+        if growth < appears:
+            continue
+        local = clamp((growth - appears) / 0.25)
+        base = (x, y - trunk * height)
+        reach = trunk * share * local
+        tip = (base[0] + math.sin(angle) * reach, base[1] - math.cos(angle) * reach)
+        frame.line(base, tip, colour, 5 + 3 * local)
+        if local > 0.6:
+            frame.circle(tip, 16 * (local - 0.6) / 0.4, mix(colour, 0.8))
+
+    # The canopy arrives last and is what makes the payoff visible.
+    if growth > 0.72:
+        bloom = clamp((growth - 0.72) / 0.28)
+        for ring in range(3):
+            frame.ellipse((x, y - trunk * 0.86), (150 + ring * 46) * bloom,
+                          (110 + ring * 34) * bloom,
+                          mix(colour, 0.42 * bloom / (ring + 1)), 4)
+
+
+def _watering_can(frame: Frame, hand: tuple[float, float], tilt: float,
+                  colour: tuple[int, int, int]) -> tuple[float, float]:
+    """A small can hanging off the hand; returns where the spout points."""
+    x, y = hand
+    w, h = 54.0, 40.0
+    lean = 0.35 * tilt
+    dx, dy = math.cos(lean), math.sin(lean)
+    corners = [
+        (x - w * 0.2 * dx, y - h * 0.2),
+        (x + w * 0.8 * dx, y - h * 0.2 + w * 0.8 * dy),
+        (x + w * 0.8 * dx, y + h * 0.8 + w * 0.8 * dy),
+        (x - w * 0.2 * dx, y + h * 0.8),
+    ]
+    frame.polyline(corners + [corners[0]], colour, 4)
+    spout = (corners[1][0] + 34 * dx, corners[1][1] + 22 + 34 * dy)
+    frame.line(corners[1], spout, colour, 4)
+    return spout
+
+
+def scene_growth(frame: Frame, t: float, spec: dict[str, Any], duration: float) -> None:
+    """A seed watered every day until it is a tree."""
+    ph = phases_of(spec, duration)
+    draw_ambient(frame, t, ph, spec)
+
+    floor = _PLANT_ROOT[1]
+    frame.line((80, floor), (1000, floor), mix(WHITE, 0.45), 5)
+
+    growth = ph.travel(t, ease_in_out)
+    _tree(frame, _PLANT_ROOT, growth, WHITE)
+
+    # The figure keeps watering at the same rate the whole way through, which
+    # is the argument: the input never changed, only what it was compounding.
+    pour = (t * 1.1) % 1.0
+    skeleton = rig.draw_figure(frame, "watering_plant", phase=pour, anchor=(300, floor),
+                               height=340, colour=GREY, weight=6.0)
+    spout = _watering_can(frame, skeleton.hand_r, 0.5 + 0.5 * math.sin(pour * 2 * math.pi), GREY)
+
+    # Droplets, arcing from the spout toward the root.
+    for k in range(5):
+        drop = ((t * 1.6) + k * 0.2) % 1.0
+        dx = spout[0] + (_PLANT_ROOT[0] - 120 - spout[0]) * drop
+        dy = spout[1] + 240 * drop * drop
+        if dy < floor:
+            frame.circle((dx, dy), 6, mix(GREY, 1.0 - drop * 0.6))
+
+    frame.text(label(spec, "input"), (300, floor + 62), 30,
+               mix(GREY, fade(t, ph.lead + 0.4, 0.6)), tracking=4)
+    if growth > 0.7:
+        frame.text(label(spec, "output"), (_PLANT_ROOT[0], floor + 62), 34,
+                   mix(WHITE, clamp((growth - 0.7) / 0.25)), tracking=4)
+
+
 SceneFn = Callable[[Frame, float, dict[str, Any], float], None]
 
 # The metaphor library.
@@ -1275,8 +1642,63 @@ TEMPLATES: dict[str, dict[str, Any]] = {
         "climax": 0.86,
         "suits": "leverage, small starts, cascading consequences",
     },
+    "comparison_split": {
+        "label": "⑦ Comparison Split",
+        "blurb": "Three tiers doing the same work at three different rates. Only "
+                 "the bottom one finishes.",
+        "fn": scene_comparison,
+        "title": "THREE WAYS TO WORK",
+        "subtitle": "same hours, three outcomes",
+        "payoff": "Effort is not the variable.",
+        "climax": 0.80,
+        "suits": "comparing approaches, working hard versus working well, tiers of skill",
+    },
+    "steep_staircase": {
+        "label": "⑧ The Steep Staircase",
+        "blurb": "A figure walking up labelled stages one tread at a time, each "
+                 "lighting as it is passed.",
+        "fn": scene_climb,
+        "title": "ONE STEP AT A TIME",
+        "subtitle": "the stages nobody skips",
+        "payoff": "There is no lift.",
+        "climax": 0.84,
+        "suits": "progression, stages of mastery, the long route with no shortcut",
+    },
+    "delusion_mirror": {
+        "label": "⑨ The Delusion Mirror",
+        "blurb": "A plain figure beside the glowing, flexing version it sees in "
+                 "the mirror -- and the gap between them.",
+        "fn": scene_mirror,
+        "title": "THE GAP",
+        "subtitle": "between who you are and who you think you are",
+        "payoff": "Close it with reps, not with belief.",
+        "climax": 0.78,
+        "suits": "self-image, delusion, the difference between confidence and competence",
+    },
+    "chain_anchor": {
+        "label": "⑩ The Chain & Anchor",
+        "blurb": "A figure hauling named dead weight, until the chain lets go and "
+                 "it straightens up and walks.",
+        "fn": scene_chains,
+        "title": "WHAT YOU DRAG",
+        "subtitle": "you chose to pick up",
+        "payoff": "Put it down. Then move.",
+        "climax": 0.76,
+        "suits": "excuses, fear, baggage, the things slowing someone down",
+    },
+    "growth_consistency": {
+        "label": "⑪ Growth & Consistency",
+        "blurb": "A figure watering at the same rate all the way through while a "
+                 "seed becomes a canopy.",
+        "fn": scene_growth,
+        "title": "SAME WATER",
+        "subtitle": "every single day",
+        "payoff": "The input never changed.",
+        "climax": 0.86,
+        "suits": "patience, consistency, tending something before it shows anything",
+    },
     "custom": {
-        "label": "⑦ Dynamic AI Scene",
+        "label": "⑫ Dynamic AI Scene",
         "blurb": "Gemini writes the geometry from scratch: paths, followed dots, "
                  "bars and text placed for your concept alone.",
         "fn": scene_custom,
@@ -1293,6 +1715,15 @@ TEMPLATES: dict[str, dict[str, Any]] = {
 METAPHOR_TYPES: tuple[str, ...] = (
     "staircase_progress", "compounding_jar", "balance_scale",
     "split_path", "gravity_funnel", "domino_chain",
+    # Character metaphors -- these put the rig on screen.
+    "comparison_split", "steep_staircase", "delusion_mirror",
+    "chain_anchor", "growth_consistency",
+)
+
+# The five that use the stick-figure rig, for the UI to group them.
+CHARACTER_TYPES: tuple[str, ...] = (
+    "comparison_split", "steep_staircase", "delusion_mirror",
+    "chain_anchor", "growth_consistency",
 )
 
 # The old keys, kept so ledger entries and saved session state from before the
