@@ -20,6 +20,8 @@ from typing import Any, Callable
 from dotenv import load_dotenv
 from google import genai
 
+from motion_engine import METAPHOR_TYPES, TEMPLATES
+
 # Load .env next to this file so the key is available before Client() is built;
 # genai.Client() reads GEMINI_API_KEY (or GOOGLE_API_KEY) from the environment.
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
@@ -523,19 +525,19 @@ SCENE_PRESETS: dict[str, dict[str, str]] = {
         "label": "Compounding & Consistency (1% Daily)",
         "concept": "How 1% better every day compounds into 37x over a year, "
                    "and why the first three months look like nothing is happening",
-        "template": "vessel",
+        "template": "compounding_jar",
     },
     "pain_freedom": {
         "label": "Short-term Pain vs. Long-term Freedom",
         "concept": "Five years of deliberate discomfort buying fifty years of freedom, "
                    "versus the comfortable road that collapses later",
-        "template": "curve",
+        "template": "split_path",
     },
     "discipline": {
         "label": "Discipline vs. Motivation",
         "concept": "Motivation is a feeling that arrives late; discipline is a system "
                    "that runs whether the feeling shows up or not",
-        "template": "staircase",
+        "template": "staircase_progress",
     },
     "overthinking": {
         "label": "Overthinking vs. Action",
@@ -545,58 +547,105 @@ SCENE_PRESETS: dict[str, dict[str, str]] = {
     },
 }
 
-SCENE_TEMPLATE_KEYS = ("curve", "vessel", "staircase", "custom")
+# Imported rather than restated: the prompt lists exactly the metaphors the
+# renderer can draw, so a model choice can never name a template that does not
+# exist. `suits` is the one-line hint the model picks on.
+SCENE_METAPHORS: dict[str, dict[str, str]] = {
+    key: {"label": str(TEMPLATES[key]["label"]), "suits": str(TEMPLATES[key]["suits"])}
+    for key in METAPHOR_TYPES
+}
+SCENE_TEMPLATE_KEYS = tuple(METAPHOR_TYPES) + ("custom", "auto")
 
 # Shorts retention: long enough to say something, short enough to loop.
 SCENE_MIN_SECONDS, SCENE_MAX_SECONDS = 15.0, 25.0
 
 
-def build_scene_prompt(concept: str, template: str = "curve",
+def build_scene_prompt(concept: str, template: str = "auto",
                        duration: float = 18.0) -> str:
     """
-    Asks for a scene spec as JSON.
+    Asks for an animation blueprint as JSON.
 
-    The custom template gets the full vector schema; the three built-in
-    templates only need copy and timing, since their geometry is already drawn
-    in code -- asking a model to re-specify it would only add ways to fail.
+    When `template` is "auto" the model picks the metaphor. That is the whole
+    point: told to use one, it produced the same shape for every topic and only
+    the words changed. Given the choice it reaches for the geometry that fits
+    the argument.
+
+    The six named metaphors have their geometry drawn in code, so for those the
+    model supplies copy, timing and phase boundaries. "custom" gets the full
+    vector schema instead.
     """
     duration = max(SCENE_MIN_SECONDS, min(SCENE_MAX_SECONDS, float(duration)))
+    catalogue = "\n".join(
+        f'    "{key}": {spec["suits"]}' for key, spec in SCENE_METAPHORS.items()
+    )
+
     shared = (
-        "You write scripts for a faceless minimalist animation channel: white "
-        "vector lines on pure black, no faces, no stock footage, no music video "
-        "cliches. The tone is calm, certain and a little cold. Never use emoji, "
-        "hashtags or exclamation marks in the on-screen copy.\n\n"
+        "You design shorts for a faceless minimalist animation channel: white "
+        "vector lines on pure black, no faces, no stock footage. The tone is "
+        "calm, certain and a little cold. Never use emoji, hashtags or "
+        "exclamation marks in the on-screen copy.\n\n"
         f"CONCEPT: {concept.strip()}\n\n"
-        "Return ONE JSON object and nothing else. Fields:\n"
+        "Return ONE JSON object and nothing else.\n\n"
+    )
+
+    if template == "auto":
+        choose = (
+            "First choose the metaphor whose geometry actually argues this "
+            "concept. Do not default to the first one; a compounding idea wants "
+            "a filling vessel, a trade-off wants two diverging paths, a "
+            "cascade wants dominoes.\n\n"
+            f'  "metaphor_type": one of:\n{catalogue}\n\n'
+        )
+    else:
+        choose = f'  "metaphor_type": "{template}"\n\n'
+
+    common = (
         '  "title": 2-5 words, uppercase, the hook that stops the scroll\n'
         '  "subtitle": one short line under the title, sentence case\n'
-        '  "payoff": the closing line, 3-8 words, the idea in its hardest form\n'
+        '  "payoff": the closing line, 3-8 words, the idea at its hardest\n'
         '  "thesis": one spoken sentence, 18-32 words, what a narrator reads\n'
-        f'  "duration": seconds as a number between {SCENE_MIN_SECONDS:.0f} and {SCENE_MAX_SECONDS:.0f}\n'
-        '  "climax": seconds, the beat where the object clears the obstacle and '
-        "the sound effect should hit\n"
+        f'  "duration": seconds, between {SCENE_MIN_SECONDS:.0f} and {SCENE_MAX_SECONDS:.0f}\n'
+        '  "animation_phases": {"draw_end": seconds the geometry finishes '
+        'drawing itself, "impact": seconds the object clears the obstacle and '
+        'the sub-bass drops}. impact should land between 65% and 88% of the '
+        "duration -- early enough to pay off, late enough to have earned it.\n"
+        '  "ambient": 0.0 to 1.2, how strong the background grid and drifting '
+        "particles are. Use 1.0 normally, lower for a clinical look.\n"
+        '  "labels": the words stamped onto the geometry itself. One or two '
+        "words each, uppercase, 16 characters at most. Which slots exist "
+        "depends on the metaphor you chose:\n"
+        '     split_path         {"near","far","easy"}  e.g. {"near":"5 YEARS",'
+        '"far":"50 YEARS","easy":"COMFORT NOW"}\n'
+        '     compounding_jar    {"unit"}               the counter word: "DAY", "REP", "PAGE"\n'
+        '     staircase_progress {"before","after","left","right"}  the two '
+        "phase names, then the two bar captions\n"
+        '     balance_scale      {"left","right"}       what sits in each pan\n'
+        '     gravity_funnel     {"pull"}               what is doing the pulling\n'
+        '     domino_chain       {"first","last"}       the small cause, the large effect\n'
+        "   Write these for THIS concept. Generic defaults exist and will be "
+        "used if you leave them out, which is worse than filling them in.\n"
         '  "publish": {"title": high-CTR YouTube Shorts title under 70 chars, '
         '"description": 2-3 sentences of psychological framing, '
         '"hashtags": array of 5-8 tags each starting with #}\n'
     )
 
     if template != "custom":
-        return shared + (
-            f'  "template": "{template}"\n\n'
-            "The animation geometry is already built for this template. Supply the "
-            "copy and timing only; do not include an elements array."
+        return shared + choose + common + (
+            "\nThe geometry for every metaphor above is already animated in "
+            "code. Supply the copy, the timing and the phases only; do not "
+            "include an elements array."
         )
 
-    return shared + (
-        '  "template": "custom"\n'
+    return shared + '  "metaphor_type": "custom"\n\n' + common + (
         '  "elements": an array of 4-9 drawing commands, rendered in order\n\n'
-        "Element schema. All coordinates are 0..1 with (0,0) top-left; the canvas "
-        "is a 1080x1920 vertical frame, so keep content between y=0.30 and y=0.85 "
-        "to clear the title and the closing line. Colours: \"white\" or \"grey\". "
-        "Times are seconds.\n"
+        "Element schema. Coordinates are 0..1 with (0,0) top-left; the canvas "
+        "is a 1080x1920 vertical frame, so keep content between y=0.30 and "
+        'y=0.85 to clear the title and the closing line. Colours: "white" or '
+        '"grey". Times are seconds.\n'
         '  {"type":"path","id":"p1","points":[[x,y],...],"curve":true,'
         '"width":7,"colour":"white","from":1.0,"to":9.0}\n'
-        '  {"type":"dot","follows":"p1","radius":24,"colour":"white","from":1.0,"to":9.0}\n'
+        '  {"type":"dot","follows":"p1","radius":24,"colour":"white",'
+        '"from":1.0,"to":9.0}\n'
         '  {"type":"text","text":"FIVE YEARS","at":[0.5,0.78],"size":44,'
         '"colour":"grey","from":3.0,"to":12.0}\n'
         '  {"type":"circle","at":[0.5,0.55],"radius":0.18,"fill":false,'
@@ -641,7 +690,7 @@ def parse_scene_response(raw: str) -> dict[str, Any]:
 
 def generate_scene_spec(
     concept: str,
-    template: str = "curve",
+    template: str = "auto",
     duration: float = 18.0,
     progress: ProgressFn | None = None,
 ) -> dict[str, Any]:
@@ -653,7 +702,7 @@ def generate_scene_spec(
     render, because a metaphor animation with stock wording is still a video.
     """
     if template not in SCENE_TEMPLATE_KEYS:
-        template = "curve"
+        template = "auto"
 
     client = get_client()
     prompt = build_scene_prompt(concept, template, duration)
@@ -667,7 +716,20 @@ def generate_scene_spec(
             spec = parse_scene_response(getattr(response, "text", "") or "")
             if not spec:
                 raise GeminiError(f"{model} returned no JSON object")
-            spec["template"] = template
+            # Only pin the template when the caller asked for a specific
+            # one. On "auto" the model's metaphor_type is the answer -- forcing
+            # it here is what made every topic come out as the same shape.
+            chosen = str(spec.get("metaphor_type") or spec.get("template") or "").strip().lower()
+            if template != "auto":
+                spec["template"] = template
+            elif chosen in SCENE_TEMPLATE_KEYS and chosen != "auto":
+                spec["template"] = chosen
+            else:
+                # A model that ignored the list gets a deterministic choice
+                # rather than a silent fallback to the same default every time.
+                spec["template"] = METAPHOR_TYPES[
+                    sum(ord(c) for c in concept) % len(METAPHOR_TYPES)
+                ]
             spec["concept"] = concept
             spec["source"] = model
             return spec

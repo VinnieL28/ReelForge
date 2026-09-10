@@ -73,8 +73,11 @@ from compliance import (
 import auth
 from paths import EXPORTS_ROOT, ensure_dir
 from motion_engine import (
+    AUTO_TEMPLATE,
     DEFAULT_TEMPLATE,
+    METAPHOR_TYPES,
     TEMPLATES,
+    resolve_template,
     active_face_name,
     build_minimalist_video,
     estimate_render_seconds,
@@ -1016,7 +1019,7 @@ if "minimal" not in st.session_state:
     st.session_state.minimal = {
         "preset": None,
         "concept": "",
-        "template": DEFAULT_TEMPLATE,
+        "template": AUTO_TEMPLATE,
         "duration": 18,
         "bgm": True,
         "bgm_volume": 0.30,
@@ -3523,13 +3526,26 @@ def render_minimalist_studio() -> None:
 
         c1, c2 = st.columns([2, 1])
         with c1:
+            choices = [AUTO_TEMPLATE] + list(TEMPLATES.keys())
+            # Resolve through the alias table: a template name saved before the
+            # rename would otherwise not be found in `choices`, and the box
+            # would quietly reset to Auto -- discarding a choice the user or a
+            # preset had just made.
+            stored = str(state.get("template") or AUTO_TEMPLATE)
+            current = stored if stored == AUTO_TEMPLATE else resolve_template(stored)
             template = st.selectbox(
-                "Scene template", list(TEMPLATES.keys()),
-                index=list(TEMPLATES.keys()).index(str(state.get("template") or DEFAULT_TEMPLATE)),
-                format_func=lambda k: TEMPLATES[k]["label"], key="mm_template",
+                "Scene template", choices,
+                index=choices.index(current) if current in choices else 0,
+                format_func=lambda k: ("✨ Auto — let Gemini pick the metaphor"
+                                       if k == AUTO_TEMPLATE else str(TEMPLATES[k]["label"])),
+                key="mm_template",
+                help="Auto is the interesting one: the model reads your concept and "
+                     "reaches for the geometry that argues it, rather than dropping "
+                     "every topic into the same shape.",
             )
             state["template"] = template
-            st.caption(TEMPLATES[template]["blurb"])
+            st.caption("Gemini chooses from the six metaphors below based on your concept."
+                       if template == AUTO_TEMPLATE else str(TEMPLATES[template]["blurb"]))
         with c2:
             duration = st.slider(
                 "Length (s)", int(SCENE_MIN_SECONDS), int(SCENE_MAX_SECONDS),
@@ -3615,8 +3631,15 @@ def render_minimalist_studio() -> None:
 
         with b2:
             if st.button("🎬 Animate without AI", width="stretch", key="mm_local"):
+                # No model to choose with, so "auto" picks deterministically
+                # from the concept: the same words always give the same
+                # metaphor, and different words give different ones.
+                picked = str(state["template"])
+                if picked == AUTO_TEMPLATE:
+                    concept = str(state.get("concept") or "")
+                    picked = METAPHOR_TYPES[sum(ord(c) for c in concept) % len(METAPHOR_TYPES)]
                 spec = fallback_scene_spec(
-                    str(state.get("concept") or ""), str(state["template"]), float(state["duration"]),
+                    str(state.get("concept") or ""), picked, float(state["duration"]),
                 )
                 spec["publish"] = fallback_publish_meta(
                     str(state.get("concept") or ""), str(spec.get("title") or ""),
@@ -3645,11 +3668,12 @@ def render_minimalist_studio() -> None:
     # ---------------------------------------------------------------- OUTPUT
     result = state.get("result") or {}
     if result:
+        chosen = resolve_template(result.get("template"))
         stat_row([
+            ("Metaphor", str(TEMPLATES[chosen]["label"]).split(" ", 1)[-1], "violet"),
             ("Runtime", f"{float(result.get('duration', 0)):.1f}s", "cyan"),
             ("Frames", str(result.get("frames", 0)), ""),
-            ("Climax", f"{float(result.get('climax', 0)):.1f}s", "violet"),
-            ("Encoder", "GPU" if result.get("gpu") else "CPU", ""),
+            ("Climax", f"{float(result.get('climax', 0)):.1f}s", ""),
         ])
         if result.get("narration") and float(result.get("narration_trimmed", 0)) > 0:
             st.caption(f"Trimmed {float(result['narration_trimmed']):.2f}s of dead air "

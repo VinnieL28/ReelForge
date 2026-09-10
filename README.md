@@ -7,10 +7,48 @@ gate that refuses to call something publish-ready when it is not.
 | Engine | What it does |
 |---|---|
 | 🎙️ Commentary Machine | Gemini watches a clip and writes the commentary; TTS narrates it; kinetic captions burn in |
-| ◼️ Minimalist Motion | Draws a 1080×1920 vector animation from code — no footage, no stock, no model-generated imagery |
+| ◼️ Minimalist Motion | Draws a 1080×1920 vector animation from code — seven metaphor templates, no footage, no stock, no model-generated imagery |
 | 📦 Batch Studio | Queues topics and renders them back to back |
 | 🎬 Reel Studio | Slide-based reels from photos and licensed stock |
 | ⚔️ Versus Duel | Split-screen comparison shorts with animated stat badges |
+
+---
+
+## Minimalist Motion: the metaphor library
+
+Gemini reads your concept and **chooses** the geometry that argues it, rather
+than dropping every topic into the same shape. Ask for "why scrolling is hard
+to stop" and it reaches for the funnel; ask about compounding and it reaches
+for the jar. Pick a template by hand if you'd rather.
+
+| Template | Geometry and motion |
+|---|---|
+| ① Steep vs. Shallow Path | Two routes race — the steep one dips hard and ends high, the flat one cruises and ends on spikes |
+| ② Compounding Skill Jar | An outlined vessel filling on a real `1.01^n` curve with a live day counter and falling particles |
+| ③ Exponential Staircase | A figure pushing up consistent steps; effort stays linear while reward goes `u³` |
+| ④ Balance Scale | One pan loads instantly and stops, the other loads slowly and never stops; the beam flips on the beat and wobbles as it settles |
+| ⑤ Gravity Funnel | A mote circling a throat, the orbit tightening and accelerating until it is gone in three frames |
+| ⑥ Domino Chain | Six tiles, each 1.46× the last, falling faster as they go — the final one is 6.6× the first |
+| ⑦ Dynamic AI Scene | Gemini writes the geometry from scratch: paths, followed dots, bars, text |
+
+Every scene runs the same three-beat structure, so the picture and the sound
+design cannot drift apart:
+
+1. **Draw** — the geometry writes itself on, a trim-path from 0% to 100%
+2. **Travel** — the object moves along it under heavy cubic easing
+3. **Impact** — the milestone lands, and the sub-bass drop is placed on that
+   exact frame
+
+Gemini supplies the beat boundaries as `animation_phases`, and the words
+stamped onto the geometry as `labels` — so a video about instant versus
+delayed reward is labelled "NOW / FOREVER", not "5 YEARS / 50 YEARS".
+
+The glow is three Gaussian passes at different radii summed at half
+resolution: a bright core within a few pixels of the stroke, a soft body out
+to ~45px, and a faint atmosphere reaching 140px. One pass is either a tight rim
+or a wide wash and cannot be both, which is what makes single-pass bloom look
+like a filter. Behind it all sits a faint grid that pulses outward from the
+impact, and slow motes drifting up through the frame.
 
 ---
 

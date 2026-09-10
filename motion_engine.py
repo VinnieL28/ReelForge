@@ -44,16 +44,25 @@ BLACK: tuple[int, int, int] = (0, 0, 0)
 WHITE: tuple[int, int, int] = (255, 255, 255)
 GREY: tuple[int, int, int] = (136, 136, 136)          # #888888
 DIM: tuple[int, int, int] = (44, 44, 44)              # unreached path, ticks
-# Tuned by measuring the halo across a stroke: this gives a rim of ~37/255 at
-# 6px that is gone by 90px. Tighter settings were invisible on a 1080-wide
-# frame; wider ones stopped being an edge glow and became a bloom wash.
-GLOW_STRENGTH = 1.2
-GLOW_RADIUS = 24
-# The halo is computed at a quarter resolution and scaled back up. It is a soft
-# blur -- there is nothing in it above a quarter-res Nyquist -- and doing it at
-# full size cost 83ms a frame against 26ms this way.
-_GLOW_DIVISOR = 4
-_GLOW_LUT = [min(255, int(v * GLOW_STRENGTH)) for v in range(256)] * 3
+# The glow is three blurs, not one.
+#
+# A single Gaussian is either a tight rim or a wide wash and cannot be both,
+# which is what makes one-pass bloom look like a filter. Real light falls off
+# on more than one scale: a bright core within a few pixels of the stroke, a
+# soft body out to ~40px, and a faint atmosphere well beyond it. Summing three
+# passes at different radii gives that falloff, and because each is computed at
+# a fraction of the frame size the three together cost less than the one
+# full-resolution blur did.
+#
+# (radius in output pixels, weight, resolution divisor)
+GLOW_PASSES: tuple[tuple[float, float, int], ...] = (
+    (10.0, 0.85, 2),      # core: tight and bright, hugs the line
+    (30.0, 0.55, 4),      # body: the halo you actually read as glow
+    (90.0, 0.30, 8),      # atmosphere: lifts the black around a lit region
+)
+GLOW_STRENGTH = 1.0       # master multiplier over the three passes above
+_GLOW_LUTS = [[min(255, int(v * weight)) for v in range(256)] * 3
+              for _, weight, _ in GLOW_PASSES]
 
 # One reusable drawing surface per thread. Clearing a 2160x3840 buffer costs
 # 2.4ms against 14ms to allocate a fresh one, and a render draws hundreds.
@@ -139,6 +148,36 @@ def ease_out(t: float) -> float:
 def ease_in(t: float) -> float:
     t = clamp(t)
     return t * t * t
+
+
+def ease_out_cubic(t: float) -> float:
+    """Arrives fast, settles slowly. The default for anything that travels."""
+    t = clamp(t)
+    return 1.0 - (1.0 - t) ** 3
+
+
+def ease_in_cubic(t: float) -> float:
+    """Creeps, then goes. Gravity, and anything being pulled in."""
+    t = clamp(t)
+    return t ** 3
+
+
+def rush_into(t: float, bite: float = 4.5) -> float:
+    """
+    Hangs back, then covers the last third almost at once.
+
+    Sharper than ease_in_cubic: for the beat before an impact, where the
+    picture should feel like it is being yanked rather than falling.
+    """
+    t = clamp(t)
+    return (math.exp(bite * t) - 1.0) / (math.exp(bite) - 1.0)
+
+
+def overshoot(t: float, amount: float = 1.7) -> float:
+    """Goes past the mark and comes back -- weight, for anything that lands."""
+    t = clamp(t)
+    p = t - 1.0
+    return p * p * ((amount + 1) * p + amount) + 1.0
 
 
 def fade(t: float, start: float, attack: float = 0.45, hold: float = 1e9,
@@ -274,6 +313,17 @@ class Frame:
         else:
             self.draw.ellipse(box, outline=colour, width=max(1, int(width * s)))
 
+    def ellipse(self, centre: tuple[float, float], rx: float, ry: float,
+                colour: tuple[int, int, int] = WHITE, width: float = 0.0) -> None:
+        """An axis-aligned ellipse -- the funnel rings are circles in perspective."""
+        s = self.ss
+        cx, cy = centre[0] * s, centre[1] * s
+        box = (cx - rx * s, cy - ry * s, cx + rx * s, cy + ry * s)
+        if width <= 0:
+            self.draw.ellipse(box, fill=colour)
+        else:
+            self.draw.ellipse(box, outline=colour, width=max(1, int(width * s)))
+
     def rect(self, box: tuple[float, float, float, float],
              colour: tuple[int, int, int] = WHITE, width: float = 0.0,
              radius: float = 0.0) -> None:
@@ -344,19 +394,200 @@ class Frame:
 
     # -- output ------------------------------------------------------------
     def finish(self, glow: float = GLOW_STRENGTH) -> np.ndarray:
-        """Box-filters the supersampled canvas down and adds the bloom."""
+        """Box-filters the supersampled canvas down and adds the multi-pass bloom."""
         # reduce() is a dedicated box reduction: 14ms against 48ms for a
         # general resize at the same quality for an integer factor.
         sharp = self.image.reduce(self.ss) if self.ss > 1 else self.image
         if glow <= 0:
             return np.asarray(sharp, dtype=np.uint8)
 
-        halo = (sharp.reduce(_GLOW_DIVISOR)
-                .filter(ImageFilter.GaussianBlur(radius=GLOW_RADIUS / _GLOW_DIVISOR))
-                .resize((self.w, self.h), Image.Resampling.BILINEAR))
-        lut = _GLOW_LUT if glow == GLOW_STRENGTH else [min(255, int(v * glow)) for v in range(256)] * 3
-        # Saturating uint8 add in C beats the same sum in float32 numpy.
-        return np.asarray(ImageChops.add(sharp, halo.point(lut)), dtype=np.uint8)
+        # The three passes are summed at half resolution and upscaled once.
+        # Doing the LUT and the add at full size per pass costs three 6.2M-pixel
+        # upscales, three full-res LUTs and three full-res adds -- 137ms a frame
+        # against 47ms this way, for a halo that is soft enough that half
+        # resolution is indistinguishable.
+        half = (self.w // 2, self.h // 2)
+        halo: Image.Image | None = None
+        for index, (radius, weight, divisor) in enumerate(GLOW_PASSES):
+            blurred = (sharp.reduce(divisor)
+                       .filter(ImageFilter.GaussianBlur(radius=radius / divisor)))
+            if blurred.size != half:
+                blurred = blurred.resize(half, Image.Resampling.BILINEAR)
+            lut = (_GLOW_LUTS[index] if glow == GLOW_STRENGTH
+                   else [min(255, int(v * weight * glow)) for v in range(256)] * 3)
+            scaled = blurred.point(lut)
+            # Saturating uint8 add in C beats the same sum in float32 numpy.
+            halo = scaled if halo is None else ImageChops.add(halo, scaled)
+
+        if halo is None:
+            return np.asarray(sharp, dtype=np.uint8)
+        full = halo.resize((self.w, self.h), Image.Resampling.BILINEAR)
+        return np.asarray(ImageChops.add(sharp, full), dtype=np.uint8)
+
+
+# ---------------------------------------------------------------------------
+# Animation phases
+#
+# Every template runs the same three-beat structure, so the sound design and
+# the picture cannot drift apart: the drop is placed at `impact`, and `impact`
+# is where the picture pays off.
+#
+#   1. draw    the geometry writes itself on -- a trim-path from 0% to 100%
+#   2. travel  the object moves along it, heavy cubic easing
+#   3. impact  the milestone: the ball clears, the jar fills, the wall falls
+#   4. settle  the closing line lands and the frame holds
+# ---------------------------------------------------------------------------
+
+LEAD_IN = 1.1               # titles breathe before anything moves
+SETTLE_OUT = 2.2            # the closing beat
+
+
+class Phases:
+    """Where each beat starts and ends, in seconds, for one scene."""
+
+    __slots__ = ("lead", "draw_end", "impact", "end", "duration")
+
+    def __init__(self, duration: float, climax: float,
+                 draw_end: float | None = None) -> None:
+        self.duration = max(duration, 1.0)
+        self.lead = min(LEAD_IN, self.duration * 0.12)
+        self.end = max(self.lead + 0.5, self.duration - SETTLE_OUT)
+        self.impact = min(max(climax, self.lead + 0.4), self.duration - 0.3)
+        # The path finishes drawing before the object gets there, so the
+        # object always has somewhere left to travel to. A model-supplied
+        # draw_end is honoured, but never past the impact -- geometry still
+        # being drawn when the beat lands reads as a stall.
+        default = self.lead + (self.impact - self.lead) * 0.55
+        self.draw_end = (min(max(draw_end, self.lead + 0.2), self.impact - 0.15)
+                         if draw_end else default)
+
+    def draw(self, t: float) -> float:
+        """0..1 across the trim-path beat."""
+        return ease_in_out(clamp((t - self.lead) / max(self.draw_end - self.lead, 1e-6)))
+
+    def travel(self, t: float, easing: Callable[[float], float] | None = None) -> float:
+        """0..1 from the lead-in to the impact, eased hard by default."""
+        raw = clamp((t - self.lead) / max(self.impact - self.lead, 1e-6))
+        return (easing or ease_out_cubic)(raw)
+
+    def after(self, t: float, span: float = 1.0) -> float:
+        """0..1 in the `span` seconds following the impact."""
+        return clamp((t - self.impact) / max(span, 1e-6))
+
+    def tail(self, t: float) -> float:
+        """0..1 across the settle beat."""
+        return clamp((t - self.end) / max(self.duration - self.end, 1e-6))
+
+
+def phases_of(spec: dict[str, Any], duration: float) -> Phases:
+    return Phases(duration, float(spec.get("climax") or duration * 0.75),
+                  float(spec.get("draw_end") or 0.0) or None)
+
+
+# ---------------------------------------------------------------------------
+# Ambient layer
+#
+# A frame of pure geometry on pure black reads as a diagram. What makes these
+# channels feel alive is what is happening *behind* the subject: a grid that
+# breathes, dust drifting through the light. It costs a few milliseconds and
+# it is most of the difference between a chart and a film.
+# ---------------------------------------------------------------------------
+
+GRID_SPACING = 135.0
+GRID_COLOUR = (17, 17, 17)
+_DRIFT_SEED = 20260910
+
+
+def draw_grid(frame: Frame, t: float, phases: Phases, strength: float = 1.0) -> None:
+    """A faint lattice that pulses outward from the impact."""
+    if strength <= 0:
+        return
+
+    # The pulse: a ring of brightness expanding from the centre when the beat
+    # lands, so the drop is felt in the background as well as heard.
+    since = t - phases.impact
+    pulse = math.exp(-2.6 * since) if 0.0 <= since < 1.6 else 0.0
+    breathe = 0.72 + 0.28 * math.sin(2 * math.pi * 0.09 * t)
+    cx, cy = frame.w / 2, frame.h * 0.52
+
+    columns = int(frame.w / GRID_SPACING) + 2
+    rows = int(frame.h / GRID_SPACING) + 2
+
+    for i in range(columns):
+        x = i * GRID_SPACING
+        lift = pulse * math.exp(-((x - cx) / 420.0) ** 2) if pulse else 0.0
+        level = strength * breathe * (1.0 + 5.0 * lift)
+        frame.line((x, 0), (x, frame.h), mix(GRID_COLOUR, level), 2)
+    for j in range(rows):
+        y = j * GRID_SPACING
+        lift = pulse * math.exp(-((y - cy) / 520.0) ** 2) if pulse else 0.0
+        level = strength * breathe * (1.0 + 5.0 * lift)
+        frame.line((0, y), (frame.w, y), mix(GRID_COLOUR, level), 2)
+
+
+def draw_drift(frame: Frame, t: float, count: int = 26, strength: float = 1.0) -> None:
+    """
+    Slow motes rising through the frame.
+
+    Positions come from a fixed hash of the index rather than an RNG, so frame
+    N looks the same however it was reached -- a renderer that draws frames out
+    of order must not produce a different film.
+    """
+    if strength <= 0:
+        return
+    for i in range(count):
+        seed = (i * 2654435761 + _DRIFT_SEED) & 0xFFFFFFFF
+        x = (seed % 10007) / 10007.0
+        speed = 0.018 + ((seed >> 8) % 100) / 3400.0
+        phase = ((seed >> 16) % 1000) / 1000.0
+        size = 2.0 + ((seed >> 24) % 5) * 0.8
+
+        y = ((phase + t * speed) % 1.0)
+        # Fade in and out at the edges so nothing pops into existence.
+        alpha = math.sin(math.pi * y) ** 0.7
+        wobble = math.sin(t * 0.5 + i) * 14.0
+        frame.circle((x * frame.w + wobble, (1.0 - y) * frame.h), size,
+                     mix((92, 92, 92), alpha * 0.55 * strength))
+
+
+# The words each template writes onto its own geometry. Hardcoding these was
+# the other half of the sameness problem: the shape adapted to the topic and
+# then labelled itself "5 YEARS / 50 YEARS" regardless. Gemini fills the slots;
+# the defaults here are what a template says when nobody supplied anything.
+LABEL_SLOTS: dict[str, dict[str, str]] = {
+    "split_path": {"near": "5 YEARS", "far": "50 YEARS", "easy": "COMFORT NOW"},
+    "compounding_jar": {"unit": "DAY", "meter": "x"},
+    "staircase_progress": {"before": "RESISTANCE", "after": "LEVERAGE",
+                           "left": "EFFORT", "right": "REWARD"},
+    "balance_scale": {"left": "NOW", "right": "LATER"},
+    "gravity_funnel": {"pull": "PULL"},
+    "domino_chain": {"first": "ONE PUSH", "last": "EVERYTHING"},
+    "custom": {},
+}
+
+# Long labels break the composition they sit in, so they are capped rather
+# than wrapped -- these are stamps on a diagram, not sentences.
+LABEL_MAX_CHARS = 16
+
+
+def label(spec: dict[str, Any], slot: str, fallback: str = "") -> str:
+    """The text for one labelled slot, from the spec or the template default."""
+    supplied = spec.get("labels")
+    if isinstance(supplied, dict):
+        value = str(supplied.get(slot) or "").strip()
+        if value:
+            return value.upper()[:LABEL_MAX_CHARS]
+    defaults = LABEL_SLOTS.get(str(spec.get("template") or ""), {})
+    return (fallback or defaults.get(slot, "")).upper()[:LABEL_MAX_CHARS]
+
+
+def draw_ambient(frame: Frame, t: float, phases: Phases, spec: dict[str, Any]) -> None:
+    """The background pass every template runs before its own geometry."""
+    level = float(spec.get("ambient", 1.0) or 0.0)
+    if level <= 0:
+        return
+    draw_grid(frame, t, phases, level)
+    draw_drift(frame, t, strength=level)
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +651,9 @@ def _spikes(frame: Frame, x0: float, x1: float, base: float, height: float,
 
 def scene_curve(frame: Frame, t: float, spec: dict[str, Any], duration: float) -> None:
     """A ball takes the steep drop and ends high; the flat path ends on spikes."""
+    ph = phases_of(spec, duration)
+    draw_ambient(frame, t, ph, spec)
+
     pain = catmull_rom(_PAIN_CONTROL)
     easy = catmull_rom(_EASY_CONTROL)
     pain_len, easy_len = arc_lengths(pain), arc_lengths(easy)
@@ -448,13 +682,13 @@ def scene_curve(frame: Frame, t: float, spec: dict[str, Any], duration: float) -
 
     # Labels, tied to where the ball actually is rather than to the clock.
     if u > 0.16:
-        frame.text("5 YEARS", (430, 1580), 44,
+        frame.text(label(spec, "near"), (430, 1580), 44,
                    mix(GREY, fade(t, lead + span * 0.16, 0.5)), tracking=3)
     if u > 0.66:
-        frame.text("50 YEARS", (760, 690), 46,
+        frame.text(label(spec, "far"), (760, 690), 46,
                    mix(WHITE, fade(t, lead + span * 0.66, 0.5)), tracking=3)
     if easy_u > 0.78:
-        frame.text("COMFORT NOW", (312, 906), 36,
+        frame.text(label(spec, "easy"), (312, 906), 36,
                    mix(GREY, fade(t, lead + span * 0.64, 0.5)), tracking=3)
 
 
@@ -468,6 +702,9 @@ _JAR_DAYS = 365
 
 def scene_vessel(frame: Frame, t: float, spec: dict[str, Any], duration: float) -> None:
     """A jar filling on a 1.01^n curve: nothing, nothing, nothing, then everything."""
+    ph = phases_of(spec, duration)
+    draw_ambient(frame, t, ph, spec)
+
     left, top, right, bottom = _JAR
     lead = 1.1
     span = max(duration - lead - 2.2, 1.0)
@@ -509,7 +746,7 @@ def scene_vessel(frame: Frame, t: float, spec: dict[str, Any], duration: float) 
         y = top - 130 + phase / 0.62 * 130
         frame.circle((x, y), 7, mix(WHITE, 1.0 - phase / 0.62))
 
-    frame.text(f"DAY {day}", (frame.w / 2, 1524), 38, GREY, tracking=5)
+    frame.text(f'{label(spec, "unit")} {day}', (frame.w / 2, 1524), 38, GREY, tracking=5)
     frame.text(f"{growth:.2f}x", (frame.w / 2, 1600), 62,
                WHITE if level > 0.5 else GREY, tracking=2)
 
@@ -552,6 +789,9 @@ def _stick_figure(frame: Frame, foot: tuple[float, float], lean: float,
 
 def scene_staircase(frame: Frame, t: float, spec: dict[str, Any], duration: float) -> None:
     """Linear effort, exponential reward -- and the moment the slope flips."""
+    ph = phases_of(spec, duration)
+    draw_ambient(frame, t, ph, spec)
+
     stairs = _stair_points()
     lengths = arc_lengths(stairs)
     lead = 1.1
@@ -569,7 +809,7 @@ def scene_staircase(frame: Frame, t: float, spec: dict[str, Any], duration: floa
         bx, by = point_at(stairs, lengths, climb)
         frame.circle((bx, by - 34), 32, WHITE)
         _stick_figure(frame, (bx - 74, by), 1.0, GREY)
-        frame.text("RESISTANCE", (frame.w / 2, 700), 40, mix(GREY, caption), tracking=4)
+        frame.text(label(spec, "before"), (frame.w / 2, 700), 40, mix(GREY, caption), tracking=4)
     else:
         # Over the top: the sphere runs away downhill and the figure stands up.
         roll = ease_in(clamp((u - 0.80) / 0.20))
@@ -579,19 +819,19 @@ def scene_staircase(frame: Frame, t: float, spec: dict[str, Any], duration: floa
         frame.line((top_x, top_y), (top_x + 130, top_y + 360), GREY, 6)
         frame.circle((bx, by), 32 + roll * 8, WHITE)
         _stick_figure(frame, (top_x - 96, top_y), 1.0, WHITE)
-        frame.text("LEVERAGE", (frame.w / 2, 700), 46,
+        frame.text(label(spec, "after"), (frame.w / 2, 700), 46,
                    mix(WHITE, fade(t, lead + span * 0.82, 0.5)), tracking=6)
 
     # Effort is linear; reward is not. The crossing is the whole argument.
     base, height = 1600.0, 140.0
-    for i, (label, value, colour) in enumerate((
-        ("EFFORT", clamp(u), GREY),
-        ("REWARD", clamp(u ** 3.2), WHITE),
+    for i, (caption, value, colour) in enumerate((
+        (label(spec, "left"), clamp(u), GREY),
+        (label(spec, "right"), clamp(u ** 3.2), WHITE),
     )):
         x = 220 + i * 640
         frame.line((x, base), (x, base - height), DIM, 5)
         frame.line((x, base), (x, base - height * value), colour, 11)
-        frame.text(label, (x, base + 44), 26, colour, weight="light", tracking=3)
+        frame.text(caption, (x, base + 44), 26, colour, weight="light", tracking=3)
 
 
 # ---------------------------------------------------------------------------
@@ -618,6 +858,8 @@ def scene_custom(frame: Frame, t: float, spec: dict[str, Any], duration: float) 
     output: a missing "points" key must produce a plainer video, never a crash
     two hundred frames into a render.
     """
+    draw_ambient(frame, t, phases_of(spec, duration), spec)
+
     size = (frame.w, frame.h)
     paths: dict[str, tuple[list[tuple[float, float]], list[float]]] = {}
 
@@ -704,52 +946,377 @@ def scene_custom(frame: Frame, t: float, spec: dict[str, Any], duration: float) 
 
 
 # ---------------------------------------------------------------------------
-# Templates registry
+# Template -- The Balance Scale
+#
+# Immediate gratification against delayed payoff. The left pan loads fast and
+# stops; the right pan loads slowly and never stops. The beam tips the other
+# way at the impact, which is the whole argument in one movement.
 # ---------------------------------------------------------------------------
+
+_SCALE_PIVOT = (540.0, 880.0)
+_SCALE_ARM = 372.0
+_SCALE_MAX_TILT = 0.30              # radians
+_SCALE_STAND = 500.0                # pivot to floor
+_WEIGHT_W, _WEIGHT_H = 128.0, 34.0
+_WEIGHT_SLOTS = 5
+
+
+def _pan(frame: Frame, anchor: tuple[float, float], colour: tuple[int, int, int],
+         load: float) -> None:
+    """
+    A plate hanging on two cords, with weights stacked on top of it.
+
+    Stacked *on* the plate rather than drawn inside a trapezoid: a trapezoid
+    with rungs in it reads as a lampshade, and the whole point of the shot is
+    that one side is visibly carrying more than the other.
+    """
+    x, y = anchor
+    drop = 132.0
+    plate = y + drop
+    half = _WEIGHT_W * 0.72
+
+    frame.line((x - 6, y), (x - half * 0.8, plate), mix(colour, 0.5), 3)
+    frame.line((x + 6, y), (x + half * 0.8, plate), mix(colour, 0.5), 3)
+    frame.line((x - half, plate), (x + half, plate), colour, 8)
+
+    whole = int(load * _WEIGHT_SLOTS)
+    for i in range(min(whole, _WEIGHT_SLOTS)):
+        top = plate - (i + 1) * (_WEIGHT_H + 6)
+        frame.rect((x - _WEIGHT_W / 2, top, x + _WEIGHT_W / 2, top + _WEIGHT_H),
+                   colour, width=5, radius=5)
+    partial = load * _WEIGHT_SLOTS - whole
+    if 0.06 < partial and whole < _WEIGHT_SLOTS:
+        height = _WEIGHT_H * partial
+        top = plate - whole * (_WEIGHT_H + 6) - height
+        frame.rect((x - _WEIGHT_W / 2, top, x + _WEIGHT_W / 2, top + height),
+                   mix(colour, 0.45), width=4, radius=4)
+
+
+def scene_balance(frame: Frame, t: float, spec: dict[str, Any], duration: float) -> None:
+    """A scale that tips the other way once the slow side finally lands."""
+    ph = phases_of(spec, duration)
+    draw_ambient(frame, t, ph, spec)
+
+    px, py = _SCALE_PIVOT
+    floor = py + _SCALE_STAND
+
+    # Left: instant, then flat. Right: slow, then unstoppable.
+    u = ph.travel(t, ease_in_out)
+    now_load = ease_out(clamp(u / 0.26))
+    later_load = clamp(u ** 2.7) * 1.3
+
+    diff = clamp((later_load - now_load) * 0.95, -1.0, 1.0)
+    tilt = _SCALE_MAX_TILT * (ease_out_cubic(abs(diff)) * (1 if diff >= 0 else -1))
+    # A short wobble after the flip so it settles like a real beam.
+    since = t - ph.impact
+    if 0 <= since < 1.5:
+        tilt += math.sin(since * 10.0) * 0.038 * math.exp(-2.8 * since)
+
+    # Stand: an outline, not a filled wedge.
+    frame.line((px, py), (px - 92, floor), WHITE, 6)
+    frame.line((px, py), (px + 92, floor), WHITE, 6)
+    frame.line((px - 150, floor), (px + 150, floor), WHITE, 8)
+
+    # Beam.
+    dx, dy = math.cos(tilt) * _SCALE_ARM, math.sin(tilt) * _SCALE_ARM
+    left = (px - dx, py - dy)
+    right = (px + dx, py + dy)
+    frame.line(left, right, WHITE, 10)
+    frame.circle((px, py), 20, WHITE)
+    frame.circle((px, py), 34, mix(WHITE, 0.30), 3)
+
+    _pan(frame, left, GREY, now_load)
+    _pan(frame, right, WHITE, min(1.0, later_load))
+
+    won = ph.after(t, 0.7)
+    frame.text(label(spec, "left"), (left[0], left[1] + 132 + 54), 40,
+               mix(GREY, fade(t, ph.lead + 0.2, 0.5)), tracking=5)
+    frame.text(label(spec, "right"), (right[0], right[1] + 132 + 54), 44,
+               mix(WHITE, fade(t, ph.lead + 0.6, 0.5) * (0.5 + 0.5 * won)), tracking=5)
+
+
+# ---------------------------------------------------------------------------
+# Template -- The Gravity Funnel
+#
+# What pulls you in gets faster the closer you get. A mote circles a throat,
+# the orbit tightens, and past the point of no return it is gone in three
+# frames. Reads as a distraction sink or as compounding pull, depending on
+# the copy over it.
+# ---------------------------------------------------------------------------
+
+_FUNNEL_CENTRE = (540.0, 1030.0)
+_FUNNEL_TOP_R = 400.0
+_FUNNEL_RINGS = 9
+
+
+def scene_funnel(frame: Frame, t: float, spec: dict[str, Any], duration: float) -> None:
+    """Concentric rings narrowing to a throat, with a mote spiralling in."""
+    ph = phases_of(spec, duration)
+    draw_ambient(frame, t, ph, spec)
+
+    cx, cy = _FUNNEL_CENTRE
+    reveal = ph.draw(t)
+
+    # The funnel: ellipses shrinking and sinking, drawn from the rim inward as
+    # the trim-path beat runs.
+    for i in range(_FUNNEL_RINGS):
+        share = i / (_FUNNEL_RINGS - 1)
+        if reveal < share * 0.85:
+            break
+        radius = _FUNNEL_TOP_R * (1.0 - share) ** 1.55 + 16
+        depth = cy + share * 330
+        lit = 0.30 + 0.70 * share
+        frame.ellipse((cx, depth), radius, radius * 0.32, mix(WHITE, lit), 4)
+
+    # Walls, to read it as a solid rather than a stack of hoops.
+    for side in (-1, 1):
+        frame.line((cx + side * _FUNNEL_TOP_R, cy),
+                   (cx + side * 16, cy + 330), mix(WHITE, 0.45 * reveal), 4)
+
+    # The mote: angle accelerates and radius collapses as it falls in.
+    u = ph.travel(t, ease_in_cubic)
+    if u > 0.001:
+        turns = 3.4
+        angle = 2 * math.pi * turns * (u ** 1.9)
+        radius = _FUNNEL_TOP_R * (1.0 - u) ** 1.55 + 16
+        depth = cy + u * 330
+        mx = cx + math.cos(angle) * radius
+        my = depth + math.sin(angle) * radius * 0.32
+
+        # Trail: a few positions behind, fading.
+        for k in range(1, 7):
+            back = max(0.0, u - k * 0.022)
+            a2 = 2 * math.pi * turns * (back ** 1.9)
+            r2 = _FUNNEL_TOP_R * (1.0 - back) ** 1.55 + 16
+            d2 = cy + back * 330
+            frame.circle((cx + math.cos(a2) * r2, d2 + math.sin(a2) * r2 * 0.32),
+                         16 - k * 1.6, mix(WHITE, 0.30 * (1.0 - k / 7)))
+        frame.circle((mx, my), 20, WHITE)
+
+    # Past the throat: a burst, then nothing.
+    burst = ph.after(t, 0.75)
+    if 0 < burst < 1:
+        for i in range(12):
+            angle = 2 * math.pi * i / 12
+            reach = 40 + burst * 250
+            frame.circle((cx + math.cos(angle) * reach, cy + 330 + math.sin(angle) * reach * 0.35),
+                         7 * (1 - burst), mix(WHITE, 1 - burst))
+
+    frame.text(label(spec, "pull"), (cx, cy - _FUNNEL_TOP_R * 0.34 - 90), 38,
+               mix(GREY, fade(t, ph.lead + 0.3, 0.6)), tracking=6)
+
+
+# ---------------------------------------------------------------------------
+# Template -- The Domino Chain
+#
+# One small push topples something it could never have moved directly. Each
+# domino is 1.35x its neighbour, so the last is roughly eleven times the first
+# and the scale is the point.
+# ---------------------------------------------------------------------------
+
+_DOMINO_COUNT = 6
+_DOMINO_GROWTH = 1.46               # last tile is ~6.6x the first
+_DOMINO_GAP = 0.55                  # gap as a fraction of the tile that pushes
+_DOMINO_BOX = (90.0, 990.0)         # left, right
+_DOMINO_FLOOR = 1330.0
+_DOMINO_MAX_H = 520.0
+
+
+def _domino_layout() -> list[tuple[float, float, float]]:
+    """
+    (x, height, width) per tile, solved to fit the frame.
+
+    The sizes cannot be hard-coded: at 1.46x growth the eighth tile is taller
+    than the canvas and the last two fall clean off the right edge. So the
+    proportions are fixed and the whole run is scaled to the box, including
+    the room the final tile needs to lie down in.
+    """
+    raw_heights = [_DOMINO_GROWTH ** i for i in range(_DOMINO_COUNT)]
+    raw_gaps = [h * _DOMINO_GAP for h in raw_heights[:-1]]
+    # The last tile lands flat, so the run needs its full height to the right.
+    raw_extent = sum(raw_gaps) + raw_heights[-1]
+
+    left, right = _DOMINO_BOX
+    scale = min((right - left) / raw_extent, _DOMINO_MAX_H / raw_heights[-1])
+
+    tiles: list[tuple[float, float, float]] = []
+    x = left
+    for i, raw in enumerate(raw_heights):
+        height = raw * scale
+        tiles.append((x, height, max(10.0, height * 0.19)))
+        if i < len(raw_gaps):
+            x += raw_gaps[i] * scale
+    return tiles
+
+
+def scene_dominoes(frame: Frame, t: float, spec: dict[str, Any], duration: float) -> None:
+    """A cascade where every tile is bigger than the one that knocked it."""
+    ph = phases_of(spec, duration)
+    draw_ambient(frame, t, ph, spec)
+
+    tiles = _domino_layout()
+    span = max(ph.impact - ph.lead, 0.4)
+    # Each tile starts later than the last and the gaps shorten, so the chain
+    # accelerates the way a real one does.
+    starts = [ph.lead + span * (i / _DOMINO_COUNT) ** 1.4 for i in range(_DOMINO_COUNT)]
+    fall_time = span / _DOMINO_COUNT * 1.6
+
+    frame.line((_DOMINO_BOX[0] - 30, _DOMINO_FLOOR), (_DOMINO_BOX[1] + 30, _DOMINO_FLOOR),
+               mix(WHITE, 0.55), 5)
+
+    for i, (x, height, width) in enumerate(tiles):
+        progress = clamp((t - starts[i]) / fall_time)
+        # Gravity, not a linear tip: slow off the vertical, then it goes.
+        angle = (math.pi / 2) * ease_in_cubic(progress) * 0.94
+        standing = 1.0 - progress
+        lit = 0.42 + 0.58 * clamp(progress * 2.0)
+
+        sin_a, cos_a = math.sin(angle), math.cos(angle)
+        base = (x, _DOMINO_FLOOR)
+        corners = [
+            base,
+            (base[0] + width * cos_a, base[1] - width * sin_a),
+            (base[0] + width * cos_a + height * sin_a, base[1] - width * sin_a - height * cos_a),
+            (base[0] + height * sin_a, base[1] - height * cos_a),
+        ]
+        # A filled body so a fallen tile still reads as an object rather than
+        # as one more line in a pile of lines.
+        frame.polygon(corners, mix(WHITE, 0.06 + 0.10 * standing))
+        frame.polyline(corners + [corners[0]], mix(WHITE, lit), 5)
+
+    # The finger that starts it.
+    nudge = clamp((t - ph.lead) / 0.55)
+    if nudge < 1.0:
+        first_x = tiles[0][0]
+        tip = first_x - 26
+        frame.line((tip - 78 + nudge * 56, _DOMINO_FLOOR - tiles[0][1] * 0.7),
+                   (tip - 12 + nudge * 56, _DOMINO_FLOOR - tiles[0][1] * 0.7),
+                   mix(GREY, 1.0 - nudge), 7)
+
+    frame.text(label(spec, "first"), (tiles[0][0] + 60, _DOMINO_FLOOR + 74), 32,
+               mix(GREY, fade(t, ph.lead, 0.5)), tracking=4)
+    last_x, last_h, _ = tiles[-1]
+    frame.text(label(spec, "last"), (min(last_x + 40, frame.w - 170), _DOMINO_FLOOR - last_h - 60), 38,
+               mix(WHITE, fade(t, ph.impact - 0.5, 0.6)), tracking=4)
+
 
 SceneFn = Callable[[Frame, float, dict[str, Any], float], None]
 
+# The metaphor library.
+#
+# Keys are the metaphor_type names Gemini chooses from, so the model's answer
+# is the registry key with no translation layer in between. Each entry carries
+# its own copy, so a template is a complete short on its own even when the
+# model is unreachable.
 TEMPLATES: dict[str, dict[str, Any]] = {
-    "curve": {
-        "label": "The Curve of Pain vs. Comfort",
-        "blurb": "A ball takes the steep drop and ends high; the flat road ends on spikes.",
+    "split_path": {
+        "label": "① Steep vs. Shallow Path",
+        "blurb": "Two routes race: the steep one dips hard and ends high, the flat "
+                 "one cruises and ends on spikes.",
         "fn": scene_curve,
         "title": "5 YEARS OF PAIN",
         "subtitle": "buys fifty years of comfort",
         "payoff": "Choose your hard.",
         "climax": 0.72,
+        "suits": "trade-offs, delayed reward, two ways to spend the same decade",
     },
-    "vessel": {
-        "label": "The 1% Daily Vessel",
-        "blurb": "A jar filling on a 1.01^n curve: nothing, nothing, then everything.",
+    "compounding_jar": {
+        "label": "② Compounding Skill Jar",
+        "blurb": "An outlined vessel filling on a 1.01^n curve with a live day "
+                 "counter: nothing, nothing, then everything.",
         "fn": scene_vessel,
         "title": "1% BETTER",
         "subtitle": "every single day for a year",
         "payoff": "37x. That is the whole secret.",
         "climax": 0.88,
+        "suits": "compounding, habits, why early progress is invisible",
     },
-    "staircase": {
-        "label": "The Resistance Staircase",
-        "blurb": "Linear effort, exponential reward, and the moment the slope flips.",
+    "staircase_progress": {
+        "label": "③ Exponential Staircase",
+        "blurb": "A figure pushing up consistent steps while effort stays linear "
+                 "and reward goes vertical.",
         "fn": scene_staircase,
         "title": "PUSH LONG ENOUGH",
         "subtitle": "and the hill starts pushing back",
         "payoff": "Resistance becomes leverage.",
         "climax": 0.80,
+        "suits": "discipline, systems over motivation, slow steady effort",
+    },
+    "balance_scale": {
+        "label": "④ Balance Scale",
+        "blurb": "One pan loads instantly and stops; the other loads slowly and "
+                 "never stops. The beam flips on the beat.",
+        "fn": scene_balance,
+        "title": "NOW OR LATER",
+        "subtitle": "one of them keeps paying",
+        "payoff": "The slow pan always wins.",
+        "climax": 0.74,
+        "suits": "instant gratification, patience, choosing between two payoffs",
+    },
+    "gravity_funnel": {
+        "label": "⑤ Gravity Funnel",
+        "blurb": "A mote circling a throat, the orbit tightening until it is gone "
+                 "in three frames.",
+        "fn": scene_funnel,
+        "title": "THE PULL",
+        "subtitle": "gets stronger the closer you get",
+        "payoff": "Leave early. There is no late.",
+        "climax": 0.82,
+        "suits": "distraction, addiction, momentum you cannot escape",
+    },
+    "domino_chain": {
+        "label": "⑥ Domino Chain",
+        "blurb": "Eight tiles, each 1.35x the last, falling faster as they go. The "
+                 "final one is eleven times the first.",
+        "fn": scene_dominoes,
+        "title": "ONE SMALL PUSH",
+        "subtitle": "topples what you could never lift",
+        "payoff": "Start with the tile you can move.",
+        "climax": 0.86,
+        "suits": "leverage, small starts, cascading consequences",
     },
     "custom": {
-        "label": "Custom Gemini Vector",
-        "blurb": "Renders coordinates and commands the model writes for your concept.",
+        "label": "⑦ Dynamic AI Scene",
+        "blurb": "Gemini writes the geometry from scratch: paths, followed dots, "
+                 "bars and text placed for your concept alone.",
         "fn": scene_custom,
         "title": "",
         "subtitle": "",
         "payoff": "",
         "climax": 0.75,
+        "suits": "anything the six fixed metaphors do not fit",
     },
 }
 
-DEFAULT_TEMPLATE = "curve"
+# The six named metaphors Gemini picks between. "custom" is not in the list --
+# the model reaches it by being asked for one, not by choosing it.
+METAPHOR_TYPES: tuple[str, ...] = (
+    "staircase_progress", "compounding_jar", "balance_scale",
+    "split_path", "gravity_funnel", "domino_chain",
+)
+
+# The old keys, kept so ledger entries and saved session state from before the
+# rename still resolve instead of silently falling back to the default.
+TEMPLATE_ALIASES: dict[str, str] = {
+    "curve": "split_path",
+    "vessel": "compounding_jar",
+    "staircase": "staircase_progress",
+    "scale": "balance_scale",
+    "funnel": "gravity_funnel",
+    "dominoes": "domino_chain",
+}
+
+# "auto" is a UI value, not a template: it means "let the model choose".
+AUTO_TEMPLATE = "auto"
+DEFAULT_TEMPLATE = "split_path"
 MIN_DURATION, MAX_DURATION = 8.0, 60.0
+
+
+def resolve_template(name: Any) -> str:
+    """A template key from anything -- a new name, an old name, or nonsense."""
+    key = str(name or "").strip().lower()
+    key = TEMPLATE_ALIASES.get(key, key)
+    return key if key in TEMPLATES else DEFAULT_TEMPLATE
 
 
 # ---------------------------------------------------------------------------
@@ -764,9 +1331,7 @@ def normalise_spec(raw: dict[str, Any] | None) -> dict[str, Any]:
     every field is defaulted and every range is clamped here, once.
     """
     raw = dict(raw or {})
-    template = str(raw.get("template") or DEFAULT_TEMPLATE).strip().lower()
-    if template not in TEMPLATES:
-        template = DEFAULT_TEMPLATE
+    template = resolve_template(raw.get("template") or raw.get("metaphor_type"))
     preset = TEMPLATES[template]
 
     try:
@@ -775,11 +1340,29 @@ def normalise_spec(raw: dict[str, Any] | None) -> dict[str, Any]:
         duration = 18.0
     duration = max(MIN_DURATION, min(MAX_DURATION, duration))
 
-    try:
-        climax = float(raw.get("climax") or 0.0) or duration * float(preset["climax"])
-    except (TypeError, ValueError):
-        climax = duration * float(preset["climax"])
+    # animation_phases is the model's blueprint for the three beats; `climax`
+    # is the older flat field. Either may be missing, so both are optional and
+    # both get clamped into the duration.
+    blueprint = raw.get("animation_phases") or raw.get("phases") or {}
+    if not isinstance(blueprint, dict):
+        blueprint = {}
+
+    def _seconds(*keys: str) -> float:
+        for key in keys:
+            for source in (blueprint, raw):
+                if key in source:
+                    try:
+                        value = float(source[key] or 0.0)
+                    except (TypeError, ValueError):
+                        continue
+                    if value > 0:
+                        return value
+        return 0.0
+
+    climax = _seconds("impact", "climax") or duration * float(preset["climax"])
     climax = max(0.5, min(duration - 0.4, climax))
+    draw_end = _seconds("draw_end", "draw")
+    draw_end = min(draw_end, climax - 0.15) if draw_end else 0.0
 
     spec: dict[str, Any] = {
         "template": template,
@@ -789,9 +1372,13 @@ def normalise_spec(raw: dict[str, Any] | None) -> dict[str, Any]:
         "thesis": str(raw.get("thesis") or "").strip(),
         "duration": duration,
         "climax": climax,
+        "draw_end": max(0.0, draw_end),
         "concept": str(raw.get("concept") or "").strip(),
         "source": str(raw.get("source") or "preset"),
         "elements": raw.get("elements") if isinstance(raw.get("elements"), list) else [],
+        # 0 turns the grid and the drifting motes off, for a clean diagram look.
+        "ambient": max(0.0, min(1.5, float(raw.get("ambient", 1.0) or 0.0))),
+        "labels": raw.get("labels") if isinstance(raw.get("labels"), dict) else {},
         "publish": raw.get("publish") if isinstance(raw.get("publish"), dict) else {},
     }
     return spec
@@ -805,10 +1392,10 @@ def fallback_scene_spec(concept: str, template: str = DEFAULT_TEMPLATE,
     The mode has to work with the network down or the key missing, so the
     templates carry their own copy and this just fills in the concept.
     """
-    preset = TEMPLATES.get(template, TEMPLATES[DEFAULT_TEMPLATE])
+    preset = TEMPLATES[resolve_template(template)]
     concept = (concept or "").strip()
     return normalise_spec({
-        "template": template,
+        "template": resolve_template(template),
         "title": preset["title"] or (concept[:40].upper() if concept else "THINK LONGER"),
         # A typed concept short enough to read goes on screen as the subtitle --
         # otherwise the no-AI path would render a video that says nothing about
