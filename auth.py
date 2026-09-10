@@ -44,14 +44,15 @@ ROLES: dict[str, dict[str, Any]] = {
     ADMIN: {
         "label": "Admin",
         "blurb": "Every engine, the API configuration and user management.",
-        "modes": ("commentary", "minimalist", "batch", "reel", "duel", "admin"),
+        "modes": ("commentary", "minimalist", "narrative", "batch", "reel",
+                  "duel", "admin"),
         "manage_users": True,
         "manage_keys": True,
     },
     CREATOR: {
         "label": "Creator",
-        "blurb": "Minimalist Motion and the Commentary Machine. Own files only.",
-        "modes": ("commentary", "minimalist"),
+        "blurb": "The three generation studios. Own files only.",
+        "modes": ("commentary", "minimalist", "narrative"),
         "manage_users": False,
         "manage_keys": False,
     },

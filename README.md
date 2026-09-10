@@ -7,10 +7,52 @@ gate that refuses to call something publish-ready when it is not.
 | Engine | What it does |
 |---|---|
 | 🎙️ Commentary Machine | Gemini watches a clip and writes the commentary; TTS narrates it; kinetic captions burn in |
+| 📖 Narrative Studio | Episodic storytelling: Gemini writes the script and casts the world, then a storyboard becomes Ken Burns shots cut to the voice |
 | ◼️ Minimalist Motion | Draws a 1080×1920 vector animation from code — seven metaphor templates, no footage, no stock, no model-generated imagery |
 | 📦 Batch Studio | Queues topics and renders them back to back |
 | 🎬 Reel Studio | Slide-based reels from photos and licensed stock |
 | ⚔️ Versus Duel | Split-screen comparison shorts with animated stat badges |
+
+---
+
+## Narrative Studio
+
+A four-step wizard from a one-line premise to a finished episode.
+
+1. **Concept** — topic, visual aesthetic (Desaturated Vector Comic / Cinematic
+   Lofi Anime / Nordic Noir / Flat Graphic Minimalist), narrative tone (Quiet
+   Self-Reflection / Stoic Motivation / Suspense Investigation), and format
+   (60s 9:16, or 3–5 min in 9:16 or 16:9).
+2. **Script & cast** — Gemini writes narration in beats and, in the same call,
+   extracts the protagonist, the environments and the recurring objects.
+3. **Storyboard** — beats become numbered segments with a word count, an
+   estimated duration, a camera framing and entity tags.
+4. **Assets & assembly** — narration, one still per segment, Ken Burns moves,
+   dissolves, subtitles, an ambient bed, and a metadata pack.
+
+**Why the entity block exists.** An image model asked for "the man" twelve
+times draws twelve different men. Asked for the same forty-word description
+twelve times, it draws something close enough to read as one person. That
+description is written once and pasted verbatim into every image prompt.
+
+**The voice decides the timing.** Estimated durations are always a little
+wrong and the error accumulates — by segment thirty a picture can be two
+seconds off the line being spoken. So narration is synthesized *first*, the
+storyboard is re-cut against the real word timings, and only then are stills
+generated. Providers with no word timings (Gemini TTS) get proportional
+scaling instead.
+
+**Visual sources**, tried in order and each a real fallback:
+
+| Provider | Notes |
+|---|---|
+| `gemini` | The only one that can draw the same character twice. **Not on the API free tier** — without billing it returns a quota error and the chain falls through. |
+| `pexels` | Real photography, CC0. Fetched as a set per environment so consecutive shots differ, and colour-graded to the chosen aesthetic. |
+| `procedural` | Drawn locally from the aesthetic's palette. Always available, never blocks a render. |
+
+Grading pushes stock toward the palette but cannot turn a photograph into an
+illustration — for a look that is genuinely the aesthetic you asked for, the
+Gemini provider is the one that does it.
 
 ---
 
@@ -187,12 +229,21 @@ git check-ignore -v .env users.json exports    # all three should print a rule
 app.py            Streamlit UI, login gate, all five studios
 auth.py           password hashing, roles, user store, login rate limiting
 paths.py          project-relative paths and cross-platform font resolution
+narrative_engine.py  the episodic pipeline (Narrative Studio)
 motion_engine.py  the vector animation engine (Minimalist Motion)
 character_rig.py  the stick-figure rig: six poses, solved by forward kinematics
 video_engine.py   reframing, looping, captions, the duel engine
 audio_engine.py   TTS, synthesized music beds, SFX, ducking
 gemini_engine.py  scripts, scene specs, video grounding
 compliance.py     licence model, provenance ledger, publish gate
+tests/            narrative unit tests and the ffmpeg pipeline suite
+```
+
+Run the tests:
+
+```bash
+.venv\Scripts\python tests\test_narrative_unit.py     # no network, ~2s
+.venv\Scripts\python tests\test_narrative_ffmpeg.py   # needs ffmpeg, ~90s
 ```
 
 ---

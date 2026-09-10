@@ -71,6 +71,18 @@ from compliance import (
     MONETIZATION_NOTES,
 )
 import auth
+from narrative_engine import (
+    DEFAULT_AESTHETIC as NARRATIVE_DEFAULT_AESTHETIC,
+    DEFAULT_FORMAT as NARRATIVE_DEFAULT_FORMAT,
+    DEFAULT_TONE as NARRATIVE_DEFAULT_TONE,
+    DURATION_FORMATS as NARRATIVE_FORMATS,
+    IMAGE_PROVIDERS as NARRATIVE_IMAGE_PROVIDERS,
+    NARRATIVE_TONES,
+    VISUAL_AESTHETICS as NARRATIVE_AESTHETICS,
+    generate_narrative,
+    metadata_pack,
+    produce_episode,
+)
 from paths import EXPORTS_ROOT, ensure_dir
 from motion_engine import (
     AUTO_TEMPLATE,
@@ -1015,6 +1027,28 @@ if "duel" not in st.session_state:
 # Streamlit discards the state of widgets it stops drawing, so a trip to
 # another Production Mode would otherwise reset the whole panel; the widgets
 # seed themselves from this dict on the way back in.
+# Narrative Studio keeps its wizard state here for the same reason Minimalist
+# Motion does: Streamlit drops the state of widgets it stops drawing, and an
+# episode is far too expensive to lose to a mode switch.
+if "narrative" not in st.session_state:
+    st.session_state.narrative = {
+        "topic": "",
+        "aesthetic": NARRATIVE_DEFAULT_AESTHETIC,
+        "tone": NARRATIVE_DEFAULT_TONE,
+        "format": NARRATIVE_DEFAULT_FORMAT,
+        "voice_provider": "gemini",
+        "voice": "Charon",
+        "transition": "dissolve",
+        "subtitles": True,
+        "ambient": True,
+        "image_providers": list(NARRATIVE_IMAGE_PROVIDERS),
+        "ai_disclosed": False,
+        "episode": None,     # script, cast and storyboard
+        "result": None,      # what production returned
+        "pack": "",          # the metadata pack
+        "entry_name": "",
+    }
+
 if "minimal" not in st.session_state:
     st.session_state.minimal = {
         "preset": None,
@@ -4087,9 +4121,370 @@ def render_admin_studio() -> None:
             st.markdown(f"- **{folder}** — {files} · {ready}")
 
 
+
+# ---------------------------------------------------------------------------
+# Narrative Studio
+#
+# A four-step wizard, and the steps are genuinely sequential: the storyboard
+# cannot exist before the script, and the stills are not worth generating
+# before the voice has decided how long each segment actually is.
+# ---------------------------------------------------------------------------
+
+NARRATIVE_VOICES = {
+    "gemini": ("Charon", "Kore", "Puck", "Fenrir", "Aoede"),
+    "edge": ("en-US-ChristopherNeural", "en-US-GuyNeural", "en-GB-RyanNeural",
+             "en-US-JennyNeural", "en-GB-SoniaNeural"),
+}
+
+
+def _nv() -> dict[str, Any]:
+    """Narrative Studio's own state, kept out of the widget keys."""
+    return st.session_state.narrative
+
+
+def _narrative_status(slot: Any) -> Callable[[str], None]:
+    """A progress callback that returns None -- st.markdown returns a container."""
+    def report(message: str) -> None:
+        slot.markdown(f"**{message}**")
+    return report
+
+
+def render_narrative_studio() -> None:
+    """Premise in, episode out, in four reviewable steps."""
+    state = _nv()
+    episode = state.get("episode")
+    result = state.get("result")
+
+    st.markdown(
+        badge("① Concept", "green" if state.get("topic") else "violet")
+        + badge("② Script & cast", "green" if episode else "violet")
+        + badge("③ Storyboard", "green" if episode else "violet")
+        + badge("④ Produce", "green" if result else "violet"),
+        unsafe_allow_html=True,
+    )
+
+    # ---------------------------------------------------------------- STEP 1
+    with st.container(border=True):
+        st.markdown("#### ① Channel style & concept")
+
+        state["topic"] = st.text_area(
+            "Topic", value=str(state.get("topic") or ""), key="nv_topic", height=90,
+            placeholder="POV you lived with your parents during your 20s — now you're wealthy",
+            help="One premise. The model turns it into a script, a cast and a world, "
+                 "then keeps that world consistent across every shot.",
+        )
+
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            state["aesthetic"] = pick(
+                "Visual aesthetic", list(NARRATIVE_AESTHETICS.keys()),
+                str(state.get("aesthetic") or NARRATIVE_DEFAULT_AESTHETIC), "nv_look",
+                format_func=lambda k: str(NARRATIVE_AESTHETICS[k]["label"]),
+            )
+            st.caption(str(NARRATIVE_AESTHETICS[state["aesthetic"]]["prompt"])[:120] + "...")
+        with c2:
+            state["tone"] = pick(
+                "Narrative tone", list(NARRATIVE_TONES.keys()),
+                str(state.get("tone") or NARRATIVE_DEFAULT_TONE), "nv_tone",
+                format_func=lambda k: str(NARRATIVE_TONES[k]["label"]),
+            )
+            st.caption(str(NARRATIVE_TONES[state["tone"]]["prompt"])[:120] + "...")
+
+        keys = list(NARRATIVE_FORMATS.keys())
+        state["format"] = st.selectbox(
+            "Duration & framing", keys,
+            index=keys.index(str(state.get("format") or NARRATIVE_DEFAULT_FORMAT))
+            if state.get("format") in keys else 0,
+            format_func=lambda k: str(NARRATIVE_FORMATS[k]["label"]), key="nv_format",
+        )
+        fmt = NARRATIVE_FORMATS[state["format"]]
+        st.caption(f"{fmt['note']} · {fmt['segments'][0]}–{fmt['segments'][1]} segments · "
+                   f"{fmt['aspect'][0]}×{fmt['aspect'][1]}")
+
+        if st.button("✍️ Write the script & cast the world", width="stretch",
+                     key="nv_write", disabled=not str(state.get("topic") or "").strip()):
+            status = st.empty()
+            with st.spinner("Gemini is writing..."):
+                try:
+                    state["episode"] = generate_narrative(
+                        str(state["topic"]), str(state["aesthetic"]), str(state["tone"]),
+                        str(state["format"]),
+                        progress=_narrative_status(status),
+                    )
+                    state["result"] = None
+                except Exception as exc:
+                    st.error(f"**Could not write the episode:** `{type(exc).__name__}: {exc}`")
+                    st.code(traceback.format_exc())
+            status.empty()
+            st.rerun()
+
+    if not episode:
+        st.info("Write the script to unlock the storyboard and production steps.", icon="✍️")
+        return
+
+    # ---------------------------------------------------------------- STEP 2
+    with st.container(border=True):
+        st.markdown("#### ② Script & entity extraction")
+        if str(episode.get("source")) == "fallback":
+            st.warning("Gemini was unavailable, so this is the skeleton draft. Edit the "
+                       "premise and write again for a real script.", icon="⚠️")
+
+        st.markdown(f"**{episode['title']}**")
+        st.caption(episode.get("logline") or "")
+        stat_row([
+            ("Segments", str(len(episode["segments"])), "cyan"),
+            ("Estimated", f"{float(episode['runtime']):.0f}s", ""),
+            ("Words", str(len(str(episode["script"]).split())), ""),
+            ("Model", str(episode.get("source") or ""), "violet"),
+        ])
+
+        ents = episode["entities"]
+        p = ents["protagonist"]
+        with st.expander(f"🎭 Protagonist — {p['name']}, {p['age']}", expanded=True):
+            st.markdown(f"**Appearance** · {p['appearance']}")
+            st.markdown(f"**Clothing** · {p['clothing']}")
+            st.markdown(f"**Demeanour** · {p['demeanour']}")
+            st.caption("This exact text is pasted into every image prompt. It is what "
+                       "keeps the same person on screen from shot to shot.")
+
+        with st.expander(f"🏙️ Environments ({len(ents['environments'])}) "
+                         f"and objects ({len(ents['objects'])})"):
+            for env in ents["environments"]:
+                st.markdown(f"**{env['name']}** `{env['tag']}` — {env['description']}")
+            for obj in ents["objects"]:
+                st.markdown(f"**{obj['name']}** `{obj['tag']}` — {obj['description']}")
+
+        with st.expander("📄 Full narration"):
+            st.write(episode["script"])
+
+    # ---------------------------------------------------------------- STEP 3
+    with st.container(border=True):
+        st.markdown("#### ③ Storyboard")
+        st.caption("Durations here are estimated from the word count. They are re-cut "
+                   "against the real voice before a single still is generated.")
+
+        rows = [{
+            "#": s["index"],
+            "Start": f"{float(s['start']):.1f}s",
+            "Secs": round(float(s["duration"]), 1),
+            "Words": s["words"],
+            "Beat": s["beat_type"],
+            "Environment": s["environment"],
+            "Voiceover": s["line"],
+            "Camera": s["framing"],
+        } for s in episode["segments"]]
+        st.dataframe(rows, width="stretch", hide_index=True,
+                     column_config={"Voiceover": st.column_config.TextColumn(width="large"),
+                                    "Camera": st.column_config.TextColumn(width="large")})
+
+    # ---------------------------------------------------------------- STEP 4
+    with st.container(border=True):
+        st.markdown("#### ④ Assets & assembly")
+
+        a1, a2, a3 = st.columns([1, 1, 1])
+        with a1:
+            state["voice_provider"] = pick(
+                "Narration engine", list(NARRATIVE_VOICES.keys()),
+                str(state.get("voice_provider") or "gemini"), "nv_provider",
+                format_func=lambda k: "Gemini TTS ✅" if k == "gemini" else "edge-tts ⚠️ draft",
+            )
+            voices = NARRATIVE_VOICES[state["voice_provider"]]
+            current = str(state.get("voice") or voices[0])
+            state["voice"] = st.selectbox(
+                "Voice", list(voices), index=list(voices).index(current) if current in voices else 0,
+                key=f"nv_voice_{state['voice_provider']}",
+            )
+            if state["voice_provider"] == "edge":
+                st.caption("edge-tts gives exact word timings, so the cuts land on the "
+                           "word. It is not licensed for monetized publishing.")
+        with a2:
+            state["transition"] = pick(
+                "Between shots", ["dissolve", "cut"], str(state.get("transition") or "dissolve"),
+                "nv_transition",
+                format_func=lambda k: "Soft dissolve" if k == "dissolve" else "Hard cut",
+            )
+            state["subtitles"] = st.checkbox("Burn subtitles",
+                                             value=bool(state.get("subtitles", True)),
+                                             key="nv_subs")
+            state["ambient"] = st.checkbox("Ambient bed under the voice",
+                                           value=bool(state.get("ambient", True)),
+                                           key="nv_ambient")
+        with a3:
+            state["image_providers"] = st.multiselect(
+                "Visual sources, in order", list(NARRATIVE_IMAGE_PROVIDERS),
+                default=list(state.get("image_providers") or NARRATIVE_IMAGE_PROVIDERS),
+                key="nv_images",
+                help="Tried in order; the first that delivers wins. Gemini is the only "
+                     "one that can draw the same character twice.",
+            )
+
+        if "gemini" in (state["image_providers"] or []):
+            st.caption("ℹ️ Gemini image generation is not on the API free tier. Without "
+                       "billing enabled it returns a quota error and the chain falls "
+                       "through to stock photography, graded to your aesthetic.")
+
+        state["ai_disclosed"] = st.checkbox(
+            "I will label this as AI-generated when I upload",
+            value=bool(state.get("ai_disclosed")), key="nv_disclose",
+        )
+
+        estimate = len(episode["segments"]) * 7 + float(episode["runtime"]) * 0.6
+        st.caption(f"≈ {estimate / 60:.0f}–{estimate / 30:.0f} min to produce "
+                   f"{len(episode['segments'])} segments.")
+
+        if st.button("🎬 Produce the episode", width="stretch", key="nv_produce",
+                     disabled=not state.get("image_providers")):
+            if run_narrative_production(episode):
+                st.rerun()
+
+    if result:
+        stat_row([
+            ("Runtime", f"{float(result.get('duration') or 0):.1f}s", "cyan"),
+            ("Segments", str(len(result.get("segments") or [])), ""),
+            ("Stills", ", ".join(result.get("image_providers") or []), "violet"),
+            ("Cuts", "on the word" if result.get("timings_exact") else "scaled", ""),
+        ])
+        for note in (result.get("provider_notes") or [])[:1]:
+            st.caption(f"⚠️ {note[:180]}")
+
+    show_rendered_video("narrative", "Your episode", slot="narrative")
+    render_narrative_pack()
+
+
+def run_narrative_production(episode: dict[str, Any]) -> bool:
+    """Runs stages 3 and 4 and files the result. Returns success."""
+    state = _nv()
+    bar = st.progress(0.0)
+    status = st.empty()
+    total = max(1, len(episode["segments"]) * 2 + 6)
+    done = {"n": 0}
+
+    def progress(message: str) -> None:
+        done["n"] += 1
+        bar.progress(min(0.98, done["n"] / total))
+        status.markdown(f"**{message}**")
+
+    workspace = ""
+    try:
+        stamp = int(time.time())
+        out_path = os.path.join(user_exports(), f"narrative_{stamp}.mp4")
+        workspace = os.path.join(user_exports(), f"narrative_{stamp}_work")
+
+        result = produce_episode(
+            episode, out_path, workspace=workspace,
+            fps=int(st.session_state.get("render_fps", 30)),
+            voice_provider=str(state.get("voice_provider") or "gemini"),
+            voice=str(state.get("voice") or "Charon"),
+            transition=str(state.get("transition") or "dissolve"),
+            subtitles=bool(state.get("subtitles", True)),
+            ambient=bool(state.get("ambient", True)),
+            image_providers=tuple(state.get("image_providers") or NARRATIVE_IMAGE_PROVIDERS),
+            progress=progress,
+        )
+
+        if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+            raise FileNotFoundError(f"Producer finished but {out_path} is missing or empty")
+
+        with open(out_path, "rb") as handle:
+            data = handle.read()
+
+        # Stock photography carries the Pexels licence; anything drawn by the
+        # model or by us is the user's own work. Mixed sources take the
+        # stricter of the two.
+        providers = set(result.get("image_providers") or [])
+        licence = "pexels" if "pexels" in providers else "own"
+
+        entry = append_ledger(user_exports(), {
+            "video_name": os.path.basename(out_path), "video_path": out_path,
+            "duration": float(result["duration"]),
+            "licence": licence, "licence_reference": "",
+            "source_title": str(episode.get("title") or ""),
+            "source_author": "", "source_url": "",
+            "source_provider": ", ".join(sorted(providers)) or "reelforge",
+            "tts_provider": str(result["tts_provider"]),
+            "voice": str(result.get("voice") or ""),
+            "script_model": str(episode.get("source") or ""),
+            "ai_disclosed": bool(state.get("ai_disclosed")),
+            "script": str(episode.get("script") or ""),
+            "template": "narrative",
+        })
+
+        state["result"] = result
+        state["entry_name"] = entry["video_name"]
+        state["pack"] = metadata_pack(episode, result)
+        st.session_state["narrative_video_path"] = out_path
+        st.session_state["narrative_video_bytes"] = data
+        st.session_state["narrative_video_name"] = os.path.basename(out_path)
+
+        purge_scratch_renders()
+        status.markdown("**Done.**")
+        return True
+
+    except Exception as exc:
+        bar.empty()
+        status.empty()
+        st.error(f"**Production failed:** `{type(exc).__name__}: {exc}`")
+        st.code(traceback.format_exc())
+        purge_scratch_renders()
+        return False
+    finally:
+        # The workspace holds the stills and the narration, which are worth
+        # keeping; only the assembly intermediates are removed, and
+        # produce_episode has already done that.
+        if workspace and os.path.isdir(workspace):
+            try:
+                remaining = os.listdir(workspace)
+                if not remaining:
+                    os.rmdir(workspace)
+            except OSError:
+                pass
+
+
+def render_narrative_pack() -> None:
+    """The publish check and the episode pack."""
+    state = _nv()
+    name = st.session_state.get("narrative_video_name")
+    if not name or not state.get("pack"):
+        return
+
+    entry = find_entry(user_exports(), str(name))
+    verdict = publish_readiness(entry) if entry else None
+
+    with st.container(border=True):
+        st.markdown("#### 📤 Episode pack")
+
+        if verdict and verdict["ready"]:
+            st.success("Cleared for a monetized upload.", icon="✅")
+        elif verdict:
+            st.error(f"Not cleared yet — {len(verdict['blockers'])} to fix.", icon="🚫")
+            for blocker in verdict["blockers"]:
+                st.markdown(f"- 🚫 {blocker}")
+
+        credit = attribution_line(entry) if entry else ""
+        if credit:
+            st.markdown("**Credit line — this must appear in your description:**")
+            st.code(credit, language=None)
+
+        st.download_button(
+            "📋 Download episode pack (.txt)",
+            data=str(state["pack"]).encode("utf-8"),
+            file_name=f"{os.path.splitext(str(name))[0]}_pack.txt",
+            mime="text/plain", width="stretch", key=f"nv_pack_{name}",
+            help="Script, cast, environments, the full storyboard with timings, and "
+                 "how every still was sourced.",
+        )
+
+        with st.expander("Storyboard as produced"):
+            for segment in (state.get("result") or {}).get("segments") or []:
+                st.markdown(
+                    f"**{segment['index']}.** `{segment['start']:.1f}–{segment['end']:.1f}s` "
+                    f"· {segment.get('image_provider', '')} · {segment['line']}"
+                )
+
 MODE_LABELS: dict[str, str] = {
     "commentary": "🎙️ Commentary Machine",
     "minimalist": "◼️ Minimalist Motion",
+    "narrative": "📖 Narrative Studio",
     "batch": "📦 Batch Studio",
     "reel": "🎬 Reel Studio",
     "duel": "⚔️ Versus Duel",
@@ -4188,6 +4583,10 @@ def main() -> None:
 
     if mode == "minimalist":
         render_minimalist_studio()
+        return
+
+    if mode == "narrative":
+        render_narrative_studio()
         return
 
     if mode == "batch":
