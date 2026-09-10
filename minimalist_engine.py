@@ -30,7 +30,7 @@ from typing import Any, Callable, Sequence
 import numpy as np
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
-import character_rig as rig
+import vector_rig as rig
 from paths import resolve_font
 from video_engine import _SCRATCH_RENDERS, purge_scratch_renders, video_encoder
 
@@ -570,23 +570,32 @@ LABEL_SLOTS: dict[str, dict[str, str]] = {
                         "gap": "THE GAP"},
     "chain_anchor": {"anchor1": "EXCUSES", "anchor2": "FEAR", "freed": "FREE"},
     "growth_consistency": {"input": "SAME EFFORT", "output": "COMPOUNDED"},
+    "sisyphus_boulder": {"mark1": "WEEK 1", "mark2": "MONTH 1", "mark3": "YEAR 1",
+                         "mark4": "YEAR 3", "slope": "THE GRIND", "summit": "THE TOP"},
+    "discipline_iceberg": {"above": "THE RESULT", "below": "THE WORK NOBODY SAW"},
+    "two_doors": {"left": "COMFORT", "right": "THE HARD ONE", "through": "GO"},
     "custom": {},
 }
 
 # Long labels break the composition they sit in, so they are capped rather
-# than wrapped -- these are stamps on a diagram, not sentences.
+# than wrapped -- these are stamps on a diagram, not sentences. A few slots are
+# drawn through `wrapped()` and can take a short phrase, so they pass wrap=True
+# and get a longer allowance.
 LABEL_MAX_CHARS = 16
+LABEL_WRAP_CHARS = 44
 
 
-def label(spec: dict[str, Any], slot: str, fallback: str = "") -> str:
+def label(spec: dict[str, Any], slot: str, fallback: str = "",
+          wrap: bool = False) -> str:
     """The text for one labelled slot, from the spec or the template default."""
+    limit = LABEL_WRAP_CHARS if wrap else LABEL_MAX_CHARS
     supplied = spec.get("labels")
     if isinstance(supplied, dict):
         value = str(supplied.get(slot) or "").strip()
         if value:
-            return value.upper()[:LABEL_MAX_CHARS]
+            return value.upper()[:limit]
     defaults = LABEL_SLOTS.get(str(spec.get("template") or ""), {})
-    return (fallback or defaults.get(slot, "")).upper()[:LABEL_MAX_CHARS]
+    return (fallback or defaults.get(slot, "")).upper()[:limit]
 
 
 def draw_ambient(frame: Frame, t: float, phases: Phases, spec: dict[str, Any]) -> None:
@@ -1288,6 +1297,30 @@ def _climb_points() -> list[tuple[float, float]]:
     return points
 
 
+def _trophy(frame: Frame, centre: tuple[float, float], size: float,
+            colour: tuple[int, int, int], glow: float = 0.0) -> None:
+    """A cup on a plinth -- what the last step is for."""
+    x, y = centre
+    bowl_w, bowl_h = size * 0.62, size * 0.52
+
+    if glow > 0.02:
+        for ring in range(3):
+            frame.circle((x, y - size * 0.30), size * (0.62 + ring * 0.34),
+                         mix(colour, 0.20 * glow / (ring + 1)), 3)
+
+    frame.polyline([(x - bowl_w / 2, y - size * 0.62),
+                    (x + bowl_w / 2, y - size * 0.62),
+                    (x + bowl_w * 0.30, y - size * 0.62 + bowl_h),
+                    (x - bowl_w * 0.30, y - size * 0.62 + bowl_h),
+                    (x - bowl_w / 2, y - size * 0.62)], colour, 6)
+    for side in (-1, 1):
+        frame.ellipse((x + side * bowl_w * 0.60, y - size * 0.48),
+                      size * 0.16, size * 0.20, colour, 5)
+    frame.line((x, y - size * 0.10), (x, y - size * 0.28), colour, 6)
+    frame.line((x - size * 0.26, y - size * 0.06), (x + size * 0.26, y - size * 0.06), colour, 7)
+    frame.rect((x - size * 0.34, y - size * 0.06, x + size * 0.34, y), colour, width=5)
+
+
 def scene_climb(frame: Frame, t: float, spec: dict[str, Any], duration: float) -> None:
     """A figure walking up labelled stages, one step at a time."""
     ph = phases_of(spec, duration)
@@ -1315,12 +1348,16 @@ def scene_climb(frame: Frame, t: float, spec: dict[str, Any], duration: float) -
         frame.text(text, (left + i * run + run / 2, floor - i * rise - 42),
                    28, mix(WHITE if lit > 0.5 else DIM, 0.35 + 0.65 * lit), tracking=3)
 
+    # The prize on the top tread, lighting as the climb closes on it.
+    _trophy(frame, (right + 40, top), 86,
+            mix(WHITE, 0.35 + 0.65 * clamp(walk * 1.2)), glow=clamp((walk - 0.6) / 0.4))
+
     # The figure climbs tread by tread rather than gliding up the diagonal.
     step_index = min(_CLIMB_STEPS - 1, int(reached))
     within = reached - step_index
     x = left + step_index * run + run * (0.25 + 0.5 * within)
     y = floor - (step_index + 1) * rise
-    rig.draw_figure(frame, "walking", phase=(t * 1.5) % 1.0, anchor=(x, y),
+    rig.draw_figure(frame, "climbing_stairs", phase=(t * 1.5) % 1.0, anchor=(x, y),
                     height=210, colour=WHITE, weight=6.0)
 
     # At the top: the pose changes to say arrival.
@@ -1567,6 +1604,277 @@ def scene_growth(frame: Frame, t: float, spec: dict[str, Any], duration: float) 
                    mix(WHITE, clamp((growth - 0.7) / 0.25)), tracking=4)
 
 
+# ---------------------------------------------------------------------------
+# Template -- Sisyphus Boulder
+#
+# A steep slope with checkpoints on it. The figure pushes a textured stone up
+# past each one, and the stone slips back a little between pushes -- because a
+# boulder that only ever moves forward is a conveyor belt, not a struggle.
+# ---------------------------------------------------------------------------
+
+_SLOPE = (110.0, 1430.0, 960.0, 700.0)      # base x/y, summit x/y
+_BOULDER_R = 78.0
+_PUSHER_H = 300.0
+_CHECKPOINTS = 4
+
+
+def _boulder(frame: Frame, centre: tuple[float, float], radius: float,
+             spin: float, colour: tuple[int, int, int]) -> None:
+    """
+    A stone with facets, rotating as it rolls.
+
+    The facets are the point: a plain circle rolling up a line reads as a dot
+    sliding, and the whole shot depends on seeing the thing turn.
+
+    Filled with black before it is stroked, so it occludes the pusher behind
+    it. On a steep slope a figure with its shoulder against a boulder will
+    always overlap it -- that is what pushing looks like -- and two outlines
+    crossing read as a tangle of lines. One of them has to be solid.
+    """
+    frame.circle(centre, radius, BLACK)
+    frame.circle(centre, radius, colour, 7)
+    for face in range(5):
+        angle = spin + face * (2 * math.pi / 5)
+        inner = radius * (0.34 + 0.16 * math.sin(face * 2.1))
+        a = (centre[0] + math.sin(angle) * radius * 0.92,
+             centre[1] + math.cos(angle) * radius * 0.92)
+        b = (centre[0] + math.sin(angle + 1.1) * inner,
+             centre[1] + math.cos(angle + 1.1) * inner)
+        frame.line(a, b, mix(colour, 0.45), 4)
+    frame.circle(centre, radius * 0.30, mix(colour, 0.30), 4)
+
+
+def scene_sisyphus(frame: Frame, t: float, spec: dict[str, Any], duration: float) -> None:
+    """The slope, the stone, and the ground it loses between pushes."""
+    ph = phases_of(spec, duration)
+    draw_ambient(frame, t, ph, spec)
+
+    bx, by, sx, sy = _SLOPE
+    reveal = ph.draw(t)
+    slope_angle = math.atan2(by - sy, sx - bx)
+
+    # The slope draws itself in, then the checkpoints appear along it.
+    frame.line((bx, by), (bx + (sx - bx) * reveal, by - (by - sy) * reveal), WHITE, 8)
+    frame.line((60, by), (bx, by), mix(WHITE, 0.4 * reveal), 6)
+
+    progress = ph.travel(t, ease_out_cubic)
+    # Two steps forward, a little back: the slip is what makes it a grind.
+    slip = 0.05 * math.sin(progress * math.pi * _CHECKPOINTS * 2.0) * (1.0 - progress)
+    position = clamp(progress + slip)
+
+    # Everything rides the slope, so both the stone and the pusher are placed
+    # from a point on the line rather than from an x coordinate. Offsetting the
+    # stone by its radius along the surface *normal* is what makes it sit on
+    # the hill instead of floating beside it.
+    run, rise = sx - bx, sy - by
+    length = math.hypot(run, rise) or 1.0
+    along = (run / length, rise / length)
+    # Named `outward` rather than `normal`: the checkpoint loop below already
+    # uses `normal` for an angle, and shadowing it made this a float.
+    outward = (rise / length, -run / length)     # points away from the surface
+
+    def on_slope(u: float, lift: float = 0.0) -> tuple[float, float]:
+        u = clamp(u)
+        return (bx + run * u + outward[0] * lift, by + rise * u + outward[1] * lift)
+
+    for i in range(1, _CHECKPOINTS + 1):
+        # Spaced so the last mark stops short of the summit -- a checkpoint at
+        # share 1.0 sits underneath the summit label.
+        share = i / (_CHECKPOINTS + 1)
+        if reveal < share * 0.9:
+            continue
+        cx = bx + (sx - bx) * share
+        cy = by - (by - sy) * share
+        passed = position >= share
+        # A notch cut perpendicular to the slope, so it sits on the hill.
+        notch = slope_angle + math.pi / 2
+        frame.line((cx - math.cos(notch) * 22, cy + math.sin(notch) * 22),
+                   (cx + math.cos(notch) * 22, cy - math.sin(notch) * 22),
+                   WHITE if passed else DIM, 6)
+        text = label(spec, f"mark{i}")
+        if text:
+            frame.text(text, (cx + 30, cy - 54), 26,
+                       mix(WHITE if passed else DIM, 0.4 + 0.6 * clamp(position - share + 1)),
+                       tracking=2)
+
+    # Stone and pusher.
+    #
+    # The figure is placed from the stone, not from the slope: solve for the
+    # feet that put the pushing hand on the stone's lower-left surface, and the
+    # feet land within a pixel of the slope anyway. Placing it by slope
+    # parameter instead left the hands 140px short of the rock, pushing air.
+    stone = on_slope(position, _BOULDER_R)
+    contact_angle = math.radians(168)
+    contact = (stone[0] + math.cos(contact_angle) * _BOULDER_R,
+               stone[1] - math.sin(contact_angle) * _BOULDER_R)
+    reach = rig.build_skeleton("pushing_heavy_load", 0.0, (0.0, 0.0), _PUSHER_H).hand_r
+    feet = (contact[0] - reach[0], contact[1] - reach[1])
+
+    # Figure first, stone second: the stone is filled black and covers it.
+    rig.draw_figure(frame, "pushing_heavy_load", phase=(t * 1.4) % 1.0,
+                    anchor=feet, height=_PUSHER_H, colour=WHITE, weight=7.0)
+    _boulder(frame, stone, _BOULDER_R, -position * 9.0, WHITE)
+    _ = along
+
+    frame.text(label(spec, "slope"), (330, by + 74), 32,
+               mix(GREY, fade(t, ph.lead + 0.3, 0.6)), tracking=4)
+    if ph.after(t, 0.6) > 0.3:
+        # Upper-left is the empty quadrant of a rising slope, and the stone
+        # finishes at the top right.
+        frame.text(label(spec, "summit"), (330, sy - 30), 40,
+                   mix(WHITE, ph.after(t, 1.0)), tracking=5)
+
+
+# ---------------------------------------------------------------------------
+# Template -- The Discipline Iceberg
+#
+# The classic: a small lit peak and the mass under the water nobody sees. The
+# waterline is the only horizontal in the frame, which is what makes the scale
+# below it land.
+# ---------------------------------------------------------------------------
+
+_WATERLINE = 860.0
+_BERG_X = 540.0
+
+
+def scene_iceberg(frame: Frame, t: float, spec: dict[str, Any], duration: float) -> None:
+    """A visible tip, and the volume of work holding it up."""
+    ph = phases_of(spec, duration)
+    draw_ambient(frame, t, ph, spec)
+
+    reveal = ph.draw(t)
+    sink = ph.travel(t, ease_out_cubic)
+
+    # The waterline, drawn first and always.
+    frame.line((60, _WATERLINE), (1020, _WATERLINE), mix(WHITE, 0.55 * reveal), 5)
+    for k in range(7):
+        x = 90 + k * 145
+        wobble = math.sin(t * 1.1 + k) * 6
+        frame.line((x, _WATERLINE + 16 + wobble), (x + 76, _WATERLINE + 16 + wobble),
+                   mix(WHITE, 0.16 * reveal), 3)
+
+    # The tip: small, bright, above the line.
+    tip = [(_BERG_X, _WATERLINE - 250), (_BERG_X + 132, _WATERLINE),
+           (_BERG_X - 132, _WATERLINE)]
+    frame.polygon(tip, mix(WHITE, 0.20))
+    frame.polyline(tip + [tip[0]], WHITE, 7)
+    frame.line((_BERG_X, _WATERLINE - 250), (_BERG_X - 54, _WATERLINE),
+               mix(WHITE, 0.5), 4)
+
+    # The mass: revealed downward as the beat approaches.
+    depth = 720.0 * sink
+    if depth > 12:
+        body = [
+            (_BERG_X - 132, _WATERLINE),
+            (_BERG_X - 300 * sink, _WATERLINE + depth * 0.34),
+            (_BERG_X - 236 * sink, _WATERLINE + depth * 0.78),
+            (_BERG_X - 60 * sink, _WATERLINE + depth),
+            (_BERG_X + 120 * sink, _WATERLINE + depth * 0.86),
+            (_BERG_X + 318 * sink, _WATERLINE + depth * 0.40),
+            (_BERG_X + 132, _WATERLINE),
+        ]
+        frame.polygon(body, mix(WHITE, 0.09))
+        frame.polyline(body, mix(WHITE, 0.55 + 0.30 * sink), 6)
+        # Internal facets, so the underside has volume rather than being a blob.
+        for k in range(1, 4):
+            share = k / 4
+            frame.line((_BERG_X - 132 + 40 * k, _WATERLINE),
+                       (_BERG_X - 90 * sink + 70 * k, _WATERLINE + depth * (0.45 + 0.15 * share)),
+                       mix(WHITE, 0.20 * sink), 3)
+
+    above = label(spec, "above")
+    below = label(spec, "below", wrap=True)
+    if above:
+        frame.text(above, (_BERG_X, _WATERLINE - 320), 40,
+                   mix(WHITE, fade(t, ph.lead + 0.2, 0.6)), tracking=4)
+    if below and sink > 0.35:
+        frame.wrapped(below, (_BERG_X, _WATERLINE + 300), 36,
+                      mix(GREY, clamp((sink - 0.35) / 0.4)), weight="bold", max_width=560)
+
+    # A figure standing on the tip, for scale.
+    if reveal > 0.6:
+        rig.draw_figure(frame, "reflective", phase=(t * 0.4) % 1.0,
+                        anchor=(_BERG_X, _WATERLINE - 244), height=150,
+                        colour=mix(WHITE, clamp((reveal - 0.6) / 0.3)), weight=4.0)
+
+
+# ---------------------------------------------------------------------------
+# Template -- The Divergent Path / Two Doors
+#
+# One door dark, one lit. The figure walks to the threshold and chooses. The
+# unchosen door dims further rather than disappearing, because the point is
+# that it stays available and stays wrong.
+# ---------------------------------------------------------------------------
+
+_DOOR_W, _DOOR_H = 300.0, 470.0
+_DOOR_Y = 1180.0
+_DOOR_LEFT_X, _DOOR_RIGHT_X = 250.0, 830.0
+
+
+def _door(frame: Frame, centre_x: float, glow: float, colour: tuple[int, int, int],
+          open_amount: float = 0.0) -> None:
+    """A doorway, lit from within by `glow`."""
+    left = centre_x - _DOOR_W / 2
+    top = _DOOR_Y - _DOOR_H
+
+    if glow > 0.02:
+        # Light spilling out across the floor.
+        for ring in range(4):
+            spread = (1 + ring) * 34 * glow
+            frame.polygon([(left - spread * 0.5, _DOOR_Y),
+                           (left + _DOOR_W + spread * 0.5, _DOOR_Y),
+                           (left + _DOOR_W + spread * 1.6, _DOOR_Y + 150 * glow),
+                           (left - spread * 1.6, _DOOR_Y + 150 * glow)],
+                          mix(WHITE, 0.05 * glow / (ring + 1)))
+        frame.rect((left + 14, top + 14, left + _DOOR_W - 14, _DOOR_Y),
+                   mix(WHITE, 0.30 * glow))
+
+    frame.rect((left, top, left + _DOOR_W, _DOOR_Y), colour, width=8, radius=6)
+    frame.line((left, _DOOR_Y), (left + _DOOR_W, _DOOR_Y), colour, 8)
+    # The handle, and the leaf swinging in when it opens.
+    frame.circle((left + _DOOR_W - 46, _DOOR_Y - _DOOR_H / 2), 11, colour)
+    if open_amount > 0.02:
+        swing = _DOOR_W * 0.55 * open_amount
+        frame.polyline([(left, top), (left + swing, top + 40 * open_amount),
+                        (left + swing, _DOOR_Y - 40 * open_amount), (left, _DOOR_Y)],
+                       mix(colour, 0.6), 5)
+
+
+def scene_doors(frame: Frame, t: float, spec: dict[str, Any], duration: float) -> None:
+    """Two doors, one walk, one choice."""
+    ph = phases_of(spec, duration)
+    draw_ambient(frame, t, ph, spec)
+
+    floor = _DOOR_Y
+    reveal = ph.draw(t)
+    frame.line((40, floor), (1040, floor), mix(WHITE, 0.45 * reveal), 6)
+
+    walk = ph.travel(t, ease_out_cubic)
+    chosen = ph.after(t, 1.0)
+
+    # The dark door dims further once the choice is made.
+    _door(frame, _DOOR_LEFT_X, 0.0, mix(GREY, (0.55 - 0.30 * chosen) * reveal))
+    _door(frame, _DOOR_RIGHT_X, (0.25 + 0.75 * walk) * reveal,
+          mix(WHITE, reveal), open_amount=chosen)
+
+    frame.text(label(spec, "left"), (_DOOR_LEFT_X, floor + 70), 34,
+               mix(GREY, fade(t, ph.lead + 0.3, 0.6) * (1.0 - 0.4 * chosen)), tracking=4)
+    frame.text(label(spec, "right"), (_DOOR_RIGHT_X, floor + 70), 38,
+               mix(WHITE, fade(t, ph.lead + 0.5, 0.6)), tracking=4)
+
+    # The figure starts between the doors and walks to the lit one.
+    start_x, end_x = 540.0, _DOOR_RIGHT_X
+    x = start_x + (end_x - start_x) * walk
+    pose = "walking" if chosen <= 0 else "reaching_upward"
+    height = 300 - 90 * chosen        # walking away, into the doorway
+    rig.draw_figure(frame, pose, phase=(t * 1.5) % 1.0, anchor=(x, floor),
+                    height=height, colour=WHITE, weight=7.0 - 2.0 * chosen)
+
+    if chosen > 0.4:
+        frame.text(label(spec, "through"), (frame.w / 2, floor - _DOOR_H - 110), 40,
+                   mix(WHITE, clamp((chosen - 0.4) / 0.4)), tracking=5)
+
+
 SceneFn = Callable[[Frame, float, dict[str, Any], float], None]
 
 # The metaphor library.
@@ -1697,8 +2005,41 @@ TEMPLATES: dict[str, dict[str, Any]] = {
         "climax": 0.86,
         "suits": "patience, consistency, tending something before it shows anything",
     },
+    "sisyphus_boulder": {
+        "label": "⑫ Sisyphus Boulder",
+        "blurb": "A steep slope with checkpoints, a faceted stone that turns as it "
+                 "rolls, and ground lost between pushes.",
+        "fn": scene_sisyphus,
+        "title": "THE SAME HILL",
+        "subtitle": "every single morning",
+        "payoff": "The hill is the point.",
+        "climax": 0.84,
+        "suits": "perseverance, grinding, work that resets, effort without applause",
+    },
+    "discipline_iceberg": {
+        "label": "⑬ The Discipline Iceberg",
+        "blurb": "A small lit tip above the waterline and the mass underneath it, "
+                 "revealed downward as the beat lands.",
+        "fn": scene_iceberg,
+        "title": "WHAT THEY SEE",
+        "subtitle": "is the part above the water",
+        "payoff": "The rest is why it floats.",
+        "climax": 0.80,
+        "suits": "hidden work, overnight success, the unseen cost of a visible result",
+    },
+    "two_doors": {
+        "label": "⑭ The Divergent Path",
+        "blurb": "One dark door, one lit. The figure walks to the threshold, and the "
+                 "unchosen door dims rather than vanishing.",
+        "fn": scene_doors,
+        "title": "TWO DOORS",
+        "subtitle": "both of them stay open",
+        "payoff": "Walk through one of them.",
+        "climax": 0.78,
+        "suits": "a decision, two futures, the cost of not choosing",
+    },
     "custom": {
-        "label": "⑫ Dynamic AI Scene",
+        "label": "⑮ Dynamic AI Scene",
         "blurb": "Gemini writes the geometry from scratch: paths, followed dots, "
                  "bars and text placed for your concept alone.",
         "fn": scene_custom,
@@ -1717,13 +2058,15 @@ METAPHOR_TYPES: tuple[str, ...] = (
     "split_path", "gravity_funnel", "domino_chain",
     # Character metaphors -- these put the rig on screen.
     "comparison_split", "steep_staircase", "delusion_mirror",
-    "chain_anchor", "growth_consistency",
+    "chain_anchor", "growth_consistency", "sisyphus_boulder",
+    "discipline_iceberg", "two_doors",
 )
 
-# The five that use the stick-figure rig, for the UI to group them.
+# The eight that put the stick-figure rig on screen.
 CHARACTER_TYPES: tuple[str, ...] = (
     "comparison_split", "steep_staircase", "delusion_mirror",
-    "chain_anchor", "growth_consistency",
+    "chain_anchor", "growth_consistency", "sisyphus_boulder",
+    "discipline_iceberg", "two_doors",
 )
 
 # The old keys, kept so ledger entries and saved session state from before the
@@ -1815,6 +2158,23 @@ def normalise_spec(raw: dict[str, Any] | None) -> dict[str, Any]:
     return spec
 
 
+# A watchable default for the custom template when no model supplied geometry.
+_CUSTOM_FALLBACK_ELEMENTS: list[dict[str, Any]] = [
+    {"type": "path", "id": "rise", "colour": "white", "from": 1.0, "to": 13.0,
+     "points": [[0.14, 0.72], [0.34, 0.68], [0.56, 0.58], [0.76, 0.42], [0.90, 0.33]]},
+    {"type": "dot", "follows": "rise", "radius": 24, "colour": "white",
+     "from": 1.0, "to": 13.0},
+    {"type": "path", "id": "flat", "colour": "grey", "from": 1.0, "to": 13.0,
+     "points": [[0.14, 0.72], [0.40, 0.73], [0.66, 0.745], [0.90, 0.76]]},
+    {"type": "dot", "follows": "flat", "radius": 18, "colour": "grey",
+     "from": 1.0, "to": 13.0},
+    {"type": "bar", "at": [0.22, 0.88], "width": 0.055, "height": 0.10,
+     "grow": True, "colour": "grey", "from": 2.0, "to": 13.0},
+    {"type": "bar", "at": [0.78, 0.88], "width": 0.055, "height": 0.20,
+     "grow": True, "colour": "white", "from": 2.0, "to": 13.0},
+]
+
+
 def fallback_scene_spec(concept: str, template: str = DEFAULT_TEMPLATE,
                         duration: float = 18.0) -> dict[str, Any]:
     """
@@ -1823,7 +2183,8 @@ def fallback_scene_spec(concept: str, template: str = DEFAULT_TEMPLATE,
     The mode has to work with the network down or the key missing, so the
     templates carry their own copy and this just fills in the concept.
     """
-    preset = TEMPLATES[resolve_template(template)]
+    resolved = resolve_template(template)
+    preset = TEMPLATES[resolved]
     concept = (concept or "").strip()
     return normalise_spec({
         "template": resolve_template(template),
@@ -1838,6 +2199,11 @@ def fallback_scene_spec(concept: str, template: str = DEFAULT_TEMPLATE,
         "duration": duration,
         "concept": concept,
         "source": "preset",
+        # The custom template has no built-in geometry, so with no model behind
+        # it there is nothing to draw and it degrades to a title card -- ink
+        # measured flat at 2.4% across the whole runtime. This gives it a real
+        # scene to fall back to: one path that climbs, one that flattens.
+        "elements": _CUSTOM_FALLBACK_ELEMENTS if resolved == "custom" else [],
     })
 
 

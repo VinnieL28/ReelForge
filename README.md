@@ -76,13 +76,18 @@ for the jar. Pick a template by hand if you'd rather.
 | ⑨ The Delusion Mirror | A plain figure beside the glowing, flexing version it sees in the mirror |
 | ⑩ The Chain & Anchor | A figure hauling named dead weight, until the chain lets go and it walks |
 | ⑪ Growth & Consistency | A figure watering at the same rate while a seed becomes a canopy |
-| ⑫ Dynamic AI Scene | Gemini writes the geometry from scratch: paths, followed dots, bars, text |
+| ⑫ Sisyphus Boulder | A faceted stone up a 41° slope past checkpoints, losing ground between pushes |
+| ⑬ The Discipline Iceberg | A small lit tip and the mass under the waterline, revealed downward |
+| ⑭ The Divergent Path | One dark door, one lit; the unchosen door dims rather than vanishing |
+| ⑮ Dynamic AI Scene | Gemini writes the geometry from scratch: paths, followed dots, bars, text |
 
-Templates ⑦–⑪ put a stick figure on screen, drawn by `character_rig.py`. The
+Templates ⑦–⑭ put a stick figure on screen, drawn by `vector_rig.py`. The
 model reaches for those when the concept is about a person doing something and
 for the abstract ones when it is about a quantity or a shape of change —
 verified live: 5/5 person-shaped topics chose a figure, 2/2 abstract chose a
 shape.
+
+It is also given explicit routing by premise: consistency and time to the jar, the plant or a staircase; overthinking versus doing to the tier split, the scale or the diverging paths; perseverance and hidden work to the boulder or the iceberg. Measured at 5/6 on those categories.
 
 Every scene runs the same three-beat structure, so the picture and the sound
 design cannot drift apart:
@@ -230,8 +235,9 @@ app.py            Streamlit UI, login gate, all five studios
 auth.py           password hashing, roles, user store, login rate limiting
 paths.py          project-relative paths and cross-platform font resolution
 narrative_engine.py  the episodic pipeline (Narrative Studio)
-motion_engine.py  the vector animation engine (Minimalist Motion)
-character_rig.py  the stick-figure rig: six poses, solved by forward kinematics
+minimalist_engine.py  the vector animation engine (Minimalist Motion)
+vector_rig.py     the stick-figure rig: ten poses, a two-segment torso,
+                  solved by forward kinematics
 video_engine.py   reframing, looping, captions, the duel engine
 audio_engine.py   TTS, synthesized music beds, SFX, ducking
 gemini_engine.py  scripts, scene specs, video grounding
@@ -244,6 +250,7 @@ Run the tests:
 ```bash
 .venv\Scripts\python tests\test_narrative_unit.py     # no network, ~2s
 .venv\Scripts\python tests\test_narrative_ffmpeg.py   # needs ffmpeg, ~90s
+.venv\Scripts\python tests\test_vector_scenes.py     # no network, ~30s
 ```
 
 ---

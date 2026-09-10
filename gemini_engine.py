@@ -20,7 +20,7 @@ from typing import Any, Callable
 from dotenv import load_dotenv
 from google import genai
 
-from motion_engine import METAPHOR_TYPES, TEMPLATES
+from minimalist_engine import METAPHOR_TYPES, TEMPLATES
 
 # Load .env next to this file so the key is available before Client() is built;
 # genai.Client() reads GEMINI_API_KEY (or GOOGLE_API_KEY) from the environment.
@@ -594,7 +594,19 @@ def build_scene_prompt(concept: str, template: str = "auto",
             "concept. Do not default to the first one; a compounding idea wants "
             "a filling vessel, a trade-off wants two diverging paths, a "
             "cascade wants dominoes.\n\n"
-            "Five of them put a stick figure on screen. Reach for those when the "
+            "Route by the psychological premise underneath the words, not by "
+            "the vocabulary in them:\n"
+            "  consistency, compounding, time, patience, showing up  -> "
+            "compounding_jar, growth_consistency, staircase_progress or steep_staircase\n"
+            "  overthinking versus doing, planning versus starting, comparing "
+            "yourself  -> comparison_split, balance_scale or split_path\n"
+            "  perseverance, grinding, hidden effort, work nobody sees  -> "
+            "sisyphus_boulder or discipline_iceberg\n"
+            "  a decision between two futures  -> two_doors or split_path\n"
+            "  self-image, ego, delusion  -> delusion_mirror\n"
+            "  what is holding someone back  -> chain_anchor or gravity_funnel\n"
+            "  one small cause with a large effect  -> domino_chain\n\n"
+            "Eight of them put a stick figure on screen. Reach for those when the "
             "concept is about a person doing something — straining, climbing, "
             "comparing themselves to someone, dragging something, tending "
             "something — and for the abstract ones when it is about a quantity "

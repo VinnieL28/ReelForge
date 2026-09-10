@@ -84,7 +84,7 @@ from narrative_engine import (
     produce_episode,
 )
 from paths import EXPORTS_ROOT, ensure_dir
-from motion_engine import (
+from minimalist_engine import (
     AUTO_TEMPLATE,
     DEFAULT_TEMPLATE,
     METAPHOR_TYPES,
