@@ -1174,6 +1174,67 @@ def render_auto_creator(aspect_name: str) -> None:
                 st.markdown(f"**On-screen:** {s.get('caption', '')}  \n*Spoken:* {s.get('voiceover', '')}")
 
 
+# A current desktop Chrome string.
+#
+# This is the whole fix for the TikTok failure, and it is worth being precise
+# about why. With yt-dlp's own User-Agent, TikTok answers the webpage request
+# with a challenge page instead of the post, and the extractor reports
+# "Unexpected response from webpage request" -- which reads like a broken
+# extractor and sends you to the yt-dlp issue tracker. Measured on
+# tiktok.com/@tiktok/video/7106594312292453675: default UA fails, this UA
+# succeeds, on the identical URL. It is not a version problem.
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
+# Query parameters that only identify where a share link came from.
+#
+# Note what is NOT here: `v`, `list`, `t` and `start` are load-bearing.
+# youtube.com/watch?v=ABC123 IS the video id, so stripping everything after
+# "?" would turn a working YouTube link into the YouTube home page. Only known
+# tracking keys are dropped; anything unrecognised is kept.
+TRACKING_PARAMS: frozenset[str] = frozenset({
+    "is_from_webapp", "sender_device", "sender_web_id", "web_id", "_r", "_t",
+    "refer", "referer", "share_app_id", "share_item_id", "share_link_id",
+    "shareid", "timestamp", "u_code", "tt_from", "source", "enter_from",
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "fbclid", "gclid", "igshid", "igsh", "si", "feature", "app", "pp",
+    "ref_src", "ref_url", "s", "spm_id_from",
+})
+
+
+def sanitize_media_url(url: str) -> str:
+    """
+    Strips share-tracking parameters from a pasted link.
+
+    TikTok share links arrive as `.../video/12345?is_from_webapp=1&sender_device=pc`
+    and the tail is noise. It is dropped here so the extractor, the ledger and
+    the batch queue all see one canonical URL for the same post rather than
+    three variants of it.
+
+    Whitespace and surrounding angle brackets go too -- pasting from a chat
+    client routinely brings both.
+    """
+    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+    cleaned = str(url or "").strip().strip("<>").strip()
+    if not cleaned:
+        return ""
+    if not cleaned.lower().startswith(("http://", "https://")):
+        cleaned = "https://" + cleaned.lstrip("/")
+
+    try:
+        parts = urlsplit(cleaned)
+    except ValueError:
+        return cleaned
+
+    kept = [(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True)
+            if key.lower() not in TRACKING_PARAMS]
+    # The fragment is never meaningful for a video post and often carries
+    # analytics of its own.
+    return urlunsplit((parts.scheme, parts.netloc, parts.path,
+                       urlencode(kept), ""))
+
+
 def download_clip_from_url(url: str, dest_dir: str) -> dict[str, Any]:
     """
     Pulls a TikTok / Instagram Reel / YouTube Short down to a local MP4.
@@ -1184,6 +1245,7 @@ def download_clip_from_url(url: str, dest_dir: str) -> dict[str, Any]:
     import yt_dlp
     import imageio_ffmpeg
 
+    url = sanitize_media_url(url)
     os.makedirs(dest_dir, exist_ok=True)
     stem = os.path.join(dest_dir, f"source_{int(time.time())}")
 
@@ -1196,6 +1258,20 @@ def download_clip_from_url(url: str, dest_dir: str) -> dict[str, Any]:
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
+        # Present as a desktop browser. Without this TikTok serves a challenge
+        # page and the extractor fails with "Unexpected response from webpage
+        # request" -- see the note on BROWSER_UA.
+        "http_headers": {
+            "User-Agent": BROWSER_UA,
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.tiktok.com/",
+        },
+        # A share link that redirects (vm.tiktok.com, youtu.be) needs to be
+        # followed, and a single transient 5xx should not lose the clip.
+        "retries": 3,
+        "fragment_retries": 3,
+        "extractor_retries": 2,
+        "socket_timeout": 30,
         # yt-dlp needs ffmpeg to mux separate streams; use the bundled binary
         # rather than assuming one is on PATH.
         "ffmpeg_location": os.path.dirname(imageio_ffmpeg.get_ffmpeg_exe()),
@@ -1230,7 +1306,28 @@ def _explain_download_error(exc: Exception) -> str:
     raw = str(exc)
     low = raw.lower()
 
-    if "login" in low or "cookies" in low or "rate-limit" in low:
+    # A platform challenge. TikTok answers an unrecognised client with an
+    # interstitial instead of the post, and yt-dlp surfaces that as a parse
+    # failure pointing at its own issue tracker -- which sends people to file
+    # bugs about a working extractor.
+    if ("unexpected response from webpage" in low
+            or "unable to extract webpage video data" in low
+            or "captcha" in low
+            or ("verify" in low and "human" in low)):
+        return ("The platform served a verification page instead of the post.\n\n"
+                "That usually means it is rate-limiting this network, or the post "
+                "is region-locked. Try again in a few minutes, use a different "
+                "link, or download it manually and use the file uploader.\n\n"
+                + raw[:300])
+
+    if ("429" in raw or "too many requests" in low or "rate limit" in low
+            or "rate-limit" in low):
+        return ("The platform is rate-limiting this network — too many downloads "
+                "in a short window.\n\n"
+                "Wait a few minutes before trying again. Pasting five links at "
+                "once makes this more likely, not less.\n\n" + raw[:300])
+
+    if "login" in low or "cookies" in low:
         return ("This post needs a logged-in session (Instagram does this for many Reels). "
                 "Download it manually and use the file uploader instead.\n\n" + raw[:300])
     if "private" in low or "unavailable" in low or "removed" in low:
@@ -1645,8 +1742,24 @@ def render_commentary_studio() -> None:
                 placeholder=("https://www.tiktok.com/@user/video/…\n"
                              "one per line — up to 5"),
             )
-            urls = [u.strip() for u in url_text.splitlines() if u.strip()][:MAX_URL_BATCH]
-            extra = len([u for u in url_text.splitlines() if u.strip()]) - len(urls)
+            # Cleaned here rather than inside the downloader, so that the
+            # canonical URL is what reaches session state, the batch queue and
+            # the provenance ledger. Sanitising only at download time still
+            # left `?is_from_webapp=1&sender_device=pc` in the publish pack,
+            # and made one post pasted twice with different share tokens look
+            # like two different sources.
+            typed = [u for u in (sanitize_media_url(line) for line in url_text.splitlines()) if u]
+            urls: list[str] = []
+            for candidate in typed:
+                if candidate not in urls:
+                    urls.append(candidate)
+            duplicates = len(typed) - len(urls)
+            urls = urls[:MAX_URL_BATCH]
+            extra = len(typed) - duplicates - len(urls)
+
+            if duplicates > 0:
+                st.caption(f"↔️ {duplicates} duplicate link{'s' if duplicates > 1 else ''} "
+                           "ignored (same post, different share tracking).")
             if extra > 0:
                 st.caption(f"⚠️ Only the first {MAX_URL_BATCH} links will be used ({extra} ignored).")
 

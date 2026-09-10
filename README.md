@@ -251,6 +251,7 @@ Run the tests:
 .venv\Scripts\python tests\test_narrative_unit.py     # no network, ~2s
 .venv\Scripts\python tests\test_narrative_ffmpeg.py   # needs ffmpeg, ~90s
 .venv\Scripts\python tests\test_vector_scenes.py     # no network, ~30s
+.venv\Scripts\python tests\test_url_ingest.py        # needs network, ~20s
 ```
 
 ---

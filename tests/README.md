@@ -20,3 +20,8 @@ curves under load and straightens when upright, the pose aliases still resolve,
 all fifteen templates draw and change across their runtime, the palette stays
 monochrome on a black ground, and the easing curves are front- or back-loaded
 as intended. No network.
+
+`test_url_ingest.py` covers URL sanitising and the TikTok ingest fix: tracking
+parameters stripped, YouTube's `?v=` preserved (stripping everything after `?`
+would break it), idempotence, the five failure-message shapes, and a live
+TikTok download. Set `SKIP_NETWORK=1` to skip the download.
