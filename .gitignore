@@ -1,0 +1,141 @@
+# ---------------------------------------------------------------------------
+# Secrets -- NEVER commit these.
+#
+# .env holds live GEMINI_API_KEY and PEXELS_API_KEY. Anything matching .env*
+# is ignored, including the .env.bak backups this project writes when a key is
+# rotated. The example file is the one deliberate exception.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+*.env
+!.env.example
+secrets.json
+credentials.json
+
+# The user store. Holds PBKDF2 password hashes -- not plaintext, but a hash
+# file is still a target list, and committing it would publish who has access.
+# Ship users.example.json instead and let each deployment create its own.
+users.json
+users.json.tmp
+!users.example.json
+*.pem
+*.key
+!**/site-packages/**/*.key
+
+# ---------------------------------------------------------------------------
+# Generated media and provenance
+#
+# exports/ holds rendered videos, narration audio, downloaded source clips and
+# provenance.json. It is large, regenerable, and provenance.json can carry
+# source URLs you may not want public.
+# ---------------------------------------------------------------------------
+exports/
+temp/
+tmp/
+scratch/
+output/
+*.mp4
+*.webm
+*.mov
+*.mkv
+*.mp3
+*.wav
+*.m4a
+*.ass
+*.srt
+!assets/**
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ---------------------------------------------------------------------------
+# Virtual environments
+# ---------------------------------------------------------------------------
+.venv/
+venv/
+ENV/
+env/
+.virtualenv/
+pipenv/
+poetry.lock
+.python-version
+
+# ---------------------------------------------------------------------------
+# Tooling caches
+# ---------------------------------------------------------------------------
+.pytest_cache/
+.mypy_cache/
+.pyright/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+
+# ---------------------------------------------------------------------------
+# Logs and runtime droppings
+# ---------------------------------------------------------------------------
+*.log
+streamlit.log
+streamlit.err.log
+cloudflared.log
+cloudflared.err.log
+localtunnel.log
+localtunnel.err.log
+nohup.out
+*.pid
+
+# Binaries pulled down at runtime (cloudflared etc.)
+*.exe
+!.venv/**/*.exe
+
+# ---------------------------------------------------------------------------
+# Streamlit
+# ---------------------------------------------------------------------------
+.streamlit/secrets.toml
+
+# ---------------------------------------------------------------------------
+# Docker
+#
+# The Dockerfile and .dockerignore are committed on purpose -- they are the
+# deployment. Only local compose overrides and volumes are ignored.
+# ---------------------------------------------------------------------------
+docker-compose.override.yml
+.docker-data/
+
+# ---------------------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+.claude/settings.local.json
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,16 @@
+{
+  "users": {
+    "admin": {
+      "password_hash": "pbkdf2_sha256$240000$REPLACE_WITH_YOUR_SALT$REPLACE_WITH_YOUR_HASH",
+      "role": "admin",
+      "created_at": "2026-01-01 00:00:00",
+      "last_login": ""
+    },
+    "ana.k": {
+      "password_hash": "pbkdf2_sha256$240000$REPLACE_WITH_YOUR_SALT$REPLACE_WITH_YOUR_HASH",
+      "role": "creator",
+      "created_at": "2026-01-01 00:00:00",
+      "last_login": ""
+    }
+  }
+}

@@ -1,0 +1,27 @@
+# ReelForge Studio -- direct dependencies, pinned to the versions this project
+# is verified against. Everything else in .venv is a transitive dependency.
+#
+#   py -m venv .venv
+#   .venv\Scripts\pip install -r requirements.txt
+#
+# No system binaries are required. ffmpeg arrives with imageio-ffmpeg, and the
+# Minimalist Motion engine draws with Pillow rather than Cairo or manim so that
+# it runs on a bare Windows install.
+
+streamlit==1.63.0          # UI. 1.60+ needed for st.pills and width="stretch"
+moviepy==2.2.1             # v2 API: with_start / subclipped / with_volume_scaled
+                           # (moviepy.__version__ still reads 2.1.2 in this
+                           #  release -- the distribution version is 2.2.1)
+pillow==11.3.0             # all frame drawing, captions, vector animation
+numpy==2.5.3               # frame compositing and audio synthesis
+scipy==1.18.1              # WAV I/O and the convolution reverb
+imageio-ffmpeg==0.6.0      # bundled ffmpeg: encoding, libass, filter graphs
+edge-tts==7.2.8            # draft narration with exact word boundaries
+google-genai==2.22.0       # Gemini: video grounding, scripts, scene specs, TTS
+python-dotenv==1.2.3       # loads GEMINI_API_KEY / PEXELS_API_KEY from .env
+yt-dlp==2026.8.19          # TikTok / Reels / Shorts ingestion
+requests==2.34.2           # Pexels and Wikimedia Commons lookups
+
+# Authentication adds nothing: hashlib (PBKDF2-HMAC-SHA256), hmac, secrets and
+# json are all standard library. Verified against the imports in every module --
+# the eleven pins above are exactly the eleven third-party packages used.

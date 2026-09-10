@@ -1,0 +1,33 @@
+# Normalise line endings.
+#
+# This is not cosmetic. A Dockerfile checked out with CRLF has a carriage
+# return after every line-continuation backslash, and the Linux build fails
+# with "unknown instruction". Same story for shell scripts. Force LF for
+# everything that a Linux machine will execute or parse.
+
+* text=auto eol=lf
+
+Dockerfile      text eol=lf
+*.dockerfile    text eol=lf
+.dockerignore   text eol=lf
+*.sh            text eol=lf
+*.py            text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.json          text eol=lf
+*.toml          text eol=lf
+*.md            text eol=lf
+*.txt           text eol=lf
+.gitignore      text eol=lf
+.env.example    text eol=lf
+
+# Binary: never touch these.
+*.mp4  binary
+*.mp3  binary
+*.wav  binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.ttf  binary
+*.otf  binary
+*.ico  binary

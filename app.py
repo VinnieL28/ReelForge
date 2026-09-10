@@ -1,0 +1,4187 @@
+# pyright: reportUnknownMemberType=false, reportMissingTypeStubs=false, reportUnknownVariableType=false
+# pyright: reportUnknownArgumentType=false, reportUnknownParameterType=false
+# pyright: reportMissingParameterType=false, reportUnknownLambdaType=false
+"""
+Streamlit Web Application for the AI Reels & Shorts Studio.
+
+Two production modes share one render pipeline:
+  * Reel Studio      -- topic-to-reel scripting, Ken Burns slides, viral subtitles.
+  * Versus Duel      -- split-screen A/B comparisons with animated stat badges
+                        and a winner reveal, tuned for high-RPM comparison content.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import copy
+import glob
+import time
+import threading
+import traceback
+import tempfile
+from typing import Any, Callable, Sequence
+
+import streamlit as st
+from PIL import Image
+
+from demo_data import (
+    generate_sample_images,
+    create_gradient_mesh,
+    resolve_item_photo,
+    fetch_photo,
+    fetch_photo_set,
+    load_image_from_url,
+    fallback_backdrop,
+    search_licensed_video,
+    download_licensed_clip,
+    pexels_key_status,
+    PhotoLookupError,
+    DUEL_PRESETS,
+)
+from audio_engine import (
+    generate_synth_music,
+    save_wav_to_file,
+    generate_slide_voiceovers,
+    generate_voiceover,
+    synthesize_with_word_timings,
+    synthesize_narration,
+    GEMINI_VOICES,
+    build_ducked_bgm,
+    BGM_DEFAULT_VOLUME,
+    get_audio_duration,
+    VIRAL_VOICES,
+    DEFAULT_VOICE,
+)
+from compliance import (
+    LICENCES,
+    DEFAULT_LICENCE,
+    TTS_PROVIDERS,
+    SPEAKING_PROVIDERS,
+    normalise_licence,
+    append_ledger,
+    find_entry,
+    publish_readiness,
+    build_publish_pack,
+    attribution_line,
+    summarise_ledger,
+    AI_DISCLOSURE_LINE,
+    PLATFORM_DISCLOSURE_STEPS,
+    MONETIZATION_NOTES,
+)
+import auth
+from paths import EXPORTS_ROOT, ensure_dir
+from motion_engine import (
+    DEFAULT_TEMPLATE,
+    TEMPLATES,
+    active_face_name,
+    build_minimalist_video,
+    estimate_render_seconds,
+    fallback_scene_spec,
+    normalise_spec,
+)
+from video_engine import (
+    ASPECT_RATIOS,
+    DEFAULT_FIT,
+    FIT_MODES,
+    build_reel_video,
+    format_stat,
+    render_commentary_video,
+    export_muted_video,
+    write_ass_file,
+    LOOP_MODES,
+    FOCUS_POSITIONS,
+    purge_scratch_renders,
+    sweep_temp_renders,
+)
+from gemini_engine import (
+    SCENE_MAX_SECONDS,
+    SCENE_MIN_SECONDS,
+    SCENE_PRESETS,
+    fallback_publish_meta,
+    generate_scene_spec,
+    generate_commentary,
+    generate_commentary_angles,
+    SCRIPT_ANGLES,
+    ANGLE_ORDER,
+    estimate_speech_seconds,
+    DURATION_TARGETS,
+    DEFAULT_TARGET,
+    GeminiError,
+)
+
+st.set_page_config(
+    page_title="Reelforge Studio",
+    page_icon="🎬",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ---------------------------------------------------------------------------
+# Design system
+# ---------------------------------------------------------------------------
+
+THEME_CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
+
+:root {
+    --bg-base: #08090D;
+    --bg-raise: #0E1016;
+    --violet: #8B5CF6;
+    --indigo: #6366F1;
+    --amber: #FBBF24;
+    --cyan: #22D3EE;
+    --text-hi: #F2F4F8;
+    --text-mid: #A8B0C0;
+    --text-low: #6B7385;
+    --edge: rgba(255, 255, 255, 0.08);
+    --glass: rgba(255, 255, 255, 0.03);
+}
+
+html, body, .stApp, [class*="css"] {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'ss01';
+}
+
+.stApp {
+    background:
+        radial-gradient(1100px 620px at 12% -8%, rgba(139, 92, 246, 0.16), transparent 62%),
+        radial-gradient(900px 520px at 92% 4%, rgba(34, 211, 238, 0.10), transparent 58%),
+        radial-gradient(800px 620px at 50% 112%, rgba(251, 191, 36, 0.07), transparent 60%),
+        var(--bg-base);
+    color: var(--text-hi);
+}
+
+#MainMenu, footer, header [data-testid="stStatusWidget"] { visibility: hidden; }
+.block-container { padding-top: 2.4rem; padding-bottom: 4rem; max-width: 1500px; }
+
+h1, h2, h3, h4, h5 { font-family: 'Inter', sans-serif; color: var(--text-hi); letter-spacing: -0.022em; }
+h1 { font-weight: 800; }
+h2, h3 { font-weight: 700; }
+p, span, label, li { color: var(--text-mid); }
+
+/* ---------- Brand header ---------- */
+.rf-brand {
+    display: flex; align-items: center; gap: 14px; margin-bottom: 4px;
+}
+.rf-logo {
+    width: 42px; height: 42px; border-radius: 12px; flex: 0 0 42px;
+    background: linear-gradient(135deg, var(--violet), var(--indigo) 55%, var(--cyan));
+    display: flex; align-items: center; justify-content: center;
+    font-size: 21px; box-shadow: 0 8px 26px rgba(139, 92, 246, 0.42);
+}
+.rf-title {
+    font-size: 1.85rem; font-weight: 800; letter-spacing: -0.03em; line-height: 1.1;
+    background: linear-gradient(92deg, #FFFFFF 8%, #C4B5FD 48%, #FBBF24 96%);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+}
+.rf-sub { color: var(--text-low); font-size: 0.94rem; margin: 2px 0 22px 0; font-weight: 450; }
+
+/* ---------- Frosted glass containers ---------- */
+[data-testid="stVerticalBlockBorderWrapper"]:has(> div > div > [data-testid="stVerticalBlock"]) {
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border-radius: 16px;
+    padding: 20px;
+    box-shadow: 0 10px 34px rgba(0, 0, 0, 0.34);
+    transition: border-color 160ms ease, box-shadow 160ms ease;
+}
+[data-testid="stVerticalBlockBorderWrapper"]:hover { border-color: rgba(255, 255, 255, 0.14); }
+
+/* ---------- Badges, tags, section labels ---------- */
+.rf-badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 11px; border-radius: 999px;
+    font-size: 0.72rem; font-weight: 650; letter-spacing: 0.035em; text-transform: uppercase;
+    border: 1px solid rgba(255, 255, 255, 0.12); background: rgba(255, 255, 255, 0.05);
+    color: var(--text-mid); margin-right: 6px;
+}
+.rf-badge.violet { background: rgba(139, 92, 246, 0.16); border-color: rgba(139, 92, 246, 0.42); color: #C9B8FF; }
+.rf-badge.cyan   { background: rgba(34, 211, 238, 0.14);  border-color: rgba(34, 211, 238, 0.40);  color: #9BE9F7; }
+.rf-badge.amber  { background: rgba(251, 191, 36, 0.14);  border-color: rgba(251, 191, 36, 0.40);  color: #FBD98A; }
+.rf-badge.green  { background: rgba(52, 211, 153, 0.14);  border-color: rgba(52, 211, 153, 0.38);  color: #86EFC5; }
+
+.rf-tag-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0 14px 0; }
+.rf-stat {
+    flex: 1 1 120px; padding: 12px 14px; border-radius: 13px;
+    background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.08);
+    backdrop-filter: blur(12px);
+}
+.rf-stat .k { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.07em; color: var(--text-low); font-weight: 650; }
+.rf-stat .v { font-size: 1.32rem; font-weight: 750; color: var(--text-hi); margin-top: 3px; letter-spacing: -0.02em; }
+.rf-stat.cyan .v  { color: var(--cyan); }
+.rf-stat.amber .v { color: var(--amber); }
+
+.rf-angle {
+    font-size: 0.82rem; line-height: 1.45; color: var(--text-mid);
+    background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 10px; padding: 10px 12px; margin: 8px 0 10px 0; min-height: 92px;
+}
+.rf-section { font-size: 0.74rem; font-weight: 700; letter-spacing: 0.10em; text-transform: uppercase;
+              color: var(--text-low); margin: 6px 0 10px 0; }
+.rf-hr { height: 1px; background: linear-gradient(90deg, transparent, var(--edge) 18%, var(--edge) 82%, transparent); margin: 22px 0; border: 0; }
+
+/* ---------- Buttons ---------- */
+.stButton > button, .stDownloadButton > button, .stFormSubmitButton > button {
+    border-radius: 11px; font-weight: 600; font-size: 0.88rem; letter-spacing: -0.005em;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    background: rgba(255, 255, 255, 0.045); color: var(--text-hi);
+    padding: 0.55rem 1.05rem; transition: all 150ms cubic-bezier(0.2, 0, 0.2, 1);
+}
+.stButton > button:hover, .stDownloadButton > button:hover {
+    background: rgba(255, 255, 255, 0.09); border-color: rgba(255, 255, 255, 0.24);
+    transform: translateY(-1px);
+}
+.stButton > button[kind="primary"], .stFormSubmitButton > button[kind="primary"] {
+    background: linear-gradient(96deg, var(--violet), var(--indigo) 62%, #4F46E5);
+    border: 1px solid rgba(167, 139, 250, 0.60); color: #FFFFFF; font-weight: 650;
+    box-shadow: 0 8px 26px rgba(99, 102, 241, 0.36);
+}
+.stButton > button[kind="primary"]:hover {
+    box-shadow: 0 12px 34px rgba(139, 92, 246, 0.52); transform: translateY(-1px);
+    border-color: rgba(196, 181, 253, 0.85);
+}
+.stButton > button:focus-visible { outline: none; box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.42); }
+
+/* ---------- Inputs ---------- */
+.stTextInput input, .stTextArea textarea, .stNumberInput input,
+.stSelectbox div[data-baseweb="select"] > div, .stMultiSelect div[data-baseweb="select"] > div {
+    background: rgba(255, 255, 255, 0.035) !important;
+    border: 1px solid rgba(255, 255, 255, 0.10) !important;
+    border-radius: 11px !important; color: var(--text-hi) !important;
+    transition: border-color 150ms ease, box-shadow 150ms ease;
+}
+.stTextInput input:focus, .stTextArea textarea:focus, .stNumberInput input:focus {
+    border-color: rgba(139, 92, 246, 0.75) !important;
+    box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.20) !important;
+}
+.stTextInput input::placeholder, .stTextArea textarea::placeholder { color: var(--text-low) !important; }
+.stTextInput label, .stTextArea label, .stSelectbox label, .stSlider label,
+.stNumberInput label, .stRadio label, .stCheckbox label, .stFileUploader label {
+    font-size: 0.79rem !important; font-weight: 600 !important; color: var(--text-mid) !important;
+    letter-spacing: 0.005em;
+}
+
+/* ---------- Pills / segmented control ---------- */
+[data-baseweb="button-group"] button {
+    background: rgba(255, 255, 255, 0.04) !important;
+    border: 1px solid rgba(255, 255, 255, 0.10) !important;
+    color: var(--text-mid) !important; border-radius: 999px !important;
+    font-weight: 600 !important; font-size: 0.82rem !important; padding: 0.35rem 0.95rem !important;
+    transition: all 140ms ease;
+}
+[data-baseweb="button-group"] button:hover {
+    border-color: rgba(139, 92, 246, 0.45) !important; color: var(--text-hi) !important;
+}
+[data-baseweb="button-group"] button[aria-checked="true"],
+[data-baseweb="button-group"] button[aria-pressed="true"] {
+    background: linear-gradient(96deg, rgba(139, 92, 246, 0.30), rgba(99, 102, 241, 0.24)) !important;
+    border-color: rgba(167, 139, 250, 0.70) !important; color: #FFFFFF !important;
+    box-shadow: 0 0 0 1px rgba(139, 92, 246, 0.24), 0 6px 18px rgba(99, 102, 241, 0.24);
+}
+
+/* ---------- Tabs ---------- */
+.stTabs [data-baseweb="tab-list"] {
+    gap: 6px; background: rgba(255, 255, 255, 0.03); padding: 6px;
+    border-radius: 14px; border: 1px solid var(--edge); backdrop-filter: blur(12px);
+}
+.stTabs [data-baseweb="tab"] {
+    height: auto; padding: 9px 17px; border-radius: 10px; background: transparent;
+    color: var(--text-mid); font-weight: 600; font-size: 0.87rem; border: none;
+    transition: all 150ms ease;
+}
+.stTabs [data-baseweb="tab"]:hover { background: rgba(255, 255, 255, 0.05); color: var(--text-hi); }
+.stTabs [aria-selected="true"] {
+    background: linear-gradient(96deg, rgba(139, 92, 246, 0.28), rgba(99, 102, 241, 0.20)) !important;
+    color: #FFFFFF !important; box-shadow: inset 0 0 0 1px rgba(167, 139, 250, 0.45);
+}
+.stTabs [data-baseweb="tab-highlight"], .stTabs [data-baseweb="tab-border"] { display: none; }
+
+/* ---------- Sliders ---------- */
+.stSlider [data-baseweb="slider"] div[role="slider"] {
+    background: linear-gradient(135deg, var(--violet), var(--indigo)) !important;
+    border: 2px solid rgba(255, 255, 255, 0.85) !important;
+    box-shadow: 0 3px 12px rgba(139, 92, 246, 0.55) !important;
+}
+.stSlider [data-testid="stSliderTickBarMin"], .stSlider [data-testid="stSliderTickBarMax"] {
+    color: var(--text-low); font-size: 0.7rem;
+}
+
+/* ---------- Metrics ---------- */
+[data-testid="stMetric"] {
+    background: rgba(255, 255, 255, 0.03); border: 1px solid var(--edge);
+    border-radius: 14px; padding: 14px 16px; backdrop-filter: blur(12px);
+}
+[data-testid="stMetricLabel"] p {
+    font-size: 0.70rem !important; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--text-low) !important; font-weight: 650 !important;
+}
+[data-testid="stMetricValue"] {
+    font-size: 1.5rem !important; font-weight: 750 !important; color: var(--text-hi) !important;
+    letter-spacing: -0.025em;
+}
+
+/* ---------- Sidebar ---------- */
+[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, rgba(14, 16, 22, 0.96), rgba(8, 9, 13, 0.98));
+    border-right: 1px solid var(--edge);
+}
+[data-testid="stSidebar"] .block-container { padding-top: 1.6rem; }
+
+/* ---------- Expander, uploader, progress, alerts ---------- */
+.stExpander, [data-testid="stExpander"] {
+    background: rgba(255, 255, 255, 0.025); border: 1px solid var(--edge) !important;
+    border-radius: 14px !important; backdrop-filter: blur(12px); overflow: hidden;
+}
+[data-testid="stFileUploaderDropzone"] {
+    background: rgba(255, 255, 255, 0.025); border: 1px dashed rgba(255, 255, 255, 0.16);
+    border-radius: 14px; transition: border-color 150ms ease;
+}
+[data-testid="stFileUploaderDropzone"]:hover { border-color: rgba(139, 92, 246, 0.55); }
+.stProgress > div > div > div > div {
+    background: linear-gradient(90deg, var(--violet), var(--indigo) 55%, var(--cyan)) !important;
+}
+[data-testid="stAlert"] { border-radius: 13px; border: 1px solid var(--edge); backdrop-filter: blur(12px); }
+[data-testid="stVideo"] video { border-radius: 16px; box-shadow: 0 18px 50px rgba(0, 0, 0, 0.55); }
+[data-testid="stImage"] img { border-radius: 12px; }
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.12); border-radius: 8px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(139, 92, 246, 0.45); }
+</style>
+"""
+
+st.markdown(THEME_CSS, unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
+# Export handling
+#
+# Renders go to a project-local exports/ folder with a unique timestamped name.
+# The previous code wrote to tempfile.NamedTemporaryFile(...).name, which on
+# Windows leaves an OPEN HANDLE holding a lock on the path (verified: renaming
+# it raises WinError 32) -- so ffmpeg could intermittently fail to write it.
+# %TEMP% is also swept by Windows cleanup, which made finished renders vanish.
+# ---------------------------------------------------------------------------
+
+def current_user() -> dict[str, Any]:
+    """The signed-in user, or an empty record before the gate has run."""
+    session = st.session_state.get("auth")
+    return session if isinstance(session, dict) else {}
+
+
+def user_exports() -> str:
+    """
+    The signed-in user's own exports folder, created on demand.
+
+    Every render, ledger write and download resolves through here rather than
+    through a module constant, because a module constant is process-wide and
+    this process serves every user at once. `_unassigned` is unreachable from
+    the UI -- the login gate stops before any panel renders -- and exists only
+    so a stray call cannot land in someone else's directory.
+    """
+    return ensure_dir(auth.user_exports_dir(str(current_user().get("username") or "_unassigned")))
+
+
+def new_export_path(prefix: str) -> str:
+    """Returns a fresh, unique output path inside the current user's folder."""
+    return os.path.join(user_exports(), f"{prefix}_{int(time.time())}.mp4")
+
+
+# Intermediates a render leaves behind. Finished deliverables (commentary_*,
+# reel_*, duel_*, muted_*, narration_*, source_*) are deliberately absent:
+# those are the user's work product and are never touched.
+SCRATCH_PATTERNS: tuple[str, ...] = (
+    "bgm_*.wav",
+    "captions_*.ass",
+    "music_*.wav",
+    "focus_*.png",
+    "*__nosubs*.mp4",
+)
+
+SCRATCH_MAX_AGE = 3600.0        # one hour
+
+
+def cleanup_exports(
+    max_age_seconds: float = SCRATCH_MAX_AGE,
+    directory: str = "",
+    protect: Sequence[str] = (),
+) -> dict[str, Any]:
+    """
+    Purges stale render intermediates from exports/.
+
+    Only files matching SCRATCH_PATTERNS and older than `max_age_seconds` are
+    removed, and anything still referenced by the live session is protected
+    regardless of age -- a long editing session can easily outlive the cutoff
+    while its .ass and BGM are still needed for the next render.
+    """
+    target = directory or user_exports()
+    if not os.path.isdir(target):
+        return {"removed": 0, "bytes": 0, "errors": 0}
+
+    guarded = {os.path.abspath(p) for p in protect if p}
+    cutoff = time.time() - max(0.0, float(max_age_seconds))
+    removed = freed = errors = 0
+
+    for pattern in SCRATCH_PATTERNS:
+        for path in glob.glob(os.path.join(target, pattern)):
+            try:
+                if os.path.abspath(path) in guarded:
+                    continue
+                if os.path.getmtime(path) > cutoff:
+                    continue
+                size = os.path.getsize(path)
+                os.remove(path)
+                removed += 1
+                freed += size
+            except OSError:
+                # A file being written by another process is simply skipped;
+                # it will age out on the next sweep.
+                errors += 1
+
+    return {"removed": removed, "bytes": freed, "errors": errors}
+
+
+def _session_protected_paths() -> list[str]:
+    """Paths the current session still depends on, immune from the sweep."""
+    keep: list[str] = []
+    commentary = st.session_state.get("commentary") or {}
+    for key in ("ass_path", "audio_path", "source_path"):
+        value = commentary.get(key)
+        if value:
+            keep.append(str(value))
+    for scope in ("commentary", "reel", "duel"):
+        value = st.session_state.get(f"{scope}_video_path")
+        if value:
+            keep.append(str(value))
+    return keep
+
+
+def sweep_scratch_files(force: bool = False) -> dict[str, Any]:
+    """
+    Runs the sweep at most once per session unless `force` is set.
+
+    Called on first load and again after each render, which is when new
+    intermediates appear.
+    """
+    if not force and st.session_state.get("_scratch_swept"):
+        return {"removed": 0, "bytes": 0, "errors": 0}
+    st.session_state["_scratch_swept"] = True
+    result = cleanup_exports(protect=_session_protected_paths())
+    # The temp directory too: a render that crashed before its purge ran would
+    # otherwise leave a source-clip-sized file there permanently.
+    stale = sweep_temp_renders()
+    result["removed"] += stale["removed"]
+    result["bytes"] += stale["bytes"]
+    return result
+
+
+def clear_rendered_video(scope: str) -> None:
+    """
+    Drops a previously rendered video from session state.
+
+    Called whenever a new script or duel is built, so the player can never show
+    a stale render from the last build.
+    """
+    for key in (f"{scope}_video_path", f"{scope}_video_bytes", f"{scope}_video_name"):
+        st.session_state.pop(key, None)
+
+
+def show_rendered_video(scope: str, label: str, slot: str) -> None:
+    """
+    Renders the player + download button for a finished video.
+
+    The download button is handed the raw bytes captured at render time with a
+    filename unique to that render, so a browser can never serve a cached copy
+    of an earlier export.
+
+    `slot` identifies the call site. The same video is offered in more than one
+    tab, and Streamlit rejects two widgets sharing a key -- so the key must mix
+    in where it is being drawn, not just which video it is.
+    """
+    path = st.session_state.get(f"{scope}_video_path")
+    data = st.session_state.get(f"{scope}_video_bytes")
+    if not path or not data:
+        return
+
+    with st.container(border=True):
+        st.markdown(f"#### 🎉 {label}")
+        st.markdown(
+            badge(os.path.basename(path), "violet") + badge(f"{len(data) / 1_048_576:.1f} MB", "cyan"),
+            unsafe_allow_html=True,
+        )
+        _, mid, _ = st.columns([1, 2, 1])
+        with mid:
+            st.video(data)
+        st.download_button(
+            "📥 Download MP4",
+            data=data,
+            file_name=st.session_state.get(f"{scope}_video_name", os.path.basename(path)),
+            mime="video/mp4",
+            width="stretch",
+            key=f"dl_{slot}_{scope}_{os.path.basename(path)}",
+        )
+        st.caption(f"Saved to `{path}`")
+
+
+def badge(text: str, tone: str = "") -> str:
+    """Inline pill badge markup."""
+    return f'<span class="rf-badge {tone}">{text}</span>'
+
+
+def section(label: str) -> None:
+    """Small uppercase section label."""
+    st.markdown(f'<div class="rf-section">{label}</div>', unsafe_allow_html=True)
+
+
+def stat_row(items: Sequence[tuple[str, str, str]]) -> None:
+    """Compact metric tags: a sequence of (label, value, tone)."""
+    cells = "".join(
+        f'<div class="rf-stat {tone}"><div class="k">{k}</div><div class="v">{v}</div></div>'
+        for k, v, tone in items
+    )
+    st.markdown(f'<div class="rf-tag-row">{cells}</div>', unsafe_allow_html=True)
+
+
+def divider() -> None:
+    st.markdown('<hr class="rf-hr">', unsafe_allow_html=True)
+
+
+def pick(
+    label: str,
+    options: Sequence[Any],
+    default: Any,
+    key: str,
+    format_func: Callable[[Any], str] = str,
+    help: str | None = None,
+) -> Any:
+    """
+    Pill selector that never returns None.
+
+    st.pills allows deselection, which would otherwise hand downstream code a
+    None where it expects a real option.
+    """
+    chosen = st.pills(
+        label, list(options), default=default, key=key,
+        format_func=format_func, help=help,
+    )
+    return default if chosen is None else chosen
+
+
+# ---------------------------------------------------------------------------
+# Viral script templates: Hook -> Value Points -> Call To Action
+# ---------------------------------------------------------------------------
+
+_AUTO_PALETTES = [
+    ((10, 15, 45), (120, 20, 110), (255, 110, 60)),
+    ((5, 30, 50), (10, 90, 120), (120, 220, 200)),
+    ((40, 10, 60), (130, 30, 120), (255, 140, 180)),
+    ((15, 20, 25), (70, 60, 40), (240, 200, 120)),
+    ((8, 12, 40), (60, 40, 130), (150, 120, 255)),
+]
+
+
+def _extract_subject(topic: str) -> str:
+    """
+    Strips listicle scaffolding off a topic so it can be dropped mid-sentence.
+    '5 Mind-Blowing Facts About Space' -> 'space'
+    """
+    t = topic.strip().rstrip(".!?")
+    t = re.sub(r"^\s*\d+\s*", "", t)
+    t = re.sub(
+        r"^(mind[- ]?blowing|shocking|insane|crazy|surprising|weird|amazing|"
+        r"unbelievable|little[- ]known|hidden)\s+",
+        "", t, flags=re.I,
+    )
+    t = re.sub(r"^(facts?|secrets?|tips?|reasons?|things?|habits?|rules?|ways?)\s+", "", t, flags=re.I)
+    t = re.sub(r"^(about|of|for|on|to)\s+", "", t, flags=re.I)
+    return (t or topic).strip().lower()
+
+
+def _count_from_topic(topic: str, default: int = 3) -> int:
+    """Pulls the listicle number out of a topic when the user supplied one."""
+    m = re.match(r"\s*(\d+)\b", topic.strip())
+    if m:
+        n = int(m.group(1))
+        if 2 <= n <= 6:
+            return n
+    return default
+
+
+def _build_points(frames: Sequence[str], n: int, subject: str) -> list[str]:
+    """
+    Renders `n` distinct value-point lines from a pool of phrasings.
+
+    The pool is cycled rather than repeated verbatim so a 6-point reel never
+    ships the same sentence twice -- duplicate lines are the fastest way to
+    kill retention.
+    """
+    return [frames[(i - 1) % len(frames)].format(i=i, subject=subject) for i in range(1, n + 1)]
+
+
+def _tpl_listicle(topic: str, subject: str, n: int) -> tuple[str, list[str], str]:
+    hook = f"{n} things about {subject} that nobody told you"
+    frames = [
+        "Number {i} will change how you see {subject} forever",
+        "Number {i} is the one almost everyone gets wrong",
+        "Number {i} is what the experts stay quiet about",
+        "Number {i} sounds impossible until you see the proof",
+        "Number {i} took me years to figure out",
+        "Number {i} is the reason most people give up on {subject}",
+    ]
+    return hook, _build_points(frames, n, subject), "Follow for part two — you don't want to miss it"
+
+
+def _tpl_secrets(topic: str, subject: str, n: int) -> tuple[str, list[str], str]:
+    hook = f"Stop scrolling — the truth about {subject}"
+    frames = [
+        "Secret {i}: this is what actually moves the needle with {subject}",
+        "Secret {i}: everyone chases the opposite of this, and loses",
+        "Secret {i}: the pros built their whole system around it",
+        "Secret {i}: it costs nothing, and almost nobody does it",
+        "Secret {i}: this is the part they leave out of the tutorials",
+        "Secret {i}: once you see it, you cannot unsee it",
+    ]
+    return hook, _build_points(frames, n, subject), "Save this before it disappears"
+
+
+def _tpl_habits(topic: str, subject: str, n: int) -> tuple[str, list[str], str]:
+    # Avoid "luxury habits habits" when the topic already names the noun.
+    phrase = subject if subject.rstrip("s").endswith("habit") else f"{subject} habits"
+    hook = f"{n} {phrase} that separate the top 1 percent"
+    frames = [
+        "Habit {i}: they do this every single day without fail",
+        "Habit {i}: they protect their first hour like it's an asset",
+        "Habit {i}: they say no to almost everything",
+        "Habit {i}: they track it, so it never quietly slips",
+        "Habit {i}: they finish the boring part first",
+        "Habit {i}: they invest before they spend, every time",
+    ]
+    return hook, _build_points(frames, n, subject), "Which habit are you starting today? Comment below"
+
+
+def _tpl_mistakes(topic: str, subject: str, n: int) -> tuple[str, list[str], str]:
+    hook = f"You're doing {subject} wrong — here's why"
+    frames = [
+        "Mistake {i}: this quietly costs you more than you think",
+        "Mistake {i}: you're optimizing the thing that matters least",
+        "Mistake {i}: copying someone whose starting point wasn't yours",
+        "Mistake {i}: quitting right before the compounding kicks in",
+        "Mistake {i}: confusing being busy with making progress",
+        "Mistake {i}: waiting until it feels perfect to start",
+    ]
+    return hook, _build_points(frames, n, subject), "Fix these and thank me later — follow for more"
+
+
+def _tpl_story(topic: str, subject: str, n: int) -> tuple[str, list[str], str]:
+    hook = f"Nobody believed me about {subject} — until this happened"
+    frames = [
+        "It started when everything about {subject} stopped working",
+        "Then I found the one detail everybody else had skipped",
+        "That's when the whole thing finally started to click",
+        "But the part nobody warned me about was still coming",
+        "So I rebuilt it from scratch, and this time it held",
+        "Now the results speak louder than anything I could say",
+    ]
+    return hook, _build_points(frames, n, subject), "Follow so you don't miss what happened next"
+
+
+SCRIPT_TEMPLATES: dict[str, tuple[str, Callable[[str, str, int], tuple[str, list[str], str]]]] = {
+    "listicle": ("🔢 Viral Listicle", _tpl_listicle),
+    "secrets": ("🤫 Secrets Reveal", _tpl_secrets),
+    "habits": ("👑 Top 1% Habits", _tpl_habits),
+    "mistakes": ("⚠️ You're Doing It Wrong", _tpl_mistakes),
+    "story": ("📖 Storytime", _tpl_story),
+}
+
+
+def _short_caption(line: str, max_words: int = 11) -> str:
+    """
+    Turns a spoken line into an on-screen subtitle.
+
+    Short lines are kept whole -- the viral renderer wraps and centers them, and
+    matching the narration word-for-word reads better than a clipped fragment.
+    Only genuinely long lines get trimmed, and always at a clause boundary so
+    the subtitle never cuts off mid-phrase.
+    """
+    words = line.split()
+    if len(words) <= max_words:
+        return line
+
+    clipped = " ".join(words[:max_words])
+    for sep in ("—", ",", ":", ";"):
+        if sep in clipped:
+            return clipped.rsplit(sep, 1)[0].strip(" —,:;")
+    return clipped.rstrip(" ,:;—") + "..."
+
+
+def generate_viral_script(
+    topic: str,
+    template_key: str = "listicle",
+    num_points: int = 3,
+    size: tuple[int, int] = (1080, 1350),
+    use_photos: bool = True,
+) -> list[dict[str, Any]]:
+    """
+    Builds a complete Hook -> Value Points -> CTA slide deck from a single topic.
+
+    The copy is a structurally-proven viral scaffold, not researched fact -- the
+    value points are meant to be edited with the real content.
+    """
+    subject = _extract_subject(topic)
+    _label, builder = SCRIPT_TEMPLATES.get(template_key, SCRIPT_TEMPLATES["listicle"])
+    hook, points, cta = builder(topic, subject, num_points)
+
+    lines = [("hook", hook)] + [("point", p) for p in points] + [("cta", cta)]
+    motions = ["zoom_in", "pan_right", "zoom_out", "pan_left", "breathe"]
+
+    # One clean query, several distinct results -- one per slide.
+    photo_set: list[tuple[Any, str]] = []
+    if use_photos:
+        try:
+            photo_set = _cached_photo_set(subject, len(lines))
+        except Exception:
+            photo_set = []
+
+    slides: list[dict[str, Any]] = []
+    for idx, (role, line) in enumerate(lines):
+        credit = ""
+        image = None
+
+        if photo_set:
+            image, credit = photo_set[idx % len(photo_set)]
+
+        if image is None:
+            c1, c2, c3 = _AUTO_PALETTES[idx % len(_AUTO_PALETTES)]
+            image = create_gradient_mesh(size[0], size[1], c1, c2, c3, angle=30 + idx * 15)
+
+        slides.append({
+            "kind": "image",
+            "image": image,
+            "credit": credit,
+            "query": subject,
+            "title": f"{role.upper()} — {topic.strip()}",
+            "caption": _short_caption(line),
+            "voiceover": line,
+            "duration": 3.5,
+            "motion": motions[idx % len(motions)],
+            "caption_pos": "center",
+            "caption_style": "viral",
+            "role": role,
+        })
+    return slides
+
+
+# ---------------------------------------------------------------------------
+# Versus Duel: narration + slide assembly
+# ---------------------------------------------------------------------------
+
+# Spoken forms of stat units -- "23h" must be narrated as "23 hours".
+_UNIT_SPEECH = {
+    "$": "dollars", "h": "hours", "hp": "horsepower", "s": "seconds",
+    "%": "percent", "": "", "★": "stars", "mi": "miles", "kg": "kilograms",
+}
+
+
+def speak_stat(value: float, unit: str) -> str:
+    """Renders a score the way a narrator should say it."""
+    body = f"{value:,.0f}" if float(value).is_integer() else f"{value:,.1f}"
+    word = _UNIT_SPEECH.get(unit, unit)
+    return f"{body} {word}".strip()
+
+
+def duel_tally(rounds: Sequence[dict[str, Any]]) -> tuple[int, int]:
+    """Counts rounds won by A and by B."""
+    a = sum(1 for r in rounds if str(r.get("winner", "")).upper() == "A")
+    b = sum(1 for r in rounds if str(r.get("winner", "")).upper() == "B")
+    return a, b
+
+
+def build_duel_slides(duel: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    Assembles a full duel reel: intro hook, one slide per metric round, then the
+    winner reveal -- each with narration written to read smoothly aloud.
+
+    Rounds carry their own pacing overrides so the winner reveal always lands
+    after the narrator has finished the round.
+    """
+    item_a, item_b = duel["a"], duel["b"]
+    rounds = [r for r in duel["rounds"] if str(r.get("metric", "")).strip()]
+    name_a, name_b = item_a.get("name", "Item A"), item_b.get("name", "Item B")
+    layout = duel.get("layout", "stacked")
+
+    slides: list[dict[str, Any]] = [{
+        "kind": "duel_intro",
+        "item_a": item_a,
+        "item_b": item_b,
+        "layout": layout,
+        "caption": duel.get("headline") or f"{name_a} vs {name_b}",
+        # Narration is deliberately terse: spoken numbers eat runtime fast, and
+        # duels only monetize if the whole reel stays inside a short's window.
+        "voiceover": f"{name_a} versus {name_b}. Who wins?",
+        "duration": 4.0,
+        "lead_in": 0.30, "tail_out": 0.80, "min_duration": 3.2,
+        "role": "duel_intro",
+    }]
+
+    for i, rnd in enumerate(rounds, start=1):
+        unit = str(rnd.get("unit", "") or "")
+        a_val = float(rnd.get("a_score", 0) or 0)
+        b_val = float(rnd.get("b_score", 0) or 0)
+        winner = str(rnd.get("winner", "")).upper()
+        metric = str(rnd.get("metric", f"Round {i}"))
+
+        if winner == "A":
+            verdict = f" {name_a} wins."
+        elif winner == "B":
+            verdict = f" {name_b} wins."
+        else:
+            verdict = " Dead even."
+
+        # The second score drops the unit -- the narrator already established it,
+        # and every repeated word costs a second of a very short runtime.
+        slides.append({
+            "kind": "duel_round",
+            "item_a": item_a,
+            "item_b": item_b,
+            "round": rnd,
+            "layout": layout,
+            "caption": f"{metric}: {format_stat(a_val, unit)} vs {format_stat(b_val, unit)}",
+            "voiceover": (
+                f"{metric}. {name_a}, {speak_stat(a_val, unit)}. "
+                f"{name_b}, {speak_stat(b_val, '')}.{verdict}"
+            ),
+            "duration": 5.5,
+            # Tail room so the winner glow (at 72% of the round) reads after the line.
+            "lead_in": 0.40, "tail_out": 0.90, "min_duration": 4.5,
+            "role": "duel_round",
+        })
+
+    ta, tb = duel_tally(rounds)
+    a_wins = ta >= tb
+    winner_item = item_a if a_wins else item_b
+    winner_name = name_a if a_wins else name_b
+    cta = duel.get("cta") or "Which one would you pick?"
+
+    if ta == tb:
+        verdict_line = f"Dead heat, {ta} all. You decide."
+    else:
+        verdict_line = f"{winner_name} takes it, {max(ta, tb)} to {min(ta, tb)}."
+
+    slides.append({
+        "kind": "duel_winner",
+        "winner_item": winner_item,
+        "winner_is_a": a_wins,
+        "tally": (max(ta, tb), min(ta, tb)),
+        "layout": layout,
+        "caption": cta,
+        "voiceover": f"{verdict_line} {cta} Comment below.",
+        "duration": 4.5,
+        "lead_in": 0.40, "tail_out": 1.00, "min_duration": 4.0,
+        "role": "duel_winner",
+    })
+
+    return slides
+
+
+@st.cache_data(show_spinner=False, max_entries=48)
+def _cached_search(query: str) -> tuple[Any, str]:
+    """Caches a stock-photo lookup so re-runs don't re-download on every keystroke."""
+    return fetch_photo(query)
+
+
+@st.cache_data(show_spinner=False, max_entries=24)
+def _cached_photo_set(query: str, count: int) -> list[tuple[Any, str]]:
+    """Caches a multi-photo lookup used to give each reel slide its own image."""
+    return fetch_photo_set(query, count)
+
+
+@st.cache_data(show_spinner=False, max_entries=48)
+def _cached_url(url: str) -> Any:
+    """Caches a direct-URL image fetch across Streamlit re-runs."""
+    return load_image_from_url(url)
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def _cached_preset_photo(preset_name: str, side: str) -> tuple[Any, str]:
+    """Resolves (and caches) a preset side's pinned photograph."""
+    return resolve_item_photo(DUEL_PRESETS[preset_name][side])
+
+
+def duel_from_preset(preset_name: str) -> dict[str, Any]:
+    """Materializes a quick-fill preset, resolving each side's real photograph."""
+    preset = copy.deepcopy(DUEL_PRESETS[preset_name])
+    duel: dict[str, Any] = {"preset": preset_name, "layout": "stacked"}
+
+    for side in ("a", "b"):
+        item = dict(preset[side])
+        try:
+            item["image"], item["credit"] = _cached_preset_photo(preset_name, side)
+        except Exception as exc:
+            item["image"] = fallback_backdrop()
+            item["credit"] = f"Photo unavailable ({type(exc).__name__})"
+        duel[side] = item
+
+    duel["rounds"] = list(preset["rounds"])
+    duel["headline"] = f"{duel['a']['name']} vs {duel['b']['name']}"
+    duel["cta"] = "Which one would you pick?"
+    return duel
+
+
+# ---------------------------------------------------------------------------
+# Session state
+# ---------------------------------------------------------------------------
+
+if "slides" not in st.session_state:
+    demo_samples = generate_sample_images()
+    captions_map = {
+        "01_Tokyo_Skyline.jpg": "Tokyo Nights & Cyber Glow 🗼✨",
+        "02_Aesthetic_Coffee.jpg": "Morning Brew & Artisan Coffee ☕",
+        "03_Swiss_Alps.jpg": "Alpine Escapes & Sunset Peaks 🏔️",
+        "04_Luxury_Villa.jpg": "Modern Architecture & Dream Living 🏡",
+    }
+    st.session_state.slides = [{
+        "kind": "image",
+        "image": s["image"],
+        "title": s["title"],
+        "caption": captions_map.get(s["name"], s["title"]),
+        "voiceover": "",
+        "duration": 3.5,
+        "motion": "zoom_in",
+        "caption_pos": "center",
+        "caption_style": "viral",
+    } for s in demo_samples]
+
+if "audio_settings" not in st.session_state:
+    st.session_state.audio_settings = {
+        "source": "Procedural AI Synth Music",
+        "style": "lofi",
+        "volume": 0.85,
+        "custom_path": None,
+    }
+
+if "voice_settings" not in st.session_state:
+    st.session_state.voice_settings = {
+        "enabled": False,
+        "voice": DEFAULT_VOICE,
+        "rate_pct": 12,
+        "pitch_hz": 0,
+        "volume": 1.0,
+        "music_duck": 0.28,
+        "synced": False,
+        "sfx_enabled": True,
+        "sfx_volume": 0.55,
+    }
+
+if "commentary" not in st.session_state:
+    st.session_state.commentary = {
+        "source_path": None,     # the raw clip saved to disk
+        "source_name": "",
+        "source_origin": "",     # "upload" or the URL it was pulled from
+        "model": "",
+        "audio_path": None,      # synthesized narration
+        "audio_bytes": None,
+        "words": [],             # word boundaries for kinetic captions
+        "ass_path": "",          # generated .ass subtitle file
+        # Provenance -- what rights the finished video rests on.
+        "licence": DEFAULT_LICENCE,
+        "licence_reference": "",
+        "source_author": "",
+        "source_title": "",
+        "source_url": "",
+        "source_provider": "",
+        "tts_provider": "gemini",
+        "ai_disclosed": False,
+        "voice": "en-US-ChristopherNeural",
+    }
+
+# The script lives in its own top-level key, and the Step-3 text area is bound
+# to it BY KEY rather than by `value=`. A keyed widget reads its content from
+# session state, so passing a fresh `value=` after generation is not guaranteed
+# to win -- writing this entry is what makes new text appear in the box.
+st.session_state.setdefault("commentary_script", "")
+
+if "duel" not in st.session_state:
+    st.session_state.duel = duel_from_preset(next(iter(DUEL_PRESETS)))
+
+# Minimalist Motion keeps its selections here rather than in its widget keys.
+# Streamlit discards the state of widgets it stops drawing, so a trip to
+# another Production Mode would otherwise reset the whole panel; the widgets
+# seed themselves from this dict on the way back in.
+if "minimal" not in st.session_state:
+    st.session_state.minimal = {
+        "preset": None,
+        "concept": "",
+        "template": DEFAULT_TEMPLATE,
+        "duration": 18,
+        "bgm": True,
+        "bgm_volume": 0.30,
+        "sfx": True,
+        "narrate": False,
+        "voice": "Charon",
+        "ai_disclosed": False,
+        "spec": None,        # the scene the last render used
+        "publish": None,     # title / description / hashtags
+        "result": None,      # runtime, frames, encoder
+        "entry_name": "",
+    }
+
+# Rendered videos are tracked per scope ("reel" / "duel") as
+# <scope>_video_path / _video_bytes / _video_name, so the two modes never
+# overwrite each other's output and a player can't show a stale render.
+
+
+# ---------------------------------------------------------------------------
+# Panels
+# ---------------------------------------------------------------------------
+
+def render_auto_creator(aspect_name: str) -> None:
+    """Topic -> full viral script in one click."""
+    with st.container(border=True):
+        st.markdown("#### 🤖 Topic → Reel in One Click")
+        st.caption("A topic becomes a Hook → Value Points → CTA script with slides, subtitles and narration.")
+
+        topic = st.text_input(
+            "Your Topic",
+            value="5 Mind-Blowing Facts About Space",
+            placeholder="e.g. Luxury Habits, 5 Mind-Blowing Facts About Space",
+        )
+
+        template_key = pick(
+            "Script Template", list(SCRIPT_TEMPLATES.keys()), "listicle", "auto_tpl",
+            format_func=lambda k: SCRIPT_TEMPLATES[k][0],
+        )
+
+        c1, c2 = st.columns(2)
+        with c1:
+            num_points = st.slider("Value Points", 2, 6, _count_from_topic(topic, 3))
+        with c2:
+            auto_voice = st.selectbox(
+                "Narrator Voice", list(VIRAL_VOICES.keys()),
+                format_func=lambda v: VIRAL_VOICES[v],
+                index=list(VIRAL_VOICES.keys()).index(st.session_state.voice_settings["voice"])
+                if st.session_state.voice_settings["voice"] in VIRAL_VOICES else 0,
+                key="auto_voice_select",
+            )
+
+        opt_a, opt_b = st.columns(2)
+        with opt_a:
+            auto_narrate = st.checkbox(
+                "Narrate + auto-sync durations", value=True,
+                help="Synthesizes narration and stretches each slide to fit its spoken line.",
+            )
+        with opt_b:
+            use_photos = st.checkbox(
+                "Fetch real photos for slides", value=True,
+                help="Sources real photography for the topic instead of abstract backdrops.",
+            )
+
+        if use_photos and not os.environ.get("PEXELS_API_KEY"):
+            st.caption(
+                "📷 Using Wikimedia Commons (no key needed). It is excellent for named "
+                "products but returns encyclopedic diagrams for abstract topics — set "
+                "`PEXELS_API_KEY` for curated lifestyle photography, or set each slide's "
+                "image by URL/upload in Slide Studio."
+            )
+
+        st.info(
+            "Value points are a proven **structural scaffold**, not researched facts — "
+            "swap in your real content in the Slide Studio before publishing.",
+            icon="💡",
+        )
+
+        if st.button("⚡ Generate Full Reel Script", type="primary", width="stretch"):
+            if not topic.strip():
+                st.error("Please enter a topic first.")
+            else:
+                # A new script invalidates any previously rendered reel.
+                clear_rendered_video("reel")
+                try:
+                    with st.spinner("Building script and sourcing photography..."):
+                        st.session_state.slides = generate_viral_script(
+                            topic, template_key, num_points,
+                            size=ASPECT_RATIOS[aspect_name],
+                            use_photos=use_photos,
+                        )
+                except Exception as exc:
+                    st.error(f"**Script generation failed:** `{type(exc).__name__}: {exc}`")
+                    st.code(traceback.format_exc())
+                    st.stop()
+                st.session_state.voice_settings["voice"] = auto_voice
+                st.session_state.voice_settings["synced"] = False
+
+                if auto_narrate:
+                    _synthesize(st.session_state.slides, auto_voice)
+                else:
+                    st.success(f"Generated {len(st.session_state.slides)} slides.")
+                st.rerun()
+
+    if any(s.get("role") for s in st.session_state.slides):
+        with st.container(border=True):
+            st.markdown("#### 📝 Generated Script")
+            icons = {"hook": ("🪝 HOOK", "violet"), "point": ("💎 VALUE", "cyan"), "cta": ("📣 CTA", "amber")}
+            for i, s in enumerate(st.session_state.slides):
+                role = s.get("role")
+                if role not in icons:
+                    continue
+                text, tone = icons[role]
+                voiced = badge("🔊 voiced", "green") if s.get("voice_path") else badge("🔇 silent")
+                st.markdown(
+                    badge(text, tone) + badge(f"slide {i+1}") + badge(f"{s.get('duration', 0):.1f}s") + voiced,
+                    unsafe_allow_html=True,
+                )
+                st.markdown(f"**On-screen:** {s.get('caption', '')}  \n*Spoken:* {s.get('voiceover', '')}")
+
+
+def download_clip_from_url(url: str, dest_dir: str) -> dict[str, Any]:
+    """
+    Pulls a TikTok / Instagram Reel / YouTube Short down to a local MP4.
+
+    Returns {"path", "title", "duration", "extractor"}. Raises RuntimeError with
+    a readable reason so the UI can surface exactly why a link failed.
+    """
+    import yt_dlp
+    import imageio_ffmpeg
+
+    os.makedirs(dest_dir, exist_ok=True)
+    stem = os.path.join(dest_dir, f"source_{int(time.time())}")
+
+    options: dict[str, Any] = {
+        "outtmpl": f"{stem}.%(ext)s",
+        # Prefer a ready-made MP4; fall back to muxing best video+audio.
+        "format": "b[ext=mp4]/bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b",
+        "merge_output_format": "mp4",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        # yt-dlp needs ffmpeg to mux separate streams; use the bundled binary
+        # rather than assuming one is on PATH.
+        "ffmpeg_location": os.path.dirname(imageio_ffmpeg.get_ffmpeg_exe()),
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:  # type: ignore[arg-type]
+            info = ydl.extract_info(url, download=True)
+            produced = ydl.prepare_filename(info)
+    except Exception as exc:
+        raise RuntimeError(_explain_download_error(exc)) from exc
+
+    # After a merge the real file may carry a different extension.
+    candidates = [produced, f"{stem}.mp4", f"{stem}.webm", f"{stem}.mkv"]
+    path = next((c for c in candidates if c and os.path.exists(c) and os.path.getsize(c) > 0), None)
+    if path is None:
+        found = glob.glob(f"{stem}.*")
+        path = found[0] if found else None
+    if path is None:
+        raise RuntimeError("yt-dlp reported success but no video file was written.")
+
+    return {
+        "path": path,
+        "title": str((info or {}).get("title") or os.path.basename(path)),
+        "duration": float((info or {}).get("duration") or 0.0),
+        "extractor": str((info or {}).get("extractor_key") or ""),
+    }
+
+
+def _explain_download_error(exc: Exception) -> str:
+    """Turns a raw yt-dlp failure into something a creator can act on."""
+    raw = str(exc)
+    low = raw.lower()
+
+    if "login" in low or "cookies" in low or "rate-limit" in low:
+        return ("This post needs a logged-in session (Instagram does this for many Reels). "
+                "Download it manually and use the file uploader instead.\n\n" + raw[:300])
+    if "private" in low or "unavailable" in low or "removed" in low:
+        return "That post is private, removed, or unavailable in this region.\n\n" + raw[:300]
+    if "unsupported url" in low:
+        return "That link isn't a recognised video URL. Paste the direct post link.\n\n" + raw[:300]
+    if "ffmpeg" in low:
+        return "The video and audio streams could not be merged (ffmpeg issue).\n\n" + raw[:300]
+    return f"{type(exc).__name__}: {raw[:400]}"
+
+
+def _probe_duration(video_path: str) -> float:
+    """Reads a clip's duration without decoding it, for the loop-warning hint."""
+    try:
+        from moviepy import VideoFileClip
+
+        clip = VideoFileClip(video_path)
+        try:
+            return float(clip.duration or 0.0)
+        finally:
+            clip.close()
+    except Exception:
+        return 0.0
+
+
+def _reset_commentary_chain(cm: dict[str, Any]) -> None:
+    """Clears everything downstream of the source clip when a new one arrives."""
+    cm.update({"model": "", "audio_path": None, "audio_bytes": None,
+               "words": [], "ass_path": ""})
+    st.session_state["commentary_script"] = ""
+    _clear_muted_asset()
+    clear_rendered_video("commentary")
+
+
+def _clear_muted_asset() -> None:
+    """Drops the cached muted export -- it is cut to a specific narration length."""
+    for key in ("commentary_muted_bytes", "commentary_muted_name"):
+        st.session_state.pop(key, None)
+
+
+# ---------------------------------------------------------------------------
+# Multi-URL batch for the Commentary Machine
+#
+# Paste several links, get several finished shorts. Reuses the same stages the
+# single-clip flow uses, so behaviour cannot drift between the two paths.
+# ---------------------------------------------------------------------------
+
+MAX_URL_BATCH = 5
+
+
+def _url_job(url: str) -> dict[str, Any]:
+    return {
+        "url": url, "status": "queued", "stage": "", "error": "",
+        "title": "", "video_name": "", "video_path": "", "duration": 0.0,
+        "script": "", "ready": False, "blockers": [],
+    }
+
+
+def run_url_batch(urls: Sequence[str], fair_use: bool = False,
+                  ai_disclosed: bool = False) -> None:
+    """
+    Downloads, scripts, voices and renders each URL in turn.
+
+    A failure on one link is recorded and the queue continues -- losing four
+    finished videos because the third link was private would be indefensible.
+
+    `fair_use` records the uploader's assertion that their commentary makes the
+    result transformative. It is stored as a dated claim, never as a licence.
+    """
+    cm = st.session_state.commentary
+    vs = st.session_state.voice_settings
+    jobs = [_url_job(u) for u in urls]
+    st.session_state["url_batch"] = jobs
+
+    target_size = ASPECT_RATIOS[st.session_state.get("render_aspect", next(iter(ASPECT_RATIOS)))]
+    fps = int(st.session_state.get("render_fps", 24))
+    fit_mode = str(st.session_state.get("render_fit", DEFAULT_FIT))
+    watermark = str(st.session_state.get("render_watermark", ""))
+    duration_target = str(st.session_state.get("cm_target") or DEFAULT_TARGET)
+    provider = str(cm.get("tts_provider") or "gemini")
+    voice = str(cm.get("voice") or ("Charon" if provider == "gemini" else DEFAULT_VOICE))
+    angle_pref = str(cm.get("chosen_angle") or "suspense")
+
+    bar = st.progress(0.0)
+    line = st.empty()
+    started = time.time()
+    stages = ("download", "script", "voice", "render")
+
+    for index, job in enumerate(jobs):
+        job["status"] = "running"
+
+        def mark(stage: str, _i: int = index) -> None:
+            job["stage"] = stage
+            done = stages.index(stage) / len(stages)
+            bar.progress(min(1.0, (_i + done) / len(jobs)))
+            line.markdown(f"**Clip {_i + 1}/{len(jobs)} — {stage}...**")
+
+        try:
+            mark("download")
+            got = download_clip_from_url(job["url"], user_exports())
+            job["title"] = str(got["title"])[:70]
+
+            mark("script")
+            angles = generate_commentary_angles(got["path"], duration_target=duration_target)
+            key = angle_pref if angle_pref in angles["angles"] else next(iter(angles["angles"]))
+            script = str(angles["angles"][key])
+            job["script"] = script
+
+            mark("voice")
+            narration = synthesize_narration(
+                script, provider=provider, voice=voice,
+                output_path=os.path.join(user_exports(), f"narration_{int(time.time())}"
+                                         + (".wav" if provider == "gemini" else ".mp3")),
+                rate=f"{int(st.session_state.get('cm_rate', 12)):+d}%",
+                style=str(st.session_state.get("cm_gstyle") or "Punchy viral narrator, fast pace"),
+            )
+            speech = float(narration["duration"])
+
+            mark("render")
+            ass_path = None
+            if narration["words"]:
+                ass_path = write_ass_file(
+                    list(narration["words"]),
+                    os.path.join(user_exports(), f"captions_{int(time.time())}.ass"),
+                    size=target_size,
+                    position=str(st.session_state.get("cm_cappos") or "bottom"),
+                    highlight=str(st.session_state.get("cm_kin_colour") or "yellow"),
+                )
+
+            bgm_path = None
+            if bool(st.session_state.get("cm_bgm", True)):
+                bgm_path = build_ducked_bgm(
+                    speech + 0.4, str(narration["path"]),
+                    os.path.join(user_exports(), f"bgm_{int(time.time())}.wav"),
+                    volume=float(st.session_state.get("cm_bgmvol") or BGM_DEFAULT_VOLUME),
+                )
+
+            use_focus = bool(st.session_state.get("cm_focus", False))
+            focus_spec = None
+            if use_focus:
+                focus_spec = {
+                    "position": str(st.session_state.get("cm_focus_pos") or "center"),
+                    "start": 0.0, "end": float(st.session_state.get("cm_focus_secs") or 2.0),
+                    "pulse": True, "diameter_px": int(target_size[0] * 0.40),
+                }
+
+            out_path = new_export_path("commentary")
+            result = render_commentary_video(
+                source_video=got["path"], narration_path=str(narration["path"]),
+                script=script, output_path=out_path, target_size=target_size, fps=fps,
+                original_volume=float(st.session_state.get("cm_origvol") or 0.15),
+                loop_mode=str(st.session_state.get("cm_loop") or "boomerang"),
+                fit=fit_mode,
+                burn_captions=False, ass_path=ass_path, bgm_path=bgm_path,
+                focus=focus_spec,
+                # The audio anchor is tied to the visual one: same hook, same frame.
+                hook_sfx=use_focus,
+                watermark_text=watermark,
+            )
+
+            entry = append_ledger(user_exports(), {
+                "video_name": os.path.basename(out_path), "video_path": out_path,
+                "duration": float(result["duration"]),
+                # A link off a feed is someone else's work unless the uploader
+                # asserts fair use, which is logged as a dated claim.
+                "licence": "fair_use" if fair_use else DEFAULT_LICENCE,
+                "fair_use_asserted_at": (time.strftime("%Y-%m-%d %H:%M:%S")
+                                         if fair_use else ""),
+                "licence_reference": "",
+                "source_title": job["title"], "source_author": "",
+                "source_url": job["url"], "source_provider": "",
+                "tts_provider": str(narration.get("provider") or ""),
+                "voice": str(narration.get("voice") or ""),
+                "script_model": str(angles.get("model") or ""),
+                "ai_disclosed": bool(ai_disclosed or cm.get("ai_disclosed")),
+                "script": script, "batch_url": job["url"],
+            })
+            verdict = publish_readiness(entry)
+
+            job.update({
+                "status": "done", "stage": "",
+                "licence": str(entry.get("licence") or ""),
+                "video_name": entry["video_name"], "video_path": out_path,
+                "duration": float(result["duration"]),
+                "ready": bool(verdict["ready"]), "blockers": verdict["blockers"],
+            })
+        except Exception as exc:
+            job.update({"status": "failed", "error": f"{type(exc).__name__}: {exc}"})
+
+        bar.progress((index + 1) / len(jobs))
+
+    sweep_scratch_files(force=True)
+    ok = sum(1 for j in jobs if j["status"] == "done")
+    line.markdown(f"**Finished — {ok}/{len(jobs)} rendered in "
+                  f"{(time.time() - started) / 60:.1f} min.**")
+
+
+def render_url_batch_results() -> None:
+    """Queue table for the multi-URL run, with a download per finished short."""
+    jobs = st.session_state.get("url_batch") or []
+    if not jobs:
+        return
+
+    with st.container(border=True):
+        st.markdown("#### 📦 Batch queue")
+        ok = sum(1 for j in jobs if j["status"] == "done")
+        ready = sum(1 for j in jobs if j.get("ready"))
+        stat_row([
+            ("Rendered", f"{ok}/{len(jobs)}", "cyan"),
+            ("Publish-ready", str(ready), "green" if ready and ready == ok else "amber"),
+            ("Failed", str(sum(1 for j in jobs if j["status"] == "failed")), ""),
+        ])
+
+        claimed = any(str(j.get("licence")) == "fair_use" for j in jobs)
+        if ok and not ready and claimed:
+            # The footage side passed; something else is holding them back.
+            reasons = {b for j in jobs for b in (j.get("blockers") or [])}
+            st.warning(
+                "Fair use was recorded for these, but they are still not cleared:\n\n"
+                + "\n".join(f"- {r}" for r in sorted(reasons)),
+                icon="🚫",
+            )
+        elif ok and not ready:
+            st.warning(
+                "These came from feed links, so they are logged as unverified footage and "
+                "are not cleared for a monetized upload. Tick the fair-use box before "
+                "running, record the rights you hold, or source from the licensed library.",
+                icon="🚫",
+            )
+        elif ready and claimed:
+            st.info(
+                "Cleared on your fair-use assertion, which is recorded with a timestamp in "
+                "the ledger and printed in each publish pack. That is a claim you are making, "
+                "not a licence — a claim can still be filed, so keep the commentary "
+                "substantial and credit the source in your description.",
+                icon="⚖️",
+            )
+
+        for index, job in enumerate(jobs):
+            icon = {"done": "✅", "failed": "❌", "running": "⏳"}.get(str(job["status"]), "•")
+            head = job["title"] or str(job["url"])[:52]
+            with st.expander(
+                f"{icon} {head}" + (f" · {job['duration']:.0f}s" if job["duration"] else ""),
+                expanded=job["status"] == "failed",
+            ):
+                st.caption(str(job["url"])[:100])
+
+                if job["status"] == "failed":
+                    st.error(f"**Failed at '{job['stage'] or 'start'}':** {job['error']}")
+                    continue
+                if job["status"] != "done":
+                    st.info(f"Status: {job['status']}")
+                    continue
+
+                st.markdown(
+                    badge(f"{job['duration']:.0f}s", "cyan")
+                    + (badge("publish-ready", "green") if job["ready"] else badge("not cleared", "amber")),
+                    unsafe_allow_html=True,
+                )
+                for blocker in job.get("blockers", [])[:2]:
+                    st.markdown(f"- 🚫 {blocker}")
+                st.markdown(f"*{str(job['script'])[:200]}...*")
+
+                path = str(job["video_path"])
+                if os.path.exists(path):
+                    prev, dl = st.columns([1, 1])
+                    with prev:
+                        st.video(path)
+                    with dl:
+                        with open(path, "rb") as handle:
+                            st.download_button(
+                                "📥 Download", data=handle.read(),
+                                file_name=str(job["video_name"]), mime="video/mp4",
+                                width="stretch", key=f"url_dl_{index}_{job['video_name']}",
+                            )
+
+
+def render_commentary_studio() -> None:
+    """
+    The AI Faceless Video Commentary Machine: a clean three-step flow from raw
+    clip to narrated, captioned vertical short.
+
+      1. Drop a raw viral clip.
+      2. Gemini watches it and writes the commentary script.
+      3. edge-tts speaks the (editable) script; export audio or a full video.
+    """
+    cm = st.session_state.commentary
+
+    done_upload = bool(cm.get("source_path") and os.path.exists(str(cm.get("source_path"))))
+    done_script = bool(str(st.session_state.get("commentary_script") or "").strip())
+    done_audio = bool(cm.get("audio_path") and os.path.exists(str(cm.get("audio_path"))))
+
+    st.markdown(
+        badge("① Upload clip", "green" if done_upload else "violet")
+        + badge("② Gemini script", "green" if done_script else ("violet" if done_upload else ""))
+        + badge("③ Voice & export", "green" if done_audio else ("violet" if done_script else "")),
+        unsafe_allow_html=True,
+    )
+
+    # ---------------------------------------------------------------- STEP 1
+    with st.container(border=True):
+        st.markdown("#### ① Drop your raw clip")
+        st.caption("Footage you can monetize. The licensed library is the safe default; "
+                   "uploads and links require you to state what rights you hold.")
+
+        # --- licensed library: the monetizable default ----------------------
+        with st.expander("🎬 Licensed library — cleared for commercial use", expanded=not done_upload):
+            st.caption("Creative Commons and public-domain footage with the licence and "
+                       "credit recorded automatically.")
+
+            pex = pexels_key_status()
+            if pex["ok"]:
+                st.markdown(
+                    badge("Pexels active — no attribution required", "green"),
+                    unsafe_allow_html=True,
+                )
+            elif os.environ.get("PEXELS_API_KEY"):
+                st.warning(
+                    f"**Pexels key not working** - {pex['reason']}\n\n"
+                    "Falling back to Wikimedia Commons, which is mostly CC BY-SA: "
+                    "usable commercially, but it requires credit and makes your finished "
+                    "video share-alike.",
+                    icon="🔑",
+                )
+            else:
+                st.caption("Set `PEXELS_API_KEY` in .env for footage that needs no attribution.")
+
+            lib_q = st.text_input(
+                "Search licensed footage", key="cm_lib_q",
+                placeholder="e.g. excavator digging, ocean waves, city traffic night",
+            )
+            if st.button("🔎 Search library", width="stretch", key="cm_lib_search"):
+                with st.spinner(f"Searching licensed sources for {lib_q}..."):
+                    try:
+                        st.session_state["cm_lib_hits"] = search_licensed_video(lib_q, limit=6)
+                    except Exception as exc:
+                        st.session_state["cm_lib_hits"] = []
+                        st.error(f"**Library search failed:** `{type(exc).__name__}: {exc}`")
+
+            hits = st.session_state.get("cm_lib_hits") or []
+            if hits:
+                for index, hit in enumerate(hits):
+                    licence_key = normalise_licence(str(hit.get("licence_raw")))
+                    licence = LICENCES[licence_key]
+                    tone = "green" if licence.commercial else ""
+                    with st.container(border=True):
+                        st.markdown(
+                            badge(hit["provider"], "violet")
+                            + badge(licence.label, tone)
+                            + (badge("credit required", "amber") if licence.attribution else ""),
+                            unsafe_allow_html=True,
+                        )
+                        st.markdown(f"**{hit['title'][:70]}**")
+                        st.caption(f"by {hit['author'][:60]} · {hit['size_mb']} MB · {hit['mime']}")
+                        if st.button("Use this clip", key=f"cm_lib_use_{index}", width="stretch"):
+                            try:
+                                with st.spinner("Downloading licensed clip..."):
+                                    path = download_licensed_clip(hit, user_exports())
+                                cm.update({
+                                    "source_path": path,
+                                    "source_name": hit["title"][:60],
+                                    "source_origin": hit.get("page_url") or hit["url"],
+                                    "licence": licence_key,
+                                    "licence_reference": "",
+                                    "source_author": hit["author"],
+                                    "source_title": hit["title"],
+                                    "source_url": hit.get("page_url") or hit["url"],
+                                    "source_provider": hit["provider"],
+                                })
+                                _reset_commentary_chain(cm)
+                                st.success(f"Ingested under {licence.label}.")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(f"**Could not fetch that clip:** `{type(exc).__name__}: {exc}`")
+            elif st.session_state.get("cm_lib_hits") == []:
+                st.info("No licensed clips matched. Try broader wording.", icon="🔍")
+
+        st.markdown("---")
+        st.caption("**Or bring your own** — you must hold the rights.")
+
+        up_col, url_col = st.columns(2)
+
+        with up_col:
+            st.markdown("**Upload a file**")
+            upload = st.file_uploader(
+                "Raw video clip", type=["mp4", "mov", "webm", "m4v"], key="cm_upload",
+                label_visibility="collapsed",
+            )
+
+            if upload is not None and upload.name != cm.get("source_name"):
+                try:
+                    os.makedirs(user_exports(), exist_ok=True)
+                    ext = os.path.splitext(upload.name)[1] or ".mp4"
+                    dest = os.path.join(user_exports(), f"source_{int(time.time())}{ext}")
+                    with open(dest, "wb") as fh:
+                        fh.write(upload.getbuffer())
+
+                    cm.update({"source_path": dest, "source_name": upload.name,
+                               "source_origin": "upload", "source_provider": "",
+                               "licence": DEFAULT_LICENCE})
+                    _reset_commentary_chain(cm)
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"**Could not save the upload:** `{type(exc).__name__}: {exc}`")
+                    st.code(traceback.format_exc())
+
+        with url_col:
+            st.markdown("**Or paste link(s)**")
+            url_text = st.text_area(
+                "Or paste TikTok / Instagram Reel URLs",
+                key="cm_url", label_visibility="collapsed", height=110,
+                placeholder=("https://www.tiktok.com/@user/video/…\n"
+                             "one per line — up to 5"),
+            )
+            urls = [u.strip() for u in url_text.splitlines() if u.strip()][:MAX_URL_BATCH]
+            extra = len([u for u in url_text.splitlines() if u.strip()]) - len(urls)
+            if extra > 0:
+                st.caption(f"⚠️ Only the first {MAX_URL_BATCH} links will be used ({extra} ignored).")
+
+            fair_use = st.checkbox(
+                "☑️ Transformative Commentary / Fair Use (Clear for publish)",
+                value=False, key="cm_fair_use",
+                help="Records your assertion that your commentary makes this transformative. "
+                     "It is a claim you are making, not a licence — a copyright claim can "
+                     "still be filed, and it is logged as an assertion in the ledger.",
+            )
+
+            # Fair use clears the footage. The AI label is a separate legal
+            # requirement, and the publish check blocks on it independently --
+            # so ask for it here, or the batch silently stays 'not cleared'.
+            disclose = bool(cm.get("ai_disclosed"))
+            if fair_use:
+                disclose = st.checkbox(
+                    "🤖 I will label these as AI-generated when I upload",
+                    value=disclose, key="cm_batch_disclose",
+                    help="Both YouTube and TikTok require synthetic media to be labelled. "
+                         "This is the same declaration as the box in step 3.",
+                )
+                if not disclose:
+                    st.caption(
+                        "⚠️ Fair use clears the footage rights only. Without the AI "
+                        "label these still come out **not cleared**."
+                    )
+
+            single = len(urls) <= 1
+            label = "⚡ Download & Ingest" if single else f"⚡ Render {len(urls)} shorts"
+
+            if st.button(label, width="stretch", key="cm_ingest", disabled=not urls):
+                if single:
+                    # Unchanged single-clip path: ingest, then the user drives
+                    # steps 2 and 3 by hand.
+                    try:
+                        with st.spinner("Downloading clip with yt-dlp..."):
+                            got = download_clip_from_url(urls[0], user_exports())
+
+                        cm.update({
+                            "source_path": got["path"],
+                            "source_name": got["title"][:60] or os.path.basename(got["path"]),
+                            "source_origin": urls[0],
+                            "source_provider": "",
+                            "source_url": urls[0],
+                            # A downloaded feed post is someone else's work until
+                            # the creator says otherwise.
+                            "licence": DEFAULT_LICENCE,
+                        })
+                        _reset_commentary_chain(cm)
+                        source = got["extractor"] or "source"
+                        length = f" — {got['duration']:.0f}s" if got["duration"] else ""
+                        st.success(f"Ingested from {source}{length}")
+                        st.rerun()
+                    except RuntimeError as exc:
+                        st.error(f"**Download failed:**\n\n{exc}")
+                    except Exception as exc:
+                        st.error(f"**Unexpected download error:** `{type(exc).__name__}: {exc}`")
+                        st.code(traceback.format_exc())
+                else:
+                    run_url_batch(urls, fair_use=bool(fair_use),
+                                  ai_disclosed=bool(disclose))
+                    st.rerun()
+
+            st.caption("TikTok, YouTube Shorts and public Reels. Private posts need the uploader. "
+                       f"Paste up to {MAX_URL_BATCH} links to render them back to back.")
+
+        # --- rights declaration for anything not from the library -----------
+        if done_upload and str(cm.get("source_provider") or "") == "":
+            st.markdown("---")
+            st.markdown("**What rights do you hold for this clip?**")
+            st.caption("Downloading someone's post and republishing it is not cleared for "
+                       "monetization, and it breaches most platforms' terms. Declare it honestly — "
+                       "this is what the publish check reads.")
+
+            keys = list(LICENCES.keys())
+            current = str(cm.get("licence") or DEFAULT_LICENCE)
+            chosen = st.selectbox(
+                "Licence / rights", keys,
+                index=keys.index(current) if current in keys else keys.index(DEFAULT_LICENCE),
+                format_func=lambda k: LICENCES[k].label,
+                key="cm_licence",
+            )
+            cm["licence"] = chosen
+            st.caption(LICENCES[chosen].note)
+
+            if LICENCES[chosen].needs_evidence:
+                cm["licence_reference"] = st.text_input(
+                    "Licence reference (order id, or where the permission message is saved)",
+                    value=str(cm.get("licence_reference") or ""), key="cm_licref",
+                )
+            if LICENCES[chosen].attribution:
+                cred_a, cred_b = st.columns(2)
+                with cred_a:
+                    cm["source_author"] = st.text_input(
+                        "Creator to credit", value=str(cm.get("source_author") or ""), key="cm_author")
+                with cred_b:
+                    cm["source_url"] = st.text_input(
+                        "Source URL", value=str(cm.get("source_url") or cm.get("source_origin") or ""),
+                        key="cm_srcurl")
+
+        if done_upload:
+            st.markdown("---")
+            info_col, prev_col = st.columns([2, 1])
+            with info_col:
+                size_mb = os.path.getsize(str(cm["source_path"])) / 1_048_576
+                stat_row([
+                    ("Clip", str(cm["source_name"])[:22], "cyan"),
+                    ("Size", f"{size_mb:.1f} MB", ""),
+                ])
+                origin = str(cm.get("source_origin") or "")
+                if origin and origin != "upload":
+                    st.caption(f"🔗 {origin[:70]}")
+            with prev_col:
+                st.video(str(cm["source_path"]))
+        else:
+            st.info("Upload a clip or paste a link to begin.", icon="🎬")
+
+    # ---------------------------------------------------------------- STEP 2
+    with st.container(border=True):
+        st.markdown("#### ② Gemini watches it and writes the script")
+        st.caption("The clip is uploaded to Gemini, processed, then analysed frame-by-frame for a viral commentary.")
+
+        target = pick(
+            "Script duration target",
+            list(DURATION_TARGETS.keys()), DEFAULT_TARGET, "cm_target",
+            format_func=lambda k: str(DURATION_TARGETS[k]["label"]),
+            help="Gemini is given a matching word budget so the narration lands inside this window.",
+        )
+        spec = DURATION_TARGETS[target]
+        st.caption(
+            f"Target ≈ {int(spec['low'] * 2.75)}–{int(spec['high'] * 2.75)} words "
+            f"({spec['low']}–{spec['high']}s spoken)."
+        )
+
+        if st.button("🧠 Generate 3 Viral Angles", type="primary",
+                     width="stretch", disabled=not done_upload):
+            clear_rendered_video("commentary")
+            cm["audio_path"] = None
+            cm["audio_bytes"] = None
+            cm["angles"] = {}
+
+            status = st.empty()
+            spin = st.progress(0.0)
+            steps = {"n": 0}
+
+            def note(msg: str) -> None:
+                steps["n"] += 1
+                spin.progress(min(0.9, 0.15 * steps["n"]))
+                status.markdown(f"**Stage 1/3 · Gemini grounding — {msg}**")
+
+            try:
+                result = generate_commentary_angles(
+                    str(cm["source_path"]), progress=note, duration_target=target,
+                )
+                cm["target"] = target
+                cm["angles"] = result["angles"]
+                cm["model"] = result["model"]
+
+                # Pre-load the first angle so the box is never empty; the cards
+                # below swap it with one tap.
+                first = next((k for k in ANGLE_ORDER if k in result["angles"]), None)
+                if first:
+                    st.session_state["commentary_script"] = result["angles"][first]
+                    cm["chosen_angle"] = first
+                spin.progress(1.0)
+                status.markdown(f"✅ **{len(result['angles'])} angles ready.**")
+                st.rerun()
+            except GeminiError as exc:
+                spin.empty()
+                status.empty()
+                st.error(f"**Gemini failed:**\n\n{exc}")
+            except Exception as exc:
+                spin.empty()
+                status.empty()
+                st.error(f"**Unexpected error during analysis:** `{type(exc).__name__}: {exc}`")
+                st.code(traceback.format_exc())
+
+        if cm.get("model"):
+            st.markdown(badge(f"model: {cm['model']}", "violet"), unsafe_allow_html=True)
+
+        # --- angle picker: one tap loads a script into the editor ----------
+        angles = cm.get("angles") or {}
+        if angles:
+            st.markdown("---")
+            st.markdown("##### Pick your angle")
+            st.caption("Same footage, three framings. Post one, or publish all three and let the feed decide.")
+
+            chosen = str(cm.get("chosen_angle") or "")
+            cards = st.columns(len(ANGLE_ORDER))
+            for col, key in zip(cards, ANGLE_ORDER):
+                script_text = str(angles.get(key) or "")
+                if not script_text:
+                    continue
+                meta = SCRIPT_ANGLES[key]
+                spoken = estimate_speech_seconds(script_text)
+                with col, st.container(border=True):
+                    tone = "green" if key == chosen else "violet"
+                    st.markdown(
+                        badge(meta["label"], tone)
+                        + badge(f"{len(script_text.split())}w · {spoken:.0f}s"),
+                        unsafe_allow_html=True,
+                    )
+                    st.caption(meta["blurb"])
+                    preview = script_text if len(script_text) <= 165 else script_text[:162] + "..."
+                    st.markdown(f"<div class='rf-angle'>{preview}</div>", unsafe_allow_html=True)
+                    if st.button(
+                        "✓ Selected" if key == chosen else "Use this angle",
+                        key=f"cm_angle_{key}", width="stretch",
+                        disabled=key == chosen,
+                    ):
+                        # Written before Step 3's text area is created this run,
+                        # so the editor picks it up immediately.
+                        st.session_state["commentary_script"] = script_text
+                        cm["chosen_angle"] = key
+                        cm["audio_path"] = None
+                        cm["audio_bytes"] = None
+                        _clear_muted_asset()
+                        clear_rendered_video("commentary")
+                        st.rerun()
+
+    # ---------------------------------------------------------------- STEP 3
+    with st.container(border=True):
+        st.markdown("#### ③ Edit, voice and export")
+
+        # Bound by key, not by `value=`: a keyed widget takes its contents from
+        # session state, so the state entry is the single source of truth and
+        # generated text shows up immediately.
+        st.text_area(
+            "Commentary script (edit freely before voicing)",
+            height=190, key="commentary_script",
+            placeholder="Generate a script above, or paste your own.",
+        )
+
+        script_now = str(st.session_state.get("commentary_script") or "").strip()
+        if script_now:
+            est = estimate_speech_seconds(script_now)
+            tgt = DURATION_TARGETS.get(str(cm.get("target") or DEFAULT_TARGET), DURATION_TARGETS[DEFAULT_TARGET])
+            lo, hi = float(tgt["low"]), float(tgt["high"])
+            in_range = lo - 3 <= est <= hi + 3
+
+            stat_row([
+                ("Words", str(len(script_now.split())), ""),
+                ("Est. spoken", f"{est:.0f}s", "cyan" if in_range else "amber"),
+                ("Target", f"{tgt['low']}–{tgt['high']}s", ""),
+            ])
+            if est > hi + 3:
+                st.caption(f"⏱️ Runs past the {tgt['low']}–{tgt['high']}s target — trim a sentence for retention.")
+            elif est < lo - 3:
+                st.caption(f"⏱️ Shorter than the {tgt['low']}–{tgt['high']}s target — add a beat of detail.")
+
+        provider = pick(
+            "Narration engine", list(SPEAKING_PROVIDERS),
+            str(cm.get("tts_provider") or "gemini"), "cm_tts_provider",
+            format_func=lambda k: str(TTS_PROVIDERS[k]["label"]).split(" (")[0]
+                                  + (" ✅" if TTS_PROVIDERS[k]["commercial"] else " ⚠️ draft"),
+        )
+        cm["tts_provider"] = provider
+        st.caption(str(TTS_PROVIDERS[provider]["note"]))
+        if not TTS_PROVIDERS[provider]["commercial"]:
+            st.warning(
+                "edge-tts is not licensed for monetized publishing. Use it to draft and to "
+                "check caption timing, then re-voice with Gemini before you upload.",
+                icon="⚠️",
+            )
+
+        v1, v2 = st.columns([2, 1])
+        if provider == "gemini":
+            with v1:
+                g_voices = list(GEMINI_VOICES.keys())
+                cm["voice"] = st.selectbox(
+                    "Narrator voice", g_voices,
+                    format_func=lambda v: GEMINI_VOICES[v],
+                    index=g_voices.index(cm["voice"]) if cm.get("voice") in g_voices else 0,
+                    key="cm_gvoice",
+                )
+            with v2:
+                # Gemini takes delivery notes in the prompt rather than a rate knob.
+                style = st.selectbox(
+                    "Delivery", ["Punchy viral narrator, fast pace", "Calm documentary narration",
+                                 "High-energy hype", "Suspenseful and tense"],
+                    key="cm_gstyle",
+                )
+            rate = 0
+        else:
+            with v1:
+                voices = list(VIRAL_VOICES.keys())
+                cm["voice"] = st.selectbox(
+                    "Narrator voice", voices,
+                    format_func=lambda v: VIRAL_VOICES[v],
+                    index=voices.index(cm["voice"]) if cm.get("voice") in voices else 0,
+                    key="cm_voice",
+                )
+            with v2:
+                rate = st.slider("Speed", -20, 40, 12, 2, format="%+d%%", key="cm_rate")
+            style = ""
+
+        if st.button("🎙️ Synthesize Narration", type="primary",
+                     width="stretch", disabled=not script_now):
+            try:
+                with st.spinner("Stage 2/3 · Synthesizing narration with edge-tts..."):
+                    os.makedirs(user_exports(), exist_ok=True)
+                    mp3 = os.path.join(user_exports(), f"narration_{int(time.time())}.mp3")
+                    ext = ".wav" if provider == "gemini" else ".mp3"
+                    mp3 = os.path.splitext(mp3)[0] + ext
+                    spoken = synthesize_narration(
+                        script_now, provider=provider, voice=str(cm["voice"]),
+                        output_path=mp3, rate=f"{int(rate):+d}%", style=style,
+                    )
+                    cm["timings_exact"] = bool(spoken.get("timings_exact"))
+                    with open(mp3, "rb") as fh:
+                        cm["audio_bytes"] = fh.read()
+                    cm["audio_path"] = mp3
+                    cm["words"] = spoken["words"]
+
+                    # Kinetic captions are built straight from the word
+                    # boundaries, so they stay locked to the audio no matter
+                    # how the clip is looped underneath.
+                    ass_path = ""
+                    if spoken["words"]:
+                        ass_path = write_ass_file(
+                            spoken["words"],
+                            os.path.join(user_exports(), f"captions_{int(time.time())}.ass"),
+                            size=ASPECT_RATIOS[st.session_state.get(
+                                "render_aspect", next(iter(ASPECT_RATIOS)))],
+                            position=str(st.session_state.get("cm_cappos", "bottom")),
+                            highlight=str(st.session_state.get("cm_kin_colour", "yellow")),
+                        )
+                    cm["ass_path"] = ass_path
+                # The muted export is cut to the previous narration's length.
+                _clear_muted_asset()
+                clear_rendered_video("commentary")
+                st.success(f"Narration ready — {get_audio_duration(mp3):.1f}s")
+                st.rerun()
+            except Exception as exc:
+                st.error(
+                    f"**Voiceover failed:** `{type(exc).__name__}: {exc}`\n\n"
+                    "edge-tts streams from Microsoft's servers, so this needs an internet connection."
+                )
+                st.code(traceback.format_exc())
+
+        if done_audio and cm.get("audio_bytes"):
+            # Gemini returns WAV, edge-tts returns MP3 -- label whichever it is.
+            audio_ext = os.path.splitext(str(cm["audio_path"]))[1].lower() or ".mp3"
+            audio_mime = "audio/wav" if audio_ext == ".wav" else "audio/mp3"
+            st.audio(cm["audio_bytes"], format=audio_mime)
+
+            st.markdown("##### 📥 Standalone assets for CapCut")
+            st.caption("Drop these straight onto a timeline — the muted video is already cut to the narration length.")
+
+            speech_len = get_audio_duration(str(cm["audio_path"]))
+            stamp = os.path.splitext(os.path.basename(str(cm["audio_path"])))[0]
+
+            d1, d2, d3, d4 = st.columns(4)
+            with d1:
+                st.download_button(
+                    f"🔊 Download Voiceover ({audio_ext})", data=cm["audio_bytes"],
+                    file_name=f"{stamp}{audio_ext}",
+                    mime="audio/wav" if audio_ext == ".wav" else "audio/mpeg",
+                    width="stretch", key=f"cm_dl_audio_{stamp}",
+                )
+            with d2:
+                muted_bytes = st.session_state.get("commentary_muted_bytes")
+                muted_name = st.session_state.get("commentary_muted_name", f"{stamp}_muted.mp4")
+                if muted_bytes:
+                    st.download_button(
+                        "🎞️ Download Muted Video (.mp4)", data=muted_bytes,
+                        file_name=str(muted_name), mime="video/mp4",
+                        width="stretch", key=f"cm_dl_muted_{muted_name}",
+                    )
+                elif st.button("🎞️ Build Muted Video (.mp4)", width="stretch", key="cm_build_muted"):
+                    mbar = st.progress(0.0)
+                    mstatus = st.empty()
+
+                    def muted_progress(step: int, total: int, msg: str) -> None:
+                        mbar.progress(min(1.0, step / max(total, 1)))
+                        mstatus.markdown(f"**{msg}**")
+
+                    try:
+                        mpath = os.path.join(user_exports(), f"muted_{int(time.time())}.mp4")
+                        export_muted_video(
+                            source_video=str(cm["source_path"]),
+                            output_path=mpath,
+                            duration=speech_len + 0.4,
+                            script=script_now,
+                            target_size=ASPECT_RATIOS[st.session_state.get(
+                                "render_aspect", next(iter(ASPECT_RATIOS)))],
+                            fps=int(st.session_state.get("render_fps", 30)),
+                            burn_captions=False,
+                            watermark_text="",
+                            loop_mode=str(st.session_state.get("cm_loop", "boomerang")),
+                            fit=str(st.session_state.get("render_fit", DEFAULT_FIT)),
+                            progress_callback=muted_progress,
+                        )
+                        with open(mpath, "rb") as fh:
+                            st.session_state["commentary_muted_bytes"] = fh.read()
+                        st.session_state["commentary_muted_name"] = os.path.basename(mpath)
+                        st.rerun()
+                    except Exception as exc:
+                        mbar.empty()
+                        mstatus.empty()
+                        st.error(f"**Muted export failed:** `{type(exc).__name__}: {exc}`")
+                        st.code(traceback.format_exc())
+            with d3:
+                st.download_button(
+                    "📝 Script (.txt)", data=script_now.encode("utf-8"),
+                    file_name=f"{stamp}.txt", mime="text/plain",
+                    width="stretch", key=f"cm_dl_txt_{stamp}",
+                )
+            with d4:
+                ass_file = str(cm.get("ass_path") or "")
+                if ass_file and os.path.exists(ass_file):
+                    with open(ass_file, "rb") as fh:
+                        ass_data = fh.read()
+                    st.download_button(
+                        "🎬 Captions (.ass)", data=ass_data,
+                        file_name=f"{stamp}.ass", mime="text/plain",
+                        width="stretch", key=f"cm_dl_ass_{stamp}",
+                        help="Word-timed subtitles - import straight into CapCut or Premiere.",
+                    )
+                else:
+                    st.button("🎬 Captions (.ass)", disabled=True, width="stretch",
+                              key=f"cm_dl_ass_none_{stamp}",
+                              help="Re-synthesize the narration to capture word timings.")
+
+            st.markdown("##### 🎬 Render Quick Video")
+
+            clip_len = _probe_duration(str(cm["source_path"]))
+            if clip_len and speech_len > clip_len + 0.5:
+                st.info(
+                    f"Clip is {clip_len:.1f}s but the narration runs {speech_len:.1f}s — "
+                    f"the footage will be looped ×{speech_len / clip_len:.1f} to cover it.",
+                    icon="🔁",
+                )
+
+            r1, r2 = st.columns(2)
+            with r1:
+                loop_mode = pick(
+                    "If the clip is shorter than the voiceover",
+                    list(LOOP_MODES.keys()), "boomerang", "cm_loop",
+                    format_func=lambda m: {
+                        "boomerang": "🔁 Boomerang", "loop": "↩️ Hard loop", "hold": "⏸️ Freeze",
+                    }[m],
+                    help=" · ".join(LOOP_MODES.values()),
+                )
+            with r2:
+                cap_pos = pick("Caption position", ["bottom", "center", "top"], "bottom", "cm_cappos",
+                               format_func=lambda p: {"bottom": "Lower third",
+                                                      "center": "Centre",
+                                                      "top": "Upper third"}[p])
+
+            has_words = bool(cm.get("words"))
+            r3, r4 = st.columns(2)
+            with r3:
+                cap_style = pick(
+                    "Caption style",
+                    ["kinetic", "chunked", "none"],
+                    "kinetic" if has_words else "chunked", "cm_capstyle",
+                    format_func=lambda m: {
+                        "kinetic": "⚡ Kinetic (word-by-word)",
+                        "chunked": "Phrase blocks",
+                        "none": "No captions",
+                    }[m],
+                    help="Kinetic uses the exact word timings edge-tts returned.",
+                )
+            with r4:
+                kin_colour = pick(
+                    "Highlight colour", ["yellow", "lime"], "yellow", "cm_kin_colour",
+                    format_func=lambda c: {"yellow": "🟡 Yellow", "lime": "🟢 Lime"}[c],
+                )
+
+            if cap_style == "kinetic" and not has_words:
+                st.warning(
+                    "No word timings on this narration - re-synthesize it to enable "
+                    "kinetic captions. Falling back to phrase blocks.",
+                    icon="⚠️",
+                )
+
+            cm["ai_disclosed"] = st.checkbox(
+                "I will label this as AI-generated when I upload",
+                value=bool(cm.get("ai_disclosed")), key="cm_ai_disclosed",
+                help="Both YouTube and TikTok require synthetic media to be labelled. "
+                     "The publish pack below spells out where the toggle lives.",
+            )
+
+            st.markdown("**Hook anchor**")
+            f1, f2, f3 = st.columns([1, 1, 1])
+            with f1:
+                use_focus = st.checkbox("⭕ Add Focus Circle on Hook", value=False, key="cm_focus")
+            with f2:
+                focus_pos = pick(
+                    "Position", list(FOCUS_POSITIONS.keys()), "center", "cm_focus_pos",
+                    format_func=lambda k: FOCUS_POSITIONS[k],
+                )
+            with f3:
+                focus_secs = st.slider("Hold for (s)", 1.5, 3.0, 2.0, 0.1, key="cm_focus_secs",
+                                       disabled=not use_focus)
+
+            st.markdown("**Audio mix**")
+            a1, a2, a3 = st.columns(3)
+            with a1:
+                orig_vol = st.slider("Original clip", 0.0, 0.5, 0.15, 0.01, key="cm_origvol",
+                                     help="How much of the clip's own sound stays under the narration.")
+            with a2:
+                use_bgm = st.checkbox("🎵 Add Suspense BGM", value=True, key="cm_bgm")
+            with a3:
+                bgm_vol = st.slider("BGM level", 0.0, 0.40, BGM_DEFAULT_VOLUME, 0.01,
+                                    key="cm_bgmvol", disabled=not use_bgm,
+                                    help="Auto-ducked: the bed drops while the narrator speaks.")
+
+            if st.button("🚀 Render Quick Video", type="primary", width="stretch"):
+                clear_rendered_video("commentary")
+                bar = st.progress(0.0)
+                status = st.empty()
+
+                def prog(step: int, total: int, msg: str) -> None:
+                    bar.progress(min(1.0, step / max(total, 1)))
+                    status.markdown(f"**{msg}**")
+
+                try:
+                    out_path = new_export_path("commentary")
+                    target = ASPECT_RATIOS[st.session_state.get(
+                        "render_aspect", next(iter(ASPECT_RATIOS)))]
+
+                    # Kinetic captions need word timings; rebuild the .ass here
+                    # so a change of position or colour is picked up without
+                    # re-running the text-to-speech.
+                    use_kinetic = cap_style == "kinetic" and has_words
+                    ass_for_render = None
+                    if use_kinetic:
+                        prog(1, 4, "Stage 1/4 - Building kinetic caption track...")
+                        ass_for_render = write_ass_file(
+                            list(cm["words"]),
+                            os.path.join(user_exports(), f"captions_{int(time.time())}.ass"),
+                            size=target,
+                            position=str(cap_pos),
+                            highlight=str(kin_colour),
+                        )
+                        cm["ass_path"] = ass_for_render
+
+                    bgm_track = None
+                    if use_bgm and bgm_vol > 0:
+                        prog(1, 4, "Stage 1/4 - Synthesizing ducked suspense bed...")
+                        bgm_track = build_ducked_bgm(
+                            duration=speech_len + 0.4,
+                            narration_path=str(cm["audio_path"]),
+                            output_path=os.path.join(user_exports(), f"bgm_{int(time.time())}.wav"),
+                            volume=float(bgm_vol),
+                        )
+
+                    focus_spec = None
+                    if use_focus:
+                        focus_spec = {
+                            "position": str(focus_pos),
+                            "start": 0.0,
+                            "end": float(focus_secs),
+                            "pulse": True,
+                            # Scale the ring with the frame so it looks the
+                            # same on any output size.
+                            "diameter_px": int(target[0] * 0.40),
+                        }
+
+                    render_commentary_video(
+                        source_video=str(cm["source_path"]),
+                        narration_path=str(cm["audio_path"]),
+                        script=script_now,
+                        output_path=out_path,
+                        target_size=target,
+                        fps=int(st.session_state.get("render_fps", 30)),
+                        original_volume=float(orig_vol),
+                        caption_position=str(cap_pos),
+                        burn_captions=(cap_style == "chunked" or (cap_style == "kinetic" and not has_words)),
+                        loop_mode=str(loop_mode),
+                        fit=str(st.session_state.get("render_fit", DEFAULT_FIT)),
+                        bgm_path=bgm_track,
+                        ass_path=ass_for_render,
+                        focus=focus_spec,
+                        hook_sfx=bool(use_focus),
+                        watermark_text=str(st.session_state.get("render_watermark", "")),
+                        progress_callback=prog,
+                    )
+
+                    if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+                        raise FileNotFoundError(f"Renderer finished but {out_path} is missing or empty")
+
+                    with open(out_path, "rb") as fh:
+                        data = fh.read()
+                    st.session_state["commentary_video_path"] = out_path
+                    st.session_state["commentary_video_bytes"] = data
+                    st.session_state["commentary_video_name"] = os.path.basename(out_path)
+
+                    # Provenance is written at render time, while every fact
+                    # about the render is still to hand.
+                    append_ledger(user_exports(), {
+                        "video_name": os.path.basename(out_path),
+                        "video_path": out_path,
+                        "duration": float(speech_len + 0.4),
+                        "licence": str(cm.get("licence") or DEFAULT_LICENCE),
+                        "licence_reference": str(cm.get("licence_reference") or ""),
+                        "source_title": str(cm.get("source_title") or cm.get("source_name") or ""),
+                        "source_author": str(cm.get("source_author") or ""),
+                        "source_url": str(cm.get("source_url") or cm.get("source_origin") or ""),
+                        "source_provider": str(cm.get("source_provider") or ""),
+                        "tts_provider": str(cm.get("tts_provider") or "edge"),
+                        "voice": str(cm.get("voice") or ""),
+                        "script_model": str(cm.get("model") or ""),
+                        "ai_disclosed": bool(cm.get("ai_disclosed")),
+                        "script": script_now,
+                    })
+
+                    bar.progress(1.0)
+                    status.markdown("✅ **Render complete.**")
+                    sweep_scratch_files(force=True)
+                    st.balloons()
+                except Exception as exc:
+                    bar.empty()
+                    status.empty()
+                    st.error(f"**Video render failed:** `{type(exc).__name__}: {exc}`")
+                    st.code(traceback.format_exc())
+
+    show_rendered_video("commentary", "Your Commentary Short", slot="commentary")
+    render_publish_gate()
+    render_url_batch_results()
+
+
+def render_publish_gate() -> None:
+    """
+    The monetization checkpoint: is this render actually safe to upload?
+
+    Reads the provenance the render wrote, then either hands over the publish
+    pack or spells out exactly what is blocking it.
+    """
+    name = st.session_state.get("commentary_video_name")
+    if not name:
+        return
+
+    entry = find_entry(user_exports(), str(name))
+    if not entry:
+        return
+
+    verdict = publish_readiness(entry)
+
+    with st.container(border=True):
+        st.markdown("#### ✅ Publish check")
+
+        if verdict["ready"]:
+            st.success("Cleared for a monetized upload. Grab the publish pack below.", icon="✅")
+        else:
+            st.error(
+                f"Not cleared yet — {len(verdict['blockers'])} thing"
+                f"{'s' if len(verdict['blockers']) != 1 else ''} to fix.",
+                icon="🚫",
+            )
+            for item in verdict["blockers"]:
+                st.markdown(f"- 🚫 {item}")
+
+        if verdict["passed"]:
+            with st.expander(f"What passed ({len(verdict['passed'])})", expanded=verdict["ready"]):
+                for item in verdict["passed"]:
+                    st.markdown(f"- ✅ {item}")
+
+        if verdict["warnings"]:
+            with st.expander(f"Worth knowing ({len(verdict['warnings'])})"):
+                for item in verdict["warnings"]:
+                    st.markdown(f"- ⚠️ {item}")
+
+        credit = attribution_line(entry)
+        if credit:
+            st.markdown("**Credit line — this must appear in your description:**")
+            st.code(credit, language=None)
+
+        pack = build_publish_pack(entry, str(entry.get("script") or ""))
+        st.download_button(
+            "📋 Download publish pack (.txt)", data=pack.encode("utf-8"),
+            file_name=f"{os.path.splitext(str(name))[0]}_publish.txt",
+            mime="text/plain", width="stretch", key=f"cm_pack_{name}",
+            help="Description, credits, AI-disclosure wording, the per-platform label steps, "
+                 "and the full licence trail.",
+        )
+
+        with st.expander("Upload steps and disclosure wording"):
+            st.markdown(f"**Disclosure line:** {AI_DISCLOSURE_LINE}")
+            for platform, step in PLATFORM_DISCLOSURE_STEPS.items():
+                st.markdown(f"- **{platform}** — {step}")
+            st.markdown("---")
+            for platform, note in MONETIZATION_NOTES.items():
+                st.markdown(f"- **{platform}** — {note}")
+            st.caption("Platform rules change; verify before relying on these.")
+
+        stats = summarise_ledger(user_exports())
+        stat_row([
+            ("Renders logged", str(stats["total"]), ""),
+            ("Publish-ready", str(stats["ready"]), "cyan"),
+            ("Blocked", str(stats["blocked"]), "amber" if stats["blocked"] else ""),
+        ])
+
+
+def render_duel_studio() -> None:
+    """Dual-item setup, metric rounds, and one-click duel assembly."""
+    duel = st.session_state.duel
+
+    with st.container(border=True):
+        st.markdown("#### ⚡ Quick-Fill Presets")
+        st.caption("Start from a ready-made matchup, then edit any field.")
+        cols = st.columns(len(DUEL_PRESETS))
+        for col, preset_name in zip(cols, DUEL_PRESETS.keys()):
+            with col:
+                if st.button(preset_name, key=f"preset_{preset_name}", width="stretch"):
+                    st.session_state.duel = duel_from_preset(preset_name)
+                    st.rerun()
+
+    c_a, c_b = st.columns(2)
+    for col, side, tone, accent in ((c_a, "a", "cyan", "Cyan"), (c_b, "b", "amber", "Amber")):
+        with col, st.container(border=True):
+            st.markdown(badge(f"Item {side.upper()} · {accent}", tone), unsafe_allow_html=True)
+            item = duel[side]
+
+            if isinstance(item.get("image"), Image.Image):
+                st.image(item["image"], width="stretch")
+                credit = str(item.get("credit") or "")
+                if credit:
+                    st.caption(f"📷 {credit}")
+
+            item["name"] = st.text_input("Name", value=item.get("name", ""), key=f"duel_name_{side}")
+            item["hook"] = st.text_input("Subtitle hook", value=item.get("hook", ""), key=f"duel_hook_{side}")
+
+            src_mode = pick(
+                "Image source", ["search", "url", "upload"], "search", f"duel_src_{side}",
+                format_func=lambda m: {"search": "🔎 Search", "url": "🔗 URL", "upload": "⬆️ Upload"}[m],
+            )
+
+            if src_mode == "search":
+                q = st.text_input(
+                    "Search real photos",
+                    value=str(item.get("query") or item.get("name") or ""),
+                    key=f"duel_q_{side}",
+                    placeholder="e.g. Porsche Cayenne, Rolex Submariner",
+                    help="Searches Pexels (needs PEXELS_API_KEY) then Wikimedia Commons.",
+                )
+                if st.button("Fetch photo", key=f"duel_fetch_{side}", width="stretch"):
+                    with st.spinner(f"Finding a photo of {q}..."):
+                        try:
+                            img, credit = _cached_search(q)
+                            item["image"], item["credit"], item["query"] = img, credit, q
+                            st.rerun()
+                        except PhotoLookupError as exc:
+                            st.error(str(exc))
+
+            elif src_mode == "url":
+                url = st.text_input(
+                    "Direct image URL", value="", key=f"duel_url_{side}",
+                    placeholder="https://…/photo.jpg",
+                )
+                if st.button("Load URL", key=f"duel_loadurl_{side}", width="stretch"):
+                    if not url.strip():
+                        st.error("Paste an image URL first.")
+                    else:
+                        try:
+                            item["image"] = _cached_url(url.strip())
+                            item["credit"] = "Custom URL"
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Could not load that URL: {exc}")
+
+            else:
+                up = st.file_uploader(
+                    "Upload photo", type=["jpg", "jpeg", "png", "webp"], key=f"duel_img_{side}",
+                )
+                if up is not None:
+                    item["image"] = Image.open(up).convert("RGB")
+                    item["credit"] = f"Uploaded — {up.name}"
+
+    with st.container(border=True):
+        st.markdown("#### 🥊 Metric Rounds")
+        st.caption("Three to five head-to-head categories. Each round animates its scores, then reveals a winner.")
+
+        n_rounds = st.slider("Number of rounds", 3, 5, min(5, max(3, len(duel["rounds"]))))
+        rounds: list[dict[str, Any]] = []
+        units = ["", "$", "h", "hp", "s", "%", "★", "mi", "kg"]
+
+        for i in range(n_rounds):
+            existing = duel["rounds"][i] if i < len(duel["rounds"]) else {
+                "metric": f"Round {i + 1}", "a_score": 0.0, "b_score": 0.0,
+                "unit": "", "winner": "A", "note": "",
+            }
+            with st.expander(
+                f"Round {i + 1} — {existing.get('metric', '')}", expanded=(i < 3)
+            ):
+                r1, r2 = st.columns([3, 1])
+                metric = r1.text_input("Category", value=str(existing.get("metric", "")), key=f"rm_{i}")
+                unit_val = str(existing.get("unit", ""))
+                unit = r2.selectbox(
+                    "Unit", units,
+                    index=units.index(unit_val) if unit_val in units else 0,
+                    key=f"ru_{i}",
+                )
+
+                s1, s2, s3 = st.columns([1, 1, 1.4])
+                a_score = s1.number_input(
+                    f"{duel['a'].get('name', 'A')} score",
+                    value=float(existing.get("a_score", 0) or 0), step=1.0, key=f"ra_{i}",
+                )
+                b_score = s2.number_input(
+                    f"{duel['b'].get('name', 'B')} score",
+                    value=float(existing.get("b_score", 0) or 0), step=1.0, key=f"rb_{i}",
+                )
+                with s3:
+                    win = pick(
+                        "Round winner", ["A", "B", "Tie"],
+                        str(existing.get("winner", "A")).upper() if str(existing.get("winner", "A")).upper() in ("A", "B") else "Tie",
+                        key=f"rw_{i}",
+                        format_func=lambda w: {"A": "◀ A wins", "B": "B wins ▶", "Tie": "Tie"}[w],
+                    )
+
+                note = st.text_input(
+                    "Note (shown under the category)", value=str(existing.get("note", "")), key=f"rn_{i}",
+                )
+
+            rounds.append({
+                "metric": metric, "unit": unit, "a_score": a_score, "b_score": b_score,
+                "winner": "" if win == "Tie" else win, "note": note,
+            })
+
+        duel["rounds"] = rounds
+
+        ta, tb = duel_tally(rounds)
+        stat_row([
+            (duel["a"].get("name", "A"), f"{ta} won", "cyan"),
+            (duel["b"].get("name", "B"), f"{tb} won", "amber"),
+            ("Rounds", str(len(rounds)), ""),
+        ])
+
+    with st.container(border=True):
+        st.markdown("#### 🎬 Build The Duel")
+        b1, b2 = st.columns(2)
+        with b1:
+            duel["layout"] = pick(
+                "Split layout", ["stacked", "side_by_side"], duel.get("layout", "stacked"), "duel_layout",
+                format_func=lambda l: {"stacked": "▤ Top vs Bottom", "side_by_side": "▥ Side by Side"}[l],
+            )
+        with b2:
+            duel_voice = st.selectbox(
+                "Narrator Voice", list(VIRAL_VOICES.keys()),
+                format_func=lambda v: VIRAL_VOICES[v],
+                index=list(VIRAL_VOICES.keys()).index(st.session_state.voice_settings["voice"])
+                if st.session_state.voice_settings["voice"] in VIRAL_VOICES else 0,
+                key="duel_voice_select",
+            )
+
+        duel["headline"] = st.text_input("Opening hook", value=duel.get("headline", ""))
+        duel["cta"] = st.text_input("Closing call to action", value=duel.get("cta", ""))
+
+        opt1, opt2 = st.columns(2)
+        with opt1:
+            narrate = st.checkbox("Narrate + auto-sync durations", value=True, key="duel_narrate")
+        with opt2:
+            auto_render = st.checkbox(
+                "Render the video immediately", value=True, key="duel_autorender",
+                help="Runs the full pipeline: narration → frames → SFX mix → MP4.",
+            )
+
+        if st.button("⚔️ Build Versus Duel Reel", type="primary", width="stretch"):
+            if not [r for r in duel["rounds"] if str(r.get("metric", "")).strip()]:
+                st.error("Add at least one round with a category name.")
+            else:
+                # A new build must never leave the previous render on screen.
+                clear_rendered_video("duel")
+
+                try:
+                    with st.spinner("Assembling duel timeline..."):
+                        st.session_state.slides = build_duel_slides(duel)
+                except Exception as exc:
+                    st.error(f"**Could not assemble the duel:** `{type(exc).__name__}: {exc}`")
+                    st.code(traceback.format_exc())
+                    st.stop()
+
+                st.session_state.voice_settings["voice"] = duel_voice
+                if narrate:
+                    _synthesize(st.session_state.slides, duel_voice)
+
+                if auto_render:
+                    ok = run_render_pipeline(
+                        st.session_state.slides, "duel",
+                        st.session_state.get("render_aspect", next(iter(ASPECT_RATIOS))),
+                        st.session_state.get("render_fit", "blur_pad"),
+                        st.session_state.get("render_transition", "crossfade"),
+                        float(st.session_state.get("render_transition_dur", 0.5)),
+                        int(st.session_state.get("render_fps", 24)),
+                        str(st.session_state.get("render_watermark", "@viral_reels")),
+                    )
+                    if ok:
+                        st.balloons()
+                else:
+                    st.success(f"Duel built — {len(st.session_state.slides)} slides. Render it in Export.")
+                    st.rerun()
+
+    show_rendered_video("duel", "Your Versus Duel", slot="duelstudio")
+
+
+def run_render_pipeline(
+    slides: list[dict[str, Any]],
+    scope: str,
+    aspect_name: str,
+    fit_mode: str,
+    transition_type: str,
+    transition_dur: float,
+    fps: int,
+    watermark_text: str,
+) -> bool:
+    """
+    Runs the complete render for `slides` and stores the result in session state.
+
+    Four visible stages: (1) audio synthesis, (2) visual rendering,
+    (3) audio/SFX multiplexing, (4) final export. Every failure path surfaces
+    the real exception in the UI rather than dying quietly.
+
+    Returns True on success.
+    """
+    vs = st.session_state.voice_settings
+    audio_cfg = st.session_state.audio_settings
+
+    if not slides:
+        st.error("Nothing to render — add at least one slide first.")
+        return False
+
+    bar = st.progress(0.0)
+    status = st.empty()
+
+    def stage(fraction: float, message: str) -> None:
+        bar.progress(min(1.0, max(0.0, fraction)))
+        status.markdown(f"**{message}**")
+
+    # ---- Stage 1: audio synthesis ----------------------------------------
+    audio_p = audio_cfg.get("custom_path")
+    total_runtime = sum(s.get("duration", 3.5) for s in slides)
+
+    try:
+        if audio_cfg["source"] == "Procedural AI Synth Music" and not audio_p:
+            stage(0.04, "Stage 1/4 · Audio synthesis — generating music bed...")
+            stereo, sr = generate_synth_music(style=audio_cfg["style"], duration=total_runtime + 2.0)
+            music_path = os.path.join(user_exports(), f"music_{int(time.time())}.wav")
+            os.makedirs(user_exports(), exist_ok=True)
+            save_wav_to_file(stereo, sr, music_path)
+            audio_p = music_path
+    except Exception as exc:
+        st.error(f"**Stage 1 — music synthesis failed:** `{type(exc).__name__}: {exc}`")
+        st.code(traceback.format_exc())
+        return False
+
+    use_audio = audio_p if audio_cfg["source"] != "No Audio (Mute)" else None
+
+    # Honour the voiceover toggle without discarding synthesized files.
+    if vs["enabled"]:
+        render_slides = slides
+    else:
+        render_slides = [{k: v for k, v in s.items() if k != "voice_path"} for s in slides]
+
+    # ---- Stages 2-4: handled inside build_reel_video, reported via callback
+    out_path = new_export_path(scope)
+
+    def progress(step: int, total: int, message: str) -> None:
+        # Reserve the first 8% for stage 1, the rest for the engine's stages.
+        stage(0.08 + 0.92 * (step / max(total, 1)), message)
+
+    try:
+        result = build_reel_video(
+            slides=render_slides,
+            aspect_ratio_name=aspect_name,
+            fit_mode=fit_mode,
+            transition_type=transition_type,
+            transition_dur=transition_dur,
+            audio_path=use_audio,
+            audio_volume=audio_cfg.get("volume", 0.8),
+            watermark_text=watermark_text,
+            fps=fps,
+            output_path=out_path,
+            progress_callback=progress,
+            voiceover_volume=vs["volume"],
+            music_duck=vs["music_duck"],
+            sfx_enabled=vs.get("sfx_enabled", True),
+            sfx_volume=vs.get("sfx_volume", 0.55),
+        )
+    except Exception as exc:
+        st.error(
+            f"**Render failed during stage 2-4:** `{type(exc).__name__}: {exc}`\n\n"
+            "Common causes: FFmpeg missing from the environment, a corrupt source "
+            "image, or a slide with zero duration."
+        )
+        st.code(traceback.format_exc())
+        return False
+
+    # ---- Read the bytes back for a cache-proof download --------------------
+    try:
+        if not os.path.exists(out_path):
+            raise FileNotFoundError(f"Renderer reported success but {out_path} is missing")
+        with open(out_path, "rb") as fh:
+            data = fh.read()
+        if not data:
+            raise ValueError("Rendered file is empty (0 bytes)")
+    except Exception as exc:
+        st.error(f"**Stage 4 — could not read the exported file:** `{type(exc).__name__}: {exc}`")
+        st.code(traceback.format_exc())
+        return False
+
+    st.session_state[f"{scope}_video_path"] = out_path
+    st.session_state[f"{scope}_video_bytes"] = data
+    st.session_state[f"{scope}_video_name"] = os.path.basename(out_path)
+
+    bar.progress(1.0)
+    status.markdown("✅ **Render complete.**")
+    st.success(
+        f"Exported {os.path.basename(out_path)} — {result['duration']:.1f}s, "
+        f"{result['num_slides']} slides, {result.get('num_voiceovers', 0)} voiceovers, "
+        f"{len(data) / 1_048_576:.1f} MB"
+    )
+    return True
+
+
+def _synthesize(slides: list[dict[str, Any]], voice: str) -> None:
+    """Runs voiceover synthesis with a progress bar and reports the outcome."""
+    vs = st.session_state.voice_settings
+    bar = st.progress(0)
+    status = st.empty()
+
+    def prog(step: int, total: int, msg: str) -> None:
+        bar.progress(min(1.0, step / max(total, 1)))
+        status.markdown(f"**Stage 1/4 · Audio synthesis — {msg}**")
+
+    try:
+        summary = generate_slide_voiceovers(
+            slides, voice=voice,
+            rate=f"{int(vs['rate_pct']):+d}%",
+            pitch=f"{int(vs['pitch_hz']):+d}Hz",
+            progress_callback=prog,
+        )
+    except Exception as exc:
+        st.error(
+            f"**Stage 1 — voiceover synthesis failed:** `{type(exc).__name__}: {exc}`\n\n"
+            "edge-tts streams from Microsoft's servers, so this needs an internet connection."
+        )
+        st.code(traceback.format_exc())
+        return
+
+    if summary["errors"]:
+        st.warning("Some voiceovers failed:\n\n" + "\n\n".join(summary["errors"]))
+    if summary["voiced_slides"]:
+        vs["enabled"] = True
+        vs["synced"] = True
+        st.success(
+            f"✅ {summary['voiced_slides']} voiceovers synthesized "
+            f"({summary['total_spoken']:.1f}s spoken) — runtime synced to {summary['total_runtime']:.1f}s."
+        )
+    else:
+        st.error("No voiceovers were produced. Check that slides have script text.")
+
+
+def render_slide_studio() -> None:
+    """Per-slide editing for image slides; duel slides are edited in their own tab."""
+    with st.container(border=True):
+        h1, h2 = st.columns([3, 1])
+        with h1:
+            st.markdown("#### Slide Sequence")
+            st.caption("Captions, narration, motion and timing for every slide.")
+        with h2:
+            if st.button("🔄 Reset Demo Slides", width="stretch"):
+                st.session_state.slides = [{
+                    "kind": "image", "image": s["image"], "title": s["title"],
+                    "caption": s["title"], "voiceover": "", "duration": 3.5,
+                    "motion": "zoom_in", "caption_pos": "center", "caption_style": "viral",
+                } for s in generate_sample_images()]
+                st.rerun()
+
+        uploaded = st.file_uploader(
+            "Add images", type=["jpg", "jpeg", "png", "webp"], accept_multiple_files=True,
+        )
+        if uploaded:
+            for uf in uploaded:
+                st.session_state.slides.append({
+                    "kind": "image",
+                    "image": Image.open(uf).convert("RGB"),
+                    "title": uf.name,
+                    "caption": f"Highlight: {os.path.splitext(uf.name)[0]} ✨",
+                    "voiceover": "",
+                    "duration": 4.0, "motion": "zoom_in",
+                    "caption_pos": "center", "caption_style": "viral",
+                })
+            st.success(f"Added {len(uploaded)} image(s).")
+            st.rerun()
+
+    if not st.session_state.slides:
+        st.info("No slides yet — use the AI Auto-Creator, the Duel Engine, or upload images.")
+        return
+
+    to_delete: list[int] = []
+    for idx, slide in enumerate(st.session_state.slides):
+        kind = slide.get("kind", "image")
+        label = str({
+            "duel_intro": "⚔️ Duel Intro", "duel_round": "🥊 Duel Round",
+            "duel_winner": "🏆 Winner Reveal",
+        }.get(kind) or slide.get("title") or "Slide")
+
+        with st.expander(f"Slide {idx + 1} · {label} · {slide.get('duration', 0):.1f}s", expanded=(idx == 0)):
+            if kind != "image":
+                st.markdown(badge(label, "violet"), unsafe_allow_html=True)
+                slide["voiceover"] = st.text_area(
+                    "🎙️ Narration", value=slide.get("voiceover", ""), height=90, key=f"dvo_{idx}",
+                )
+                st.caption("Duel visuals are configured in the Versus Duel tab.")
+                if st.button("🗑️ Delete", key=f"ddel_{idx}"):
+                    to_delete.append(idx)
+                continue
+
+            cols = st.columns([1, 2])
+            with cols[0]:
+                img = slide.get("image")
+                if isinstance(img, Image.Image):
+                    st.image(img, width="stretch")
+                elif img:
+                    st.image(str(img), width="stretch")
+                if slide.get("credit"):
+                    st.caption(f"📷 {slide['credit']}")
+
+                slide_src = pick(
+                    "Image", ["search", "url", "upload"], "search", f"slide_src_{idx}",
+                    format_func=lambda m: {"search": "🔎", "url": "🔗", "upload": "⬆️"}[m],
+                )
+
+                if slide_src == "search":
+                    sq = st.text_input(
+                        "Photo search", value=str(slide.get("query") or ""),
+                        key=f"slide_q_{idx}", placeholder="e.g. Human Brain",
+                    )
+                    if st.button("Fetch", key=f"slide_fetch_{idx}", width="stretch"):
+                        try:
+                            slide["image"], slide["credit"] = _cached_search(sq)
+                            slide["query"] = sq
+                            st.rerun()
+                        except PhotoLookupError as exc:
+                            st.error(str(exc))
+                elif slide_src == "url":
+                    su = st.text_input("Image URL", value="", key=f"slide_url_{idx}",
+                                       placeholder="https://…/photo.jpg")
+                    if st.button("Load", key=f"slide_load_{idx}", width="stretch"):
+                        try:
+                            slide["image"] = _cached_url(su.strip())
+                            slide["credit"] = "Custom URL"
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Could not load: {exc}")
+                else:
+                    upl = st.file_uploader(
+                        "Upload", type=["jpg", "jpeg", "png", "webp"], key=f"slide_up_{idx}",
+                    )
+                    if upl is not None:
+                        slide["image"] = Image.open(upl).convert("RGB")
+                        slide["credit"] = f"Uploaded — {upl.name}"
+            with cols[1]:
+                slide["caption"] = st.text_input(
+                    "On-screen subtitle", value=slide.get("caption", ""), key=f"cap_{idx}",
+                )
+                slide["voiceover"] = st.text_area(
+                    "🎙️ Voiceover script", value=slide.get("voiceover", ""), height=70, key=f"vo_{idx}",
+                    help="Spoken over this slide. Blank reuses the subtitle text.",
+                )
+                if slide.get("voice_path"):
+                    st.markdown(
+                        badge(f"🔊 {slide.get('voice_duration', 0):.1f}s spoken", "green")
+                        + badge(f"slide {slide.get('duration', 0):.1f}s"),
+                        unsafe_allow_html=True,
+                    )
+
+                s1, s2 = st.columns(2)
+                with s1:
+                    slide["duration"] = st.slider(
+                        "Duration (s)", 1.0, 12.0, float(slide.get("duration", 3.5)), 0.5, key=f"dur_{idx}",
+                    )
+                with s2:
+                    motions = ["zoom_in", "zoom_out", "pan_right", "pan_left", "breathe", "static"]
+                    slide["motion"] = st.selectbox(
+                        "Motion", motions,
+                        index=motions.index(slide.get("motion", "zoom_in"))
+                        if slide.get("motion") in motions else 0,
+                        key=f"mot_{idx}",
+                    )
+
+                styles = ["viral", "glass", "neon", "dark", "minimal"]
+                slide["caption_style"] = pick(
+                    "Caption style", styles,
+                    slide.get("caption_style", "viral") if slide.get("caption_style") in styles else "viral",
+                    key=f"sty_{idx}",
+                    format_func=lambda s: {
+                        "viral": "🔥 Viral", "glass": "Glass", "neon": "Neon",
+                        "dark": "Dark", "minimal": "Minimal",
+                    }[s],
+                )
+
+                if st.button("🗑️ Delete", key=f"del_{idx}"):
+                    to_delete.append(idx)
+
+    if to_delete:
+        for idx in sorted(to_delete, reverse=True):
+            st.session_state.slides.pop(idx)
+        st.rerun()
+
+
+def render_audio_studio() -> None:
+    """Voiceover synthesis plus the music bed."""
+    vs = st.session_state.voice_settings
+
+    with st.container(border=True):
+        st.markdown("#### 🎙️ AI Voiceover")
+        st.caption("Ultra-realistic neural narration via edge-tts — free, no API key.")
+
+        v1, v2 = st.columns([2, 1])
+        with v1:
+            vs["voice"] = st.selectbox(
+                "Narrator voice", list(VIRAL_VOICES.keys()),
+                format_func=lambda v: VIRAL_VOICES[v],
+                index=list(VIRAL_VOICES.keys()).index(vs["voice"]) if vs["voice"] in VIRAL_VOICES else 0,
+                key="studio_voice_select",
+            )
+        with v2:
+            vs["enabled"] = st.checkbox("Enable in render", value=vs["enabled"])
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            vs["rate_pct"] = st.slider("Speed", -30, 50, int(vs["rate_pct"]), 2, format="%+d%%")
+        with c2:
+            vs["pitch_hz"] = st.slider("Pitch", -30, 30, int(vs["pitch_hz"]), 2, format="%+dHz")
+        with c3:
+            vs["volume"] = st.slider("Narration vol", 0.3, 1.5, float(vs["volume"]), 0.05)
+
+        vs["music_duck"] = st.slider(
+            "Music ducking under narration", 0.0, 1.0, float(vs["music_duck"]), 0.02,
+            help="How far the music drops while the narrator speaks. Lower = clearer speech.",
+        )
+
+        g1, g2 = st.columns(2)
+        with g1:
+            do_sync = st.button("🎬 Generate Voiceovers + Sync", type="primary", width="stretch")
+        with g2:
+            if st.button("🔇 Clear Voiceovers", width="stretch"):
+                for s in st.session_state.slides:
+                    for k in ("voice_path", "voice_duration", "voice_offset"):
+                        s.pop(k, None)
+                vs["enabled"] = False
+                vs["synced"] = False
+                st.rerun()
+
+        if do_sync:
+            if not st.session_state.slides:
+                st.error("Add slides first.")
+            else:
+                _synthesize(st.session_state.slides, vs["voice"])
+                first = next((s for s in st.session_state.slides if s.get("voice_path")), None)
+                if first:
+                    st.caption("Preview — first narration line:")
+                    st.audio(first["voice_path"])
+
+    with st.container(border=True):
+        st.markdown("#### 💥 Kinetic Sound Design")
+        st.caption("Synthesized risers, impacts and chimes cut to the on-screen animation.")
+
+        s1, s2 = st.columns([1, 2])
+        with s1:
+            vs["sfx_enabled"] = st.checkbox("Enable SFX", value=vs.get("sfx_enabled", True))
+        with s2:
+            vs["sfx_volume"] = st.slider(
+                "SFX level", 0.0, 1.2, float(vs.get("sfx_volume", 0.55)), 0.05,
+                help="Risers land on each transition; impacts fire as stat cards appear; "
+                     "a chime marks every round winner.",
+            )
+
+        if st.button("🔊 Preview SFX", width="stretch"):
+            from audio_engine import SFX_WHOOSH, SFX_IMPACT, SFX_CHIME, get_sfx_path
+            p1, p2, p3 = st.columns(3)
+            for col, name, label in (
+                (p1, SFX_WHOOSH, "Riser"), (p2, SFX_IMPACT, "Impact"), (p3, SFX_CHIME, "Chime"),
+            ):
+                with col:
+                    st.caption(label)
+                    st.audio(get_sfx_path(name))
+
+    with st.container(border=True):
+        st.markdown("#### 🎵 Background Music")
+        options = ["Procedural AI Synth Music", "Upload Custom Audio File", "No Audio (Mute)"]
+        current = st.session_state.audio_settings.get("source")
+        audio_src = pick(
+            "Source", options, current if current in options else options[0], "audio_src",
+        )
+        st.session_state.audio_settings["source"] = audio_src
+
+        if audio_src == "Procedural AI Synth Music":
+            m1, m2 = st.columns(2)
+            with m1:
+                styles = ["lofi", "ambient", "upbeat"]
+                st.session_state.audio_settings["style"] = pick(
+                    "Vibe", styles, st.session_state.audio_settings.get("style", "lofi"), "music_style",
+                    format_func=lambda x: {
+                        "lofi": "☕ Lofi Chill", "ambient": "🌌 Ambient", "upbeat": "⚡ Upbeat",
+                    }[x],
+                )
+            with m2:
+                st.session_state.audio_settings["volume"] = st.slider(
+                    "Music volume", 0.1, 1.0, float(st.session_state.audio_settings["volume"]), 0.05,
+                )
+
+            if st.button("🎵 Generate & Preview Track", width="stretch"):
+                with st.spinner("Synthesizing procedural track..."):
+                    total = sum(s.get("duration", 3.5) for s in st.session_state.slides) + 2.0
+                    stereo, sr = generate_synth_music(
+                        style=st.session_state.audio_settings["style"], duration=min(total, 45.0),
+                    )
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+                    save_wav_to_file(stereo, sr, tmp.name)
+                    st.session_state.audio_settings["custom_path"] = tmp.name
+                st.success("Track generated.")
+                st.audio(tmp.name)
+
+        elif audio_src == "Upload Custom Audio File":
+            up = st.file_uploader("Upload audio", type=["wav", "mp3", "m4a"])
+            if up:
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(up.name)[1])
+                tmp.write(up.read())
+                tmp.close()
+                st.session_state.audio_settings["custom_path"] = tmp.name
+                st.success("Audio uploaded.")
+                st.audio(tmp.name)
+            st.session_state.audio_settings["volume"] = st.slider(
+                "Music volume", 0.1, 1.0, float(st.session_state.audio_settings["volume"]), 0.05,
+            )
+        else:
+            st.session_state.audio_settings["custom_path"] = None
+            st.info("Exporting without a music bed.")
+
+
+def render_preview(aspect_name: str, fps: int) -> None:
+    """Project summary and slide gallery."""
+    slides = st.session_state.slides
+    total = sum(s.get("duration", 3.5) for s in slides)
+    voiced = sum(1 for s in slides if s.get("voice_path"))
+    w, h = ASPECT_RATIOS[aspect_name]
+
+    stat_row([
+        ("Slides", str(len(slides)), ""),
+        ("Runtime", f"{total:.1f}s", "cyan"),
+        ("Resolution", f"{w}×{h}", ""),
+        ("FPS", str(fps), ""),
+        ("Voiced", f"{voiced}/{len(slides)}", "amber"),
+    ])
+
+    with st.container(border=True):
+        st.markdown("#### Slide Gallery")
+        if not slides:
+            st.info("No slides yet.")
+            return
+        cols = st.columns(min(len(slides), 4))
+        for idx, slide in enumerate(slides):
+            with cols[idx % len(cols)]:
+                kind = slide.get("kind", "image")
+                st.markdown(
+                    badge(f"#{idx + 1}", "violet") + badge(f"{slide.get('duration', 0):.1f}s"),
+                    unsafe_allow_html=True,
+                )
+                img = slide.get("image")
+                if isinstance(img, Image.Image):
+                    st.image(img, width="stretch")
+                elif kind == "duel_winner":
+                    win = slide.get("winner_item", {})
+                    if isinstance(win.get("image"), Image.Image):
+                        st.image(win["image"], width="stretch")
+                elif kind in ("duel_intro", "duel_round"):
+                    a_img = slide.get("item_a", {}).get("image")
+                    if isinstance(a_img, Image.Image):
+                        st.image(a_img, width="stretch")
+                st.caption(slide.get("caption", ""))
+
+
+def render_export(
+    aspect_name: str, fit_mode: str, transition_type: str,
+    transition_dur: float, fps: int, watermark_text: str,
+) -> None:
+    """Render controls, progress, and the finished vertical preview."""
+    slides = st.session_state.slides
+    vs = st.session_state.voice_settings
+    n_voiced = sum(1 for s in slides if s.get("voice_path"))
+    total = sum(s.get("duration", 3.5) for s in slides)
+
+    with st.container(border=True):
+        st.markdown("#### 🚀 Render")
+        stat_row([
+            ("Slides", str(len(slides)), ""),
+            ("Runtime", f"{total:.1f}s", "cyan" if total <= 60 else "amber"),
+            ("Voiceovers", str(n_voiced) if vs["enabled"] else "off", "amber"),
+        ])
+        if n_voiced and not vs["enabled"]:
+            st.info("Voiceovers are synthesized but disabled — enable them in Audio Studio.", icon="🔇")
+        if total > 60:
+            st.warning(
+                f"This reel runs {total:.0f}s. Shorts and Reels reward sub-60s — "
+                "trim a round, shorten the narration, or raise voice speed in Audio Studio.",
+                icon="⏱️",
+            )
+
+        scope = "duel" if any(str(s.get("kind", "")).startswith("duel") for s in slides) else "reel"
+
+        if st.button("🚀 Generate Video Now", type="primary", width="stretch"):
+            clear_rendered_video(scope)
+            if run_render_pipeline(
+                slides, scope, aspect_name, fit_mode, transition_type,
+                transition_dur, fps, watermark_text,
+            ):
+                st.balloons()
+
+    show_rendered_video("reel", "Your Reel", slot="export")
+    show_rendered_video("duel", "Your Versus Duel", slot="export")
+
+
+# ---------------------------------------------------------------------------
+# Batch mode
+#
+# One topic per line in, finished vertical videos out. Each job runs the same
+# pipeline the single-clip studio does -- licensed footage, Gemini script,
+# licensed narration, kinetic captions, ducked bed, provenance -- and a failure
+# in one job never stops the queue.
+# ---------------------------------------------------------------------------
+
+BATCH_STAGES = ("footage", "script", "voice", "render")
+
+
+def _batch_job(topic: str) -> dict[str, Any]:
+    """A fresh queue entry."""
+    return {
+        "topic": topic.strip(),
+        "status": "queued",       # queued | running | done | failed | skipped
+        "stage": "",
+        "error": "",
+        "video_name": "",
+        "video_path": "",
+        "duration": 0.0,
+        "licence": "",
+        "credit": "",
+        "script": "",
+        "ready": False,
+    }
+
+
+def run_batch_job(
+    job: dict[str, Any],
+    settings: dict[str, Any],
+    on_stage: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """
+    Takes one topic all the way to a rendered, ledgered video.
+
+    Raises nothing: any failure is recorded on the job so the queue can carry
+    on. A batch that dies on job three of twenty is worse than useless.
+    """
+    def stage(name: str) -> None:
+        job["stage"] = name
+        if on_stage:
+            on_stage(name)
+
+    topic = str(job["topic"])
+    target = ASPECT_RATIOS[str(settings.get("aspect") or next(iter(ASPECT_RATIOS)))]
+
+    # ---- 1. licensed footage ------------------------------------------
+    stage("footage")
+    hits = search_licensed_video(topic, limit=4)
+    if not hits:
+        raise RuntimeError(f"No licensed footage found for '{topic}'. Try broader wording.")
+
+    hit = hits[0]
+    licence_key = normalise_licence(str(hit.get("licence_raw")))
+    if not LICENCES[licence_key].commercial:
+        raise RuntimeError(f"Best match for '{topic}' is not cleared for commercial use.")
+
+    clip_path = download_licensed_clip(hit, user_exports())
+    job["licence"] = licence_key
+
+    # ---- 2. script -----------------------------------------------------
+    stage("script")
+    angles = generate_commentary_angles(
+        clip_path, duration_target=str(settings.get("target") or DEFAULT_TARGET),
+    )
+    preferred = str(settings.get("angle") or "suspense")
+    key = preferred if preferred in angles["angles"] else next(iter(angles["angles"]))
+    script = str(angles["angles"][key])
+    job["script"] = script
+
+    # ---- 3. narration ---------------------------------------------------
+    stage("voice")
+    narration = synthesize_narration(
+        script,
+        provider=str(settings.get("tts_provider") or "gemini"),
+        voice=str(settings.get("voice") or "Charon"),
+        output_path=os.path.join(user_exports(), f"narration_{int(time.time())}.wav"),
+        style=str(settings.get("style") or "Punchy viral narrator, fast pace"),
+    )
+    speech = float(narration["duration"])
+
+    # ---- 4. render -------------------------------------------------------
+    stage("render")
+    ass_path = None
+    if settings.get("kinetic", True) and narration["words"]:
+        ass_path = write_ass_file(
+            list(narration["words"]),
+            os.path.join(user_exports(), f"captions_{int(time.time())}.ass"),
+            size=target, position=str(settings.get("caption_position") or "bottom"),
+            highlight=str(settings.get("highlight") or "yellow"),
+        )
+
+    bgm_path = None
+    if settings.get("bgm", True):
+        bgm_path = build_ducked_bgm(
+            speech + 0.4, narration["path"],
+            os.path.join(user_exports(), f"bgm_{int(time.time())}.wav"),
+            volume=float(settings.get("bgm_volume") or BGM_DEFAULT_VOLUME),
+        )
+
+    out_path = new_export_path("batch")
+    result = render_commentary_video(
+        source_video=clip_path,
+        narration_path=str(narration["path"]),
+        script=script,
+        output_path=out_path,
+        target_size=target,
+        fps=int(settings.get("fps") or 24),
+        original_volume=float(settings.get("original_volume") or 0.15),
+        loop_mode=str(settings.get("loop_mode") or "boomerang"),
+        fit=str(settings.get("fit") or DEFAULT_FIT),
+        burn_captions=False,
+        ass_path=ass_path,
+        bgm_path=bgm_path,
+        watermark_text=str(settings.get("watermark") or ""),
+    )
+
+    # ---- 5. provenance ---------------------------------------------------
+    entry = append_ledger(user_exports(), {
+        "video_name": os.path.basename(out_path),
+        "video_path": out_path,
+        "duration": float(result["duration"]),
+        "licence": licence_key,
+        "licence_reference": "",
+        "source_title": str(hit.get("title") or ""),
+        "source_author": str(hit.get("author") or ""),
+        "source_url": str(hit.get("page_url") or hit.get("url") or ""),
+        "source_provider": str(hit.get("provider") or ""),
+        "tts_provider": str(narration.get("provider") or ""),
+        "voice": str(narration.get("voice") or ""),
+        "script_model": str(angles.get("model") or ""),
+        "ai_disclosed": bool(settings.get("ai_disclosed")),
+        "script": script,
+        "batch_topic": topic,
+    })
+
+    verdict = publish_readiness(entry)
+    job.update({
+        "status": "done",
+        "stage": "",
+        "video_name": entry["video_name"],
+        "video_path": out_path,
+        "duration": float(result["duration"]),
+        "credit": attribution_line(entry),
+        "ready": bool(verdict["ready"]),
+        "blockers": verdict["blockers"],
+    })
+    return job
+
+
+def render_batch_studio() -> None:
+    """Queue several topics and render them one after another."""
+    st.markdown(
+        '<div class="rf-brand"><div class="rf-logo">📦</div>'
+        '<div><div class="rf-title">Batch Studio</div></div></div>'
+        '<div class="rf-sub">Queue topics, walk away, come back to finished vertical videos '
+        '— each one sourced, scripted, voiced and licence-logged.</div>',
+        unsafe_allow_html=True,
+    )
+
+    queue: list[dict[str, Any]] = st.session_state.setdefault("batch_queue", [])
+
+    with st.container(border=True):
+        st.markdown("#### ① Queue your topics")
+        st.caption("One per line. Each becomes a search against the licensed library, "
+                   "then a full render.")
+
+        raw = st.text_area(
+            "Topics", key="batch_topics", height=140,
+            placeholder="ocean waves\ncity traffic at night\nexcavator digging\nvolcano eruption",
+        )
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            target = pick(
+                "Length", list(DURATION_TARGETS.keys()), "rewards", "batch_target",
+                format_func=lambda k: str(DURATION_TARGETS[k]["label"]).split(" · ")[0],
+            )
+        with c2:
+            angle = pick(
+                "Angle", list(ANGLE_ORDER), "suspense", "batch_angle",
+                format_func=lambda k: str(SCRIPT_ANGLES[k]["label"]),
+            )
+        with c3:
+            voice = st.selectbox(
+                "Voice", list(GEMINI_VOICES.keys()),
+                format_func=lambda v: GEMINI_VOICES[v].split(" — ")[0],
+                key="batch_voice",
+            )
+
+        d1, d2, d3 = st.columns(3)
+        with d1:
+            kinetic = st.checkbox("Kinetic captions", value=True, key="batch_kinetic")
+        with d2:
+            bgm = st.checkbox("Suspense BGM", value=True, key="batch_bgm")
+        with d3:
+            disclosed = st.checkbox("Label as AI on upload", value=True, key="batch_disclosed")
+
+        topics = [t.strip() for t in raw.splitlines() if t.strip()]
+        est = len(topics) * (int(DURATION_TARGETS[target]["high"]) * 1.4 + 60)
+        if topics:
+            stat_row([
+                ("Topics", str(len(topics)), "cyan"),
+                ("Est. total", f"~{est / 60:.0f} min", "amber" if est > 1800 else ""),
+                ("Per video", f"~{est / max(len(topics), 1) / 60:.1f} min", ""),
+            ])
+
+        b1, b2 = st.columns([3, 1])
+        with b1:
+            start = st.button("🚀 Run batch", type="primary", width="stretch",
+                              disabled=not topics)
+        with b2:
+            if st.button("Clear queue", width="stretch"):
+                st.session_state["batch_queue"] = []
+                st.rerun()
+
+    if start:
+        st.session_state["batch_queue"] = [_batch_job(t) for t in topics]
+        queue = st.session_state["batch_queue"]
+
+        settings = {
+            "aspect": st.session_state.get("render_aspect", next(iter(ASPECT_RATIOS))),
+            "fit": st.session_state.get("render_fit", DEFAULT_FIT),
+            "fps": st.session_state.get("render_fps", 24),
+            "watermark": st.session_state.get("render_watermark", ""),
+            "target": target, "angle": angle, "voice": voice,
+            "tts_provider": "gemini", "kinetic": kinetic, "bgm": bgm,
+            "ai_disclosed": disclosed,
+            "caption_position": "bottom", "highlight": "yellow",
+            "loop_mode": "boomerang", "original_volume": 0.15,
+            "bgm_volume": BGM_DEFAULT_VOLUME,
+            "style": "Punchy viral narrator, fast pace",
+        }
+
+        overall = st.progress(0.0)
+        line = st.empty()
+        started = time.time()
+
+        for index, job in enumerate(queue):
+            job["status"] = "running"
+
+            def on_stage(name: str, _i: int = index, _t: str = job["topic"]) -> None:
+                done = BATCH_STAGES.index(name) / len(BATCH_STAGES)
+                overall.progress(min(1.0, (_i + done) / len(queue)))
+                line.markdown(f"**Job {_i + 1}/{len(queue)} · {_t} — {name}...**")
+
+            try:
+                run_batch_job(job, settings, on_stage)
+            except Exception as exc:
+                # One bad topic must not take the rest of the queue with it.
+                job.update({"status": "failed", "stage": "",
+                            "error": f"{type(exc).__name__}: {exc}"})
+
+            overall.progress((index + 1) / len(queue))
+
+        sweep_scratch_files(force=True)
+        done = sum(1 for j in queue if j["status"] == "done")
+        line.markdown(f"**Finished — {done}/{len(queue)} rendered "
+                      f"in {(time.time() - started) / 60:.1f} min.**")
+        if done:
+            st.balloons()
+
+    if queue:
+        with st.container(border=True):
+            st.markdown("#### ② Results")
+            ok = sum(1 for j in queue if j["status"] == "done")
+            ready = sum(1 for j in queue if j.get("ready"))
+            stat_row([
+                ("Rendered", f"{ok}/{len(queue)}", "cyan"),
+                ("Publish-ready", str(ready), "green" if ready == ok and ok else "amber"),
+                ("Failed", str(sum(1 for j in queue if j["status"] == "failed")), ""),
+            ])
+
+            for index, job in enumerate(queue):
+                icon = {"done": "✅", "failed": "❌", "running": "⏳"}.get(str(job["status"]), "•")
+                with st.expander(
+                    f"{icon} {job['topic']} "
+                    f"{'· ' + str(job['duration']) [:4] + 's' if job['duration'] else ''}",
+                    expanded=job["status"] == "failed",
+                ):
+                    if job["status"] == "failed":
+                        st.error(f"**Failed at '{job['stage'] or 'start'}':** {job['error']}")
+                        continue
+                    if job["status"] != "done":
+                        st.info(f"Status: {job['status']}")
+                        continue
+
+                    st.markdown(
+                        badge(LICENCES[str(job["licence"])].label, "green")
+                        + badge(f"{job['duration']:.0f}s")
+                        + (badge("publish-ready", "green") if job["ready"] else badge("blocked", "amber")),
+                        unsafe_allow_html=True,
+                    )
+                    if job.get("credit"):
+                        st.caption(f"Credit required: {job['credit']}")
+                    if not job["ready"]:
+                        for blocker in job.get("blockers", []):
+                            st.markdown(f"- 🚫 {blocker}")
+
+                    st.markdown(f"*{str(job['script'])[:220]}...*")
+
+                    path = str(job["video_path"])
+                    if os.path.exists(path):
+                        prev, dl = st.columns([1, 1])
+                        with prev:
+                            st.video(path)
+                        with dl:
+                            with open(path, "rb") as handle:
+                                st.download_button(
+                                    "📥 Download", data=handle.read(),
+                                    file_name=str(job["video_name"]), mime="video/mp4",
+                                    width="stretch", key=f"batch_dl_{index}_{job['video_name']}",
+                                )
+
+
+# ---------------------------------------------------------------------------
+# Shell
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Minimalist Motion studio
+#
+# The only mode that needs no footage at all: the picture is drawn from code,
+# so the render is the user's own work outright and clears the publish gate
+# without a licence question anywhere in the flow.
+# ---------------------------------------------------------------------------
+
+MM_VOICES = ("Charon", "Kore", "Puck", "Fenrir", "Aoede")
+
+
+def _mm() -> dict[str, Any]:
+    """
+    The mode's own state, kept outside the widget keys.
+
+    Streamlit drops the state of widgets that stop being drawn, so switching to
+    another Production Mode would wipe every selection here. Mirroring each
+    choice into this dict and seeding the widgets from it is what makes the
+    mode survive a round trip.
+    """
+    return st.session_state.minimal
+
+
+def mm_publish_text(spec: dict[str, Any], publish: dict[str, Any]) -> str:
+    """The publish pack for an animation: no licence trail, because there is none."""
+    tags = " ".join(publish.get("hashtags") or [])
+    lines = [
+        "REELFORGE - MINIMALIST MOTION PUBLISH PACK",
+        "=" * 52,
+        "",
+        "TITLE",
+        str(publish.get("title") or ""),
+        "",
+        "DESCRIPTION",
+        str(publish.get("description") or ""),
+        "",
+        tags,
+        "",
+        "-" * 52,
+        "FOOTAGE",
+        "Vector animation generated procedurally by ReelForge Studio.",
+        "No stock footage, no third-party assets, no model-generated imagery.",
+        "You hold the rights outright.",
+        "",
+        f"Template       : {TEMPLATES[str(spec.get('template'))]['label']}",
+        f"Runtime        : {float(spec.get('duration') or 0):.1f}s",
+        f"On-screen copy : {spec.get('title')} / {spec.get('subtitle')}",
+        f"Closing line   : {spec.get('payoff')}",
+    ]
+    if spec.get("thesis"):
+        lines += ["", "NARRATION SCRIPT", str(spec.get("thesis"))]
+    lines += ["", "-" * 52, AI_DISCLOSURE_LINE, ""]
+    for platform, step in PLATFORM_DISCLOSURE_STEPS.items():
+        lines.append(f"{platform}: {step}")
+    return "\n".join(lines)
+
+
+def run_minimalist_render(spec: dict[str, Any]) -> bool:
+    """Renders the animation and files it in the ledger. Returns success."""
+    state = _mm()
+    bar = st.progress(0.0)
+    status = st.empty()
+
+    def progress(step: int, total: int, message: str) -> None:
+        bar.progress(min(1.0, step / max(total, 1)))
+        status.markdown(f"**{message}**")
+
+    try:
+        out_path = os.path.join(user_exports(), f"minimalist_{int(time.time())}.mp4")
+        os.makedirs(user_exports(), exist_ok=True)
+
+        narrate = bool(state.get("narrate"))
+        result = build_minimalist_video(
+            spec, out_path,
+            fps=int(st.session_state.get("render_fps", 30)),
+            bgm=bool(state.get("bgm", True)),
+            bgm_volume=float(state.get("bgm_volume", 0.30)),
+            sfx=bool(state.get("sfx", True)),
+            narrate=narrate,
+            voice=str(state.get("voice") or "Charon"),
+            progress_callback=progress,
+        )
+
+        if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+            raise FileNotFoundError(f"Renderer finished but {out_path} is missing or empty")
+
+        with open(out_path, "rb") as handle:
+            data = handle.read()
+
+        publish = dict(result["publish"])
+        entry = append_ledger(user_exports(), {
+            "video_name": os.path.basename(out_path), "video_path": out_path,
+            "duration": float(result["duration"]),
+            # Drawn from code in this process. Nothing was licensed because
+            # nothing was borrowed.
+            "licence": "own", "licence_reference": "",
+            "source_title": "Procedural vector animation",
+            "source_author": "", "source_url": "", "source_provider": "reelforge",
+            "tts_provider": str(result["tts_provider"]),
+            "voice": str(result.get("voice") or ""),
+            "script_model": str(spec.get("source") or "preset"),
+            "ai_disclosed": bool(state.get("ai_disclosed")),
+            "script": str(spec.get("thesis") or ""),
+            "template": str(spec.get("template")),
+        })
+
+        state.update({
+            "spec": result["spec"], "publish": publish,
+            "result": {k: result[k] for k in
+                       ("duration", "fps", "frames", "template", "climax",
+                        "narration", "narration_trimmed", "bgm", "sfx", "gpu")},
+            "entry_name": entry["video_name"],
+        })
+        st.session_state["minimal_video_path"] = out_path
+        st.session_state["minimal_video_bytes"] = data
+        st.session_state["minimal_video_name"] = os.path.basename(out_path)
+
+        # Beds, mixes and voice takes all went to the temp directory; this is
+        # the one call that clears them.
+        purge_scratch_renders()
+        status.markdown("**Done.**")
+        return True
+
+    except Exception as exc:
+        bar.empty()
+        status.empty()
+        st.error(f"**Render failed:** `{type(exc).__name__}: {exc}`")
+        st.code(traceback.format_exc())
+        purge_scratch_renders()
+        return False
+
+
+def render_minimalist_studio() -> None:
+    """Concept in, finished 1080x1920 vector animation out. No footage anywhere."""
+    state = _mm()
+    has_spec = bool(state.get("spec"))
+
+    st.markdown(
+        badge("① Concept", "green" if state.get("concept") else "violet")
+        + badge("② Scene", "green" if has_spec else "violet")
+        + badge("③ Render", "green" if st.session_state.get("minimal_video_path") else "violet"),
+        unsafe_allow_html=True,
+    )
+
+    # ---------------------------------------------------------------- STEP 1
+    with st.container(border=True):
+        st.markdown("#### ① Metaphor")
+        st.caption("Everything on screen is drawn from code — white vector on pure "
+                   "black. There is no footage to license, so this mode clears the "
+                   "publish gate on its own.")
+
+        preset_keys = list(SCENE_PRESETS.keys())
+        chosen = st.pills(
+            "Quick-select", preset_keys, default=state.get("preset"),
+            format_func=lambda k: SCENE_PRESETS[k]["label"], key="mm_preset",
+        )
+        if chosen and chosen != state.get("preset"):
+            state["preset"] = chosen
+            state["concept"] = SCENE_PRESETS[chosen]["concept"]
+            state["template"] = SCENE_PRESETS[chosen]["template"]
+            st.rerun()
+
+        concept = st.text_area(
+            "Metaphor Concept or Topic", value=str(state.get("concept") or ""),
+            key="mm_concept", height=96,
+            placeholder="Why the people who start ugly finish first",
+            help="One idea, stated plainly. The model turns it into geometry, copy "
+                 "and timing — it never draws anything itself.",
+        )
+        state["concept"] = concept
+
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            template = st.selectbox(
+                "Scene template", list(TEMPLATES.keys()),
+                index=list(TEMPLATES.keys()).index(str(state.get("template") or DEFAULT_TEMPLATE)),
+                format_func=lambda k: TEMPLATES[k]["label"], key="mm_template",
+            )
+            state["template"] = template
+            st.caption(TEMPLATES[template]["blurb"])
+        with c2:
+            duration = st.slider(
+                "Length (s)", int(SCENE_MIN_SECONDS), int(SCENE_MAX_SECONDS),
+                int(state.get("duration", 18)), 1, key="mm_duration",
+                help="15–25s is the retention sweet spot for Shorts: long enough to "
+                     "land an idea, short enough to loop.",
+            )
+            state["duration"] = duration
+
+        estimate = estimate_render_seconds(float(duration), int(st.session_state.get("render_fps", 30)))
+        st.caption(f"≈ {estimate:.0f}s to draw at {int(st.session_state.get('render_fps', 30))}fps · "
+                   f"font in use: `{active_face_name()}`")
+
+    # ---------------------------------------------------------------- STEP 2
+    with st.container(border=True):
+        st.markdown("#### ② Sound")
+        a1, a2, a3 = st.columns([1, 1, 1])
+        with a1:
+            state["bgm"] = st.checkbox("🎵 Atmospheric bed", value=bool(state.get("bgm", True)),
+                                       key="mm_bgm",
+                                       help="Slowed, reverbed phonk, synthesized to the exact "
+                                            "length of the animation so there is no loop seam.")
+            state["bgm_volume"] = st.slider("Bed volume", 0.0, 1.0,
+                                            float(state.get("bgm_volume", 0.30)), 0.05,
+                                            key="mm_bgmvol", disabled=not state["bgm"])
+        with a2:
+            state["sfx"] = st.checkbox("💥 Sub drop on the climax",
+                                       value=bool(state.get("sfx", True)), key="mm_sfx",
+                                       help="A riser into a sub-bass hit, placed so the impact "
+                                            "lands on the frame the object clears the obstacle.")
+        with a3:
+            state["narrate"] = st.checkbox("🎙️ Narrate the thesis",
+                                           value=bool(state.get("narrate", False)), key="mm_narrate",
+                                           help="Gemini TTS reads the one-line thesis. Leading "
+                                                "silence is trimmed so the voice starts at 0.0s.")
+            state["voice"] = pick("Voice", MM_VOICES, str(state.get("voice") or "Charon"),
+                                  "mm_voice") if state["narrate"] else state.get("voice", "Charon")
+
+        if state["narrate"]:
+            state["ai_disclosed"] = st.checkbox(
+                "I will label this as AI-generated when I upload",
+                value=bool(state.get("ai_disclosed")), key="mm_disclose",
+                help="Required once there is a synthetic voice on the track. A silent "
+                     "cut has no synthetic media in it and needs no label.",
+            )
+        else:
+            state["ai_disclosed"] = bool(state.get("ai_disclosed"))
+            st.caption("Silent cut — no synthetic voice, so no synthetic-media label is required.")
+
+    # ---------------------------------------------------------------- STEP 3
+    with st.container(border=True):
+        st.markdown("#### ③ Generate & animate")
+        b1, b2 = st.columns([2, 1])
+
+        with b1:
+            if st.button("✨ Generate Metaphor & Animate", width="stretch",
+                         key="mm_go", disabled=not str(state.get("concept") or "").strip()):
+                spec: dict[str, Any] | None = None
+                with st.spinner("Gemini is writing the scene..."):
+                    try:
+                        raw = generate_scene_spec(
+                            str(state["concept"]), str(state["template"]), float(state["duration"]),
+                        )
+                        spec = normalise_spec(raw)
+                    except Exception as exc:
+                        # A dead key or a 503 must not cost the user the video.
+                        st.warning(
+                            f"Gemini could not write the scene ({exc}). Animating with the "
+                            "template's own copy instead — edit it below and re-render.",
+                            icon="⚠️",
+                        )
+                        spec = fallback_scene_spec(
+                            str(state["concept"]), str(state["template"]), float(state["duration"]),
+                        )
+                if spec is not None:
+                    if not spec.get("publish"):
+                        spec["publish"] = fallback_publish_meta(
+                            str(state["concept"]), str(spec.get("title") or ""),
+                            str(spec.get("payoff") or ""),
+                        )
+                    if run_minimalist_render(spec):
+                        st.rerun()
+
+        with b2:
+            if st.button("🎬 Animate without AI", width="stretch", key="mm_local"):
+                spec = fallback_scene_spec(
+                    str(state.get("concept") or ""), str(state["template"]), float(state["duration"]),
+                )
+                spec["publish"] = fallback_publish_meta(
+                    str(state.get("concept") or ""), str(spec.get("title") or ""),
+                    str(spec.get("payoff") or ""),
+                )
+                if run_minimalist_render(spec):
+                    st.rerun()
+
+        if has_spec:
+            spec = dict(state["spec"])
+            with st.expander("✏️ Edit the copy and re-render"):
+                spec["title"] = st.text_input("Title", value=str(spec.get("title") or ""),
+                                              key="mm_title")
+                spec["subtitle"] = st.text_input("Subtitle", value=str(spec.get("subtitle") or ""),
+                                                 key="mm_subtitle")
+                spec["payoff"] = st.text_input("Closing line", value=str(spec.get("payoff") or ""),
+                                               key="mm_payoff")
+                spec["thesis"] = st.text_area("Narration thesis",
+                                              value=str(spec.get("thesis") or ""),
+                                              key="mm_thesis", height=88)
+                if st.button("🔄 Re-render with these edits", width="stretch", key="mm_rerender"):
+                    state["spec"] = spec
+                    if run_minimalist_render(spec):
+                        st.rerun()
+
+    # ---------------------------------------------------------------- OUTPUT
+    result = state.get("result") or {}
+    if result:
+        stat_row([
+            ("Runtime", f"{float(result.get('duration', 0)):.1f}s", "cyan"),
+            ("Frames", str(result.get("frames", 0)), ""),
+            ("Climax", f"{float(result.get('climax', 0)):.1f}s", "violet"),
+            ("Encoder", "GPU" if result.get("gpu") else "CPU", ""),
+        ])
+        if result.get("narration") and float(result.get("narration_trimmed", 0)) > 0:
+            st.caption(f"Trimmed {float(result['narration_trimmed']):.2f}s of dead air "
+                       "off the front of the voice track.")
+
+    show_rendered_video("minimal", "Your Minimalist Motion short", slot="minimal")
+    render_minimalist_publish()
+
+
+def render_minimalist_publish() -> None:
+    """Publish pack for an animation: the check, the metadata, the download."""
+    state = _mm()
+    name = st.session_state.get("minimal_video_name")
+    publish = state.get("publish") or {}
+    spec = state.get("spec") or {}
+    if not name or not publish:
+        return
+
+    entry = find_entry(user_exports(), str(name))
+    verdict = publish_readiness(entry) if entry else None
+
+    with st.container(border=True):
+        st.markdown("#### 📤 Publish pack")
+
+        if verdict and verdict["ready"]:
+            st.success("Cleared for a monetized upload — the animation is your own work "
+                       "outright, with nothing borrowed to claim.", icon="✅")
+        elif verdict:
+            st.error(f"Not cleared yet — {len(verdict['blockers'])} to fix.", icon="🚫")
+            for blocker in verdict["blockers"]:
+                st.markdown(f"- 🚫 {blocker}")
+
+        st.markdown("**High-CTR title**")
+        st.code(str(publish.get("title") or ""), language=None)
+        st.markdown("**Description**")
+        st.code(str(publish.get("description") or ""), language=None)
+        st.markdown("**Hashtags**")
+        st.code(" ".join(publish.get("hashtags") or []), language=None)
+
+        pack = mm_publish_text(spec, publish)
+        st.download_button(
+            "📋 Download publish pack (.txt)", data=pack.encode("utf-8"),
+            file_name=f"{os.path.splitext(str(name))[0]}_publish.txt",
+            mime="text/plain", width="stretch", key=f"mm_pack_{name}",
+        )
+
+        if verdict and verdict["warnings"]:
+            with st.expander(f"Worth knowing ({len(verdict['warnings'])})"):
+                for item in verdict["warnings"]:
+                    st.markdown(f"- ⚠️ {item}")
+
+
+
+# ---------------------------------------------------------------------------
+# Authentication gate
+#
+# Nothing else in this file renders until `require_login()` returns True. The
+# gate is the first statement in main(), so an unauthenticated visitor sees the
+# login card and nothing else -- no sidebar, no mode selector, no filenames.
+# ---------------------------------------------------------------------------
+
+LOGIN_CSS = """
+<style>
+.rf-login-wrap { max-width: 400px; margin: 6vh auto 0 auto; }
+.rf-login-card {
+    background: linear-gradient(180deg, rgba(255,255,255,0.045), rgba(255,255,255,0.015));
+    border: 1px solid var(--edge);
+    border-radius: 18px;
+    padding: 34px 30px 26px 30px;
+    box-shadow: 0 24px 70px rgba(0,0,0,0.55);
+}
+.rf-login-mark {
+    font-size: 30px; font-weight: 800; letter-spacing: -0.02em;
+    text-align: center; color: var(--text-hi); margin-bottom: 4px;
+}
+.rf-login-sub {
+    text-align: center; color: var(--text-low); font-size: 13px;
+    margin-bottom: 22px; letter-spacing: 0.02em;
+}
+.rf-login-rule { height: 1px; background: var(--edge); margin: 20px 0 14px 0; }
+.rf-login-foot { text-align: center; color: var(--text-low); font-size: 11.5px; }
+</style>
+"""
+
+# Rate limiting lives in auth.py, not here: Streamlit re-executes this script
+# on every interaction, so a counter defined at this level would be reset by
+# the very click it is counting. See the note there.
+LOGIN_MAX_ATTEMPTS = auth.LOGIN_MAX_ATTEMPTS
+LOGIN_LOCKOUT_SECONDS = auth.LOGIN_LOCKOUT_SECONDS
+login_locked_for = auth.login_locked_for
+note_login_failure = auth.note_login_failure
+clear_login_failures = auth.clear_login_failures
+
+
+def _boot_admin_once() -> None:
+    """
+    Makes sure an admin exists, printing a generated password to the console.
+
+    To the console and never to the page: whoever can reach the login screen is
+    not yet known to be the operator.
+    """
+    if st.session_state.get("_auth_bootstrapped"):
+        return
+    st.session_state["_auth_bootstrapped"] = True
+
+    result = auth.bootstrap()
+    if result["created"]:
+        banner = (
+            "\n" + "=" * 66 +
+            "\n  ReelForge Studio - first run: an admin account was created."
+            f"\n    username: {result['username']}"
+            f"\n    password: {result['password']}"
+            "\n  This is shown once, here in the server console only."
+            "\n  Sign in and change it under Admin > Users."
+            "\n" + "=" * 66 + "\n"
+        )
+        print(banner, flush=True)
+        st.session_state["_auth_first_run"] = True
+
+
+def render_login() -> None:
+    """The whole page when nobody is signed in."""
+    st.markdown(LOGIN_CSS, unsafe_allow_html=True)
+    _, middle, _ = st.columns([1, 1.15, 1])
+
+    with middle:
+        st.markdown('<div class="rf-login-wrap">', unsafe_allow_html=True)
+        with st.container(border=True):
+            st.markdown('<div class="rf-login-mark">🎬 ReelForge Studio</div>',
+                        unsafe_allow_html=True)
+            st.markdown('<div class="rf-login-sub">Private workspace · sign in to continue</div>',
+                        unsafe_allow_html=True)
+
+            waiting = float(st.session_state.get("_auth_waiting", 0.0))
+
+            with st.form("rf_login", clear_on_submit=False):
+                username = st.text_input("Username", key="login_user",
+                                         autocomplete="username")
+                password = st.text_input("Password", type="password", key="login_pass",
+                                         autocomplete="current-password")
+                submitted = st.form_submit_button(
+                    "Sign in" if waiting <= 0 else f"Locked · {waiting:.0f}s",
+                    width="stretch", disabled=waiting > 0,
+                )
+
+            if waiting > 0:
+                # Say why. A button that has silently turned into "Locked" with
+                # no explanation reads as a broken app, not as a cooldown.
+                st.warning(
+                    f"Too many attempts on that account. Try again in {waiting:.0f} seconds.",
+                    icon="⏳",
+                )
+
+            if submitted:
+                # Checked here as well as on the button: a disabled button is
+                # only a hint to the browser, and the cooldown has to hold
+                # against a client that ignores it.
+                remaining = login_locked_for(username)
+                if remaining > 0:
+                    st.session_state["_auth_waiting"] = remaining
+                    st.warning(f"Too many attempts. Try again in {remaining:.0f} seconds.",
+                               icon="⏳")
+                else:
+                    who = auth.authenticate(username, password)
+                    if who:
+                        clear_login_failures(who["username"])
+                        st.session_state["auth"] = {
+                            "username": who["username"],
+                            "role": who["role"],
+                            "signed_in_at": time.strftime("%Y-%m-%d %H:%M"),
+                        }
+                        st.session_state.pop("_auth_waiting", None)
+                        ensure_dir(auth.user_exports_dir(who["username"]))
+                        st.rerun()
+                    else:
+                        cooldown = note_login_failure(username)
+                        st.session_state["_auth_waiting"] = cooldown
+                        # One message for both failure modes: saying "no such
+                        # user" would let anyone test which names exist.
+                        st.error("Incorrect username or password.", icon="🚫")
+                        if cooldown > 0:
+                            st.warning(
+                                f"Too many attempts. Try again in {cooldown:.0f} seconds.",
+                                icon="⏳",
+                            )
+
+            if st.session_state.get("_auth_first_run"):
+                st.info(
+                    "First run — an admin account was created and its password was "
+                    "printed to the server console. Check the terminal running "
+                    "Streamlit, or `docker logs` for the container.",
+                    icon="🔑",
+                )
+
+            st.markdown('<div class="rf-login-rule"></div>', unsafe_allow_html=True)
+            st.markdown(
+                '<div class="rf-login-foot">Accounts are issued by an administrator.</div>',
+                unsafe_allow_html=True,
+            )
+        st.markdown("</div>", unsafe_allow_html=True)
+
+
+def require_login() -> bool:
+    """True once signed in; otherwise draws the login card and returns False."""
+    _boot_admin_once()
+
+    # Refresh the countdown from the authoritative table so it ticks down and
+    # the form unlocks itself once the cooldown has passed.
+    typed = str(st.session_state.get("login_user") or "")
+    if typed:
+        st.session_state["_auth_waiting"] = login_locked_for(typed)
+
+    session = st.session_state.get("auth")
+    if isinstance(session, dict) and session.get("username"):
+        # Re-read the role every run so a change made in Admin takes effect on
+        # the next click rather than at the user's next sign-in.
+        record = auth.load_users().get(str(session["username"]))
+        if record is None:
+            st.session_state.pop("auth", None)      # account deleted mid-session
+        else:
+            session["role"] = auth.normalise_role(record.get("role"))
+            return True
+
+    render_login()
+    return False
+
+
+def render_identity_bar() -> None:
+    """Who you are and the way out, at the top of the sidebar."""
+    user = current_user()
+    role = auth.normalise_role(user.get("role"))
+    spec = auth.ROLES[role]
+
+    st.markdown(
+        badge(f"👤 {user.get('username', '')}", "violet")
+        + badge(spec["label"], "cyan" if role == auth.ADMIN else ""),
+        unsafe_allow_html=True,
+    )
+    if st.button("Log out", width="stretch", key="rf_logout"):
+        # Clear the whole session, not just the auth key: session state holds
+        # this user's rendered video bytes and scripts, and the next person at
+        # this browser must not inherit them.
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+        st.rerun()
+    st.caption(f"Files: `exports/{auth.safe_slug(str(user.get('username') or ''))}/`")
+
+
+# ---------------------------------------------------------------------------
+# Admin
+# ---------------------------------------------------------------------------
+
+def render_admin_studio() -> None:
+    """User management, API keys and a workspace overview. Admin only."""
+    user = current_user()
+    if not auth.can(str(user.get("role")), "manage_users"):
+        st.error("Administrators only.", icon="🚫")
+        return
+
+    st.markdown(badge("🛠️ Administration", "violet"), unsafe_allow_html=True)
+
+    # ---------------------------------------------------------------- USERS
+    with st.container(border=True):
+        st.markdown("#### 👥 Users")
+        users = auth.load_users()
+        admins = sum(1 for r in users.values() if auth.normalise_role(r.get("role")) == auth.ADMIN)
+        stat_row([
+            ("Accounts", str(len(users)), "cyan"),
+            ("Admins", str(admins), ""),
+            ("Workspaces", str(len(auth.list_user_dirs())), ""),
+        ])
+
+        for name, record in sorted(users.items()):
+            role = auth.normalise_role(record.get("role"))
+            from_env = record.get("source") == "env"
+            with st.expander(
+                f"{'🛡️' if role == auth.ADMIN else '🎬'} {name}"
+                + (" · from environment" if from_env else "")
+            ):
+                st.markdown(
+                    badge(auth.ROLES[role]["label"], "cyan" if role == auth.ADMIN else "")
+                    + badge(f"created {record.get('created_at') or 'unknown'}", "")
+                    + badge(f"last login {record.get('last_login') or 'never'}", ""),
+                    unsafe_allow_html=True,
+                )
+                if from_env:
+                    st.caption("Declared by REELFORGE_USERS / REELFORGE_ADMIN_USER. "
+                               "Change the environment variable and restart to edit it.")
+                    continue
+
+                c1, c2 = st.columns([1, 1])
+                with c1:
+                    wanted = st.selectbox(
+                        "Role", list(auth.ROLES.keys()),
+                        index=list(auth.ROLES.keys()).index(role),
+                        format_func=lambda k: str(auth.ROLES[k]["label"]),
+                        key=f"adm_role_{name}",
+                    )
+                    if wanted != role and st.button("Apply role", key=f"adm_setrole_{name}"):
+                        try:
+                            auth.set_role(name, wanted)
+                            st.success(f"{name} is now {auth.ROLES[wanted]['label']}.")
+                            st.rerun()
+                        except ValueError as exc:
+                            st.error(str(exc))
+                with c2:
+                    fresh = st.text_input("New password", type="password",
+                                          key=f"adm_pw_{name}")
+                    if st.button("Reset password", key=f"adm_setpw_{name}", disabled=not fresh):
+                        try:
+                            auth.set_password(name, fresh)
+                            st.success(f"Password reset for {name}.")
+                        except ValueError as exc:
+                            st.error(str(exc))
+
+                if name != str(user.get("username")):
+                    if st.button(f"Delete {name}", key=f"adm_del_{name}"):
+                        try:
+                            auth.delete_user(name)
+                            st.success(f"Deleted {name}. Their files were left in place.")
+                            st.rerun()
+                        except ValueError as exc:
+                            st.error(str(exc))
+                else:
+                    st.caption("This is you — delete from another admin account.")
+
+        st.markdown("---")
+        st.markdown("**Add a user**")
+        n1, n2, n3 = st.columns([1.2, 1.2, 0.9])
+        with n1:
+            new_name = st.text_input("Username", key="adm_new_name",
+                                     placeholder="ana.k")
+        with n2:
+            new_pass = st.text_input("Password", type="password", key="adm_new_pass",
+                                     placeholder="at least 8 characters")
+        with n3:
+            new_role = st.selectbox("Role", list(auth.ROLES.keys()), index=1,
+                                    format_func=lambda k: str(auth.ROLES[k]["label"]),
+                                    key="adm_new_role")
+        if st.button("➕ Create account", width="stretch", key="adm_create",
+                     disabled=not (new_name and new_pass)):
+            try:
+                made = auth.add_user(new_name, new_pass, new_role)
+                st.success(f"Created {made['username']} ({auth.ROLES[made['role']]['label']}).")
+                st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
+
+    # ------------------------------------------------------------- API KEYS
+    with st.container(border=True):
+        st.markdown("#### 🔑 API configuration")
+        st.caption("Keys apply to the whole server, so only administrators can see or "
+                   "change them. A key set here lasts until the process restarts — put "
+                   "it in `.env` or the container environment to make it permanent.")
+
+        gem = os.environ.get("GEMINI_API_KEY", "") or os.environ.get("GOOGLE_API_KEY", "")
+        pex = pexels_key_status()
+        stat_row([
+            ("Gemini", f"set ({len(gem)} chars)" if gem else "missing",
+             "green" if gem else "amber"),
+            ("Pexels", "active" if pex["ok"] else ("set, failing" if os.environ.get("PEXELS_API_KEY") else "missing"),
+             "green" if pex["ok"] else "amber"),
+        ])
+        if not pex["ok"] and os.environ.get("PEXELS_API_KEY"):
+            st.caption(f"Pexels says: {pex.get('reason') or 'no detail'}")
+
+        k1, k2 = st.columns([1, 1])
+        with k1:
+            gem_new = st.text_input("GEMINI_API_KEY", type="password", key="adm_gem")
+            if st.button("Set Gemini key", key="adm_set_gem", disabled=not gem_new):
+                os.environ["GEMINI_API_KEY"] = gem_new.strip()
+                st.success("Set for this server process.")
+                st.rerun()
+        with k2:
+            pex_new = st.text_input("PEXELS_API_KEY", type="password", key="adm_pex")
+            if st.button("Set Pexels key", key="adm_set_pex", disabled=not pex_new):
+                os.environ["PEXELS_API_KEY"] = pex_new.strip()
+                # The probe caches its verdict, and the cached one is about the
+                # old key. force=True re-checks against the live endpoint.
+                checked = pexels_key_status(force=True)
+                if checked["ok"]:
+                    st.success("Set and verified against the Pexels API.")
+                else:
+                    st.warning(f"Set, but Pexels rejected it: {checked['reason']}", icon="⚠️")
+                st.rerun()
+
+    # ------------------------------------------------------------ WORKSPACES
+    with st.container(border=True):
+        st.markdown("#### 📁 Workspaces")
+        st.caption("Each account renders into its own folder and only ever sees its own. "
+                   "This is the operator's view across all of them.")
+
+        rows: list[tuple[str, str, str]] = []
+        for folder in auth.list_user_dirs():
+            path = str(EXPORTS_ROOT / folder)
+            videos = [f for f in os.listdir(path) if f.lower().endswith(".mp4")] \
+                if os.path.isdir(path) else []
+            size = sum(os.path.getsize(os.path.join(path, f)) for f in videos) / 1_048_576
+            summary = summarise_ledger(path)
+            rows.append((folder, f"{len(videos)} clips · {size:.0f} MB",
+                         f"{summary['ready']}/{summary['total']} publish-ready"))
+
+        if not rows:
+            st.caption("No renders yet.")
+        for folder, files, ready in rows:
+            st.markdown(f"- **{folder}** — {files} · {ready}")
+
+
+MODE_LABELS: dict[str, str] = {
+    "commentary": "🎙️ Commentary Machine",
+    "minimalist": "◼️ Minimalist Motion",
+    "batch": "📦 Batch Studio",
+    "reel": "🎬 Reel Studio",
+    "duel": "⚔️ Versus Duel",
+    "admin": "🛠️ Admin",
+}
+
+
+def main() -> None:
+    # Nothing renders before this. An unauthenticated visitor gets the login
+    # card and no other markup at all -- no brand, no sidebar, no filenames.
+    if not require_login():
+        return
+
+    # Housekeeping: clear stale render intermediates once per session.
+    sweep_scratch_files()
+
+    st.markdown(
+        '<div class="rf-brand"><div class="rf-logo">🎬</div>'
+        '<div><div class="rf-title">Reelforge Studio</div></div></div>'
+        '<div class="rf-sub">Drop a raw clip, let Gemini watch it and write the commentary, '
+        'then publish a narrated vertical short.</div>',
+        unsafe_allow_html=True,
+    )
+
+    role = auth.normalise_role(current_user().get("role"))
+    modes = list(auth.allowed_modes(role))
+
+    with st.sidebar:
+        render_identity_bar()
+        divider()
+        st.markdown('<div class="rf-section">Production Mode</div>', unsafe_allow_html=True)
+        # The menu is built from the role, so a creator is never offered an
+        # engine they cannot open.
+        mode = pick(
+            "Mode", modes, modes[0], "app_mode",
+            format_func=lambda m: MODE_LABELS.get(str(m), str(m)),
+        )
+
+        divider()
+        st.markdown('<div class="rf-section">Format</div>', unsafe_allow_html=True)
+        aspect_name = st.selectbox(
+            "Aspect ratio", list(ASPECT_RATIOS.keys()), index=0, key="aspect_pick",
+        )
+        fit_mode = pick(
+            "Image fit", list(FIT_MODES.keys()), DEFAULT_FIT, "fit_mode",
+            format_func=lambda x: FIT_MODES[x],
+            help="How a clip that is not already 9:16 fills the frame. "
+                 "Crop fills it edge to edge and loses the sides; Blur fill keeps "
+                 "the whole picture over a blurred plate; Pad adds black bars.",
+        )
+        fps = pick("FPS", [24, 30, 60], 24, "fps_pick", format_func=str)
+
+        divider()
+        st.markdown('<div class="rf-section">Motion</div>', unsafe_allow_html=True)
+        transition_type = st.selectbox(
+            "Transition", ["crossfade", "slide_left", "slide_bottom", "fade_black", "cut"],
+            format_func=lambda x: {
+                "crossfade": "Crossfade", "slide_left": "Slide left",
+                "slide_bottom": "Slide up", "fade_black": "Fade black", "cut": "Hard cut",
+            }[x],
+            index=0,
+        )
+        transition_dur = st.slider("Transition (s)", 0.2, 1.5, 0.5, 0.1)
+
+        divider()
+        st.markdown('<div class="rf-section">Branding</div>', unsafe_allow_html=True)
+        watermark_text = st.text_input(
+            "Watermark handle", value="@viral_reels", key="watermark_input",
+            help="Burned into the top-right of every render. Clear it for no watermark.",
+        )
+
+    # Mirror the render settings into session state so panels that render on
+    # their own (the duel build button) use exactly what the sidebar shows.
+    st.session_state["render_aspect"] = aspect_name
+    st.session_state["render_fit"] = fit_mode
+    st.session_state["render_transition"] = transition_type
+    st.session_state["render_transition_dur"] = transition_dur
+    st.session_state["render_fps"] = fps
+    st.session_state["render_watermark"] = watermark_text
+
+    # The sidebar already filtered the menu; this catches a stale `app_mode`
+    # left in session state from a previous account on the same browser.
+    if mode not in modes:
+        st.error(f"Your role does not have access to that view. Showing {MODE_LABELS[modes[0]]}.",
+                 icon="🚫")
+        mode = modes[0]
+
+    if mode == "admin":
+        render_admin_studio()
+        return
+
+    # The commentary machine is a single linear flow -- no tabs to get lost in.
+    if mode == "commentary":
+        render_commentary_studio()
+        return
+
+    if mode == "minimalist":
+        render_minimalist_studio()
+        return
+
+    if mode == "batch":
+        render_batch_studio()
+        return
+
+    if mode == "duel":
+        tabs = st.tabs(["⚔️ Versus Duel", "🖼️ Slide Studio", "🎵 Audio", "👁️ Preview", "🚀 Export"])
+        with tabs[0]:
+            render_duel_studio()
+    else:
+        tabs = st.tabs(["🤖 AI Auto-Creator", "🖼️ Slide Studio", "🎵 Audio", "👁️ Preview", "🚀 Export"])
+        with tabs[0]:
+            render_auto_creator(aspect_name)
+
+    with tabs[1]:
+        render_slide_studio()
+    with tabs[2]:
+        render_audio_studio()
+    with tabs[3]:
+        render_preview(aspect_name, fps)
+    with tabs[4]:
+        render_export(aspect_name, fit_mode, transition_type, transition_dur, fps, watermark_text)
+
+
+if __name__ == "__main__":
+    main()
