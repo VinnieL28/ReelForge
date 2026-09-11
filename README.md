@@ -166,6 +166,22 @@ python -c "import auth; print(auth.hash_password('your-password-here'))"
 # paste the result into REELFORGE_ADMIN_PASSWORD_HASH in .env
 ```
 
+**Editing an engine means restarting the server.** Streamlit re-executes
+`app.py` top to bottom on every interaction, which is why module-level state in
+`app.py` never persists — but the engines it imports are cached in `sys.modules`
+for the life of the process and are *not* re-imported. So a change to
+`compliance.py`, `video_engine.py`, `duel_engine.py` and the rest has no effect
+until you restart, and adding a new name to one of them produces a confusing
+failure: the file on disk plainly defines it, and the app still raises
+
+```
+ImportError: cannot import name 'VIRAL_TARGET_SCORE' from 'compliance'
+```
+
+on every rerun, because `app.py`'s fresh import line is resolving against the
+module object loaded when the server started. Ctrl-C and `streamlit run app.py`
+again. Only `app.py` itself is hot.
+
 ---
 
 ## Accounts and roles
