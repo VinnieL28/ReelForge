@@ -130,6 +130,7 @@ def upload_video(
     video_path: str,
     progress: ProgressFn | None = None,
     timeout: int = UPLOAD_TIMEOUT,
+    normalise: bool = True,
 ) -> Any:
     """
     Uploads a clip and polls until Gemini reports it ACTIVE.
@@ -137,16 +138,35 @@ def upload_video(
     A freshly uploaded video sits in PROCESSING for a while; calling
     generate_content against it before it goes ACTIVE fails, so this blocks
     until the file is genuinely usable.
+
+    Every clip goes through an ffmpeg pre-flight first. The File API does not
+    reject an awkward container at upload time -- it accepts the bytes, parks
+    the file in FAILED, and the user sees "Gemini could not process this clip"
+    after a two-minute wait. Transcoding first turns that class of failure into
+    a four-second transcode, and shrinks the upload as a side effect.
     """
     if not os.path.exists(video_path):
         raise GeminiError(f"Video file not found: {video_path}")
 
-    size_mb = os.path.getsize(video_path) / 1_048_576
+    upload_path = video_path
+    if normalise:
+        try:
+            from video_engine import normalize_for_gemini
+
+            prepared = normalize_for_gemini(video_path, progress=progress)
+            upload_path = prepared["path"]
+        except Exception as exc:
+            # A pre-flight that cannot run is not a reason to refuse the
+            # upload -- the original may well be fine.
+            if progress:
+                progress(f"Pre-flight skipped ({type(exc).__name__}); uploading as-is.")
+
+    size_mb = os.path.getsize(upload_path) / 1_048_576
     if progress:
         progress(f"Uploading clip to Gemini ({size_mb:.1f} MB)...")
 
     try:
-        uploaded = client.files.upload(file=video_path)
+        uploaded = client.files.upload(file=upload_path)
     except Exception as exc:
         raise GeminiError(f"Upload failed: {type(exc).__name__}: {exc}") from exc
 
@@ -160,9 +180,14 @@ def upload_video(
             return uploaded
 
         if state == "FAILED":
+            # The pre-flight above already delivered baseline H.264/yuv420p/30
+            # CFR, so reaching FAILED means the file itself is damaged -- a
+            # truncated download rather than a container Gemini dislikes.
             raise GeminiError(
-                "Gemini could not process this clip. Try a standard H.264 MP4 "
-                "(some MOV/HEVC files are rejected)."
+                "Gemini rejected this clip after it had been normalised to "
+                "baseline H.264, which usually means the download is truncated "
+                "or the file has no readable video stream. Re-download it and "
+                "try again."
             )
 
         if time.time() > deadline:
@@ -792,3 +817,239 @@ def fallback_publish_meta(concept: str, title: str, payoff: str) -> dict[str, An
         "hashtags": ["#Mindset", "#Discipline", "#Psychology", "#Shorts",
                      "#SelfImprovement", "#Motivation"],
     }
+
+
+# ---------------------------------------------------------------------------
+# Viral scorecard and the retention rewrite
+#
+# compliance.viral_scorecard() is the floor: no network, always runs, and what
+# the tests assert against. This is the ceiling -- a model that can tell the
+# difference between a specific claim and a confident-sounding empty one, which
+# no regex can.
+#
+# The two are blended rather than one overriding the other. The heuristic
+# cannot be talked out of a filler count; the model cannot be fooled by a
+# script that name-drops numbers without saying anything. Averaging them keeps
+# both failure modes visible.
+# ---------------------------------------------------------------------------
+
+VIRAL_PROMPT = """You grade short-form video scripts for a channel that has to survive
+YouTube's reused-content review and TikTok's originality rules. You are hard to
+impress. Return ONE JSON object and nothing else.
+
+SCRIPT:
+{script}
+
+CONTEXT: the finished video runs {duration:.0f} seconds.
+
+Score three axes from 1 to 10. Use the whole range -- most scripts are a 4 or a 5.
+
+1. hook (first 3 seconds, roughly the first 9 words)
+   10 = opens a loop the viewer has to close: a number that sounds wrong, a
+        flat contradiction of something they believe, a stake.
+   5  = states the topic clearly. Accurate, and scrollable.
+   1  = "In this video I want to talk about..."
+
+2. density (is the script load-bearing?)
+   10 = almost every sentence carries a figure, a name, a mechanism or a
+        consequence that could be checked and could be wrong.
+   5  = a real point, thinly supported.
+   1  = confident phrasing around nothing. "This costs more than you think",
+        "the secret is consistency", "let that sink in". Score these 1-2 even
+        when they read smoothly -- especially then.
+
+3. monetization (does it survive review?)
+   10 = the commentary is clearly the product; the footage illustrates it.
+   5  = original narration, but it mostly describes what is on screen.
+   1  = reaction noises over someone else's video, or a template with the
+        nouns swapped.
+
+Also return:
+  "fixes": 2-4 specific, actionable notes. Name the exact phrase to cut or the
+           exact kind of fact that is missing. Never "add more detail".
+  "rewritten_hook": one replacement opening line of 9 words or fewer.
+
+JSON shape:
+{{"hook": 0, "density": 0, "monetization": 0,
+  "fixes": ["..."], "rewritten_hook": "..."}}"""
+
+
+REWRITE_PROMPT = """Rewrite this short-form script for retention. Return ONLY the rewritten
+script -- no preamble, no notes, no markdown.
+
+CURRENT SCRIPT:
+{script}
+
+WHAT IS WRONG WITH IT:
+{diagnosis}
+
+RULES:
+- Open on a loop, not a topic. First nine words must make scrolling feel like
+  missing something. No "In this video", no "Here are three", no greeting.
+- Every claim gets a figure, a name, a date or a mechanism. If you do not know
+  a real one, restructure the sentence so it does not need one -- do not invent
+  a statistic.
+- Delete every phrase that would survive having its subject swapped. "Game
+  changer", "at the end of the day", "the secret is", "trust me" and anything
+  that reads like them.
+- Keep it within {low}-{high} words so the spoken length does not move.
+- Same topic, same claims, same angle. This is a rewrite, not a new script.
+- End on the turn, not on a sign-off."""
+
+
+def parse_scorecard_response(raw: str) -> dict[str, Any]:
+    """Pulls the scorecard JSON out of a model response, forgivingly."""
+    parsed = parse_scene_response(raw)
+    if not isinstance(parsed, dict):
+        return {}
+
+    def _axis(key: str) -> float:
+        try:
+            return max(1.0, min(10.0, float(parsed.get(key, 0) or 0)))
+        except (TypeError, ValueError):
+            return 0.0
+
+    fixes = parsed.get("fixes") or []
+    if isinstance(fixes, str):
+        fixes = [fixes]
+
+    return {
+        "hook": _axis("hook"),
+        "density": _axis("density"),
+        "monetization": _axis("monetization"),
+        "fixes": [str(f).strip() for f in fixes if str(f).strip()][:4],
+        "rewritten_hook": str(parsed.get("rewritten_hook") or "").strip(),
+    }
+
+
+def score_virality(
+    script: str,
+    entry: dict[str, Any] | None = None,
+    progress: ProgressFn | None = None,
+) -> dict[str, Any]:
+    """
+    Scores a script 1-10 on hook, density and monetization safety.
+
+    Always returns a scorecard. With no API key, or on any API failure, the
+    compliance heuristic's answer is returned unchanged with source
+    "heuristic" -- the card is part of the export step and must never be the
+    thing that blocks a render.
+    """
+    import compliance
+
+    entry = entry or {}
+    base = compliance.viral_scorecard(script, entry)
+
+    if not str(script or "").strip():
+        return base
+
+    try:
+        client = get_client()
+    except GeminiError:
+        return base
+
+    prompt = VIRAL_PROMPT.format(
+        script=str(script).strip(),
+        duration=float(entry.get("duration") or 0.0),
+    )
+
+    last: Exception | None = None
+    for model in MODEL_CANDIDATES:
+        try:
+            if progress:
+                progress(f"Scoring the script with {model}...")
+            response = generate_with_retry(client, model, prompt, progress=progress)
+            ai = parse_scorecard_response(getattr(response, "text", "") or "")
+            if not ai or not ai["hook"]:
+                continue
+
+            # Blend, do not replace. The heuristic catches filler the model
+            # talks itself past; the model catches emptiness the heuristic's
+            # token count reads as substance.
+            merged = dict(base)
+            for axis in ("hook", "density", "monetization"):
+                blended = round((base[axis]["score"] + ai[axis]) / 2.0, 1)
+                merged[axis] = dict(base[axis])
+                merged[axis]["score"] = blended
+                merged[axis]["model_score"] = ai[axis]
+
+            overall = round(merged["hook"]["score"] * 0.45
+                            + merged["density"]["score"] * 0.35
+                            + merged["monetization"]["score"] * 0.20, 1)
+            merged["overall"] = overall
+            merged["needs_rewrite"] = overall < compliance.VIRAL_TARGET_SCORE
+            merged["fixes"] = ai["fixes"]
+            merged["rewritten_hook"] = ai["rewritten_hook"]
+            merged["source"] = f"heuristic + {model}"
+            merged["model"] = model
+            return merged
+        except Exception as exc:
+            last = exc
+            if not is_retryable(exc):
+                continue
+
+    if progress and last:
+        progress(f"Scoring fell back to the offline card ({type(last).__name__}).")
+    return base
+
+
+def rewrite_for_retention(
+    script: str,
+    card: dict[str, Any] | None = None,
+    target: str = DEFAULT_TARGET,
+    progress: ProgressFn | None = None,
+) -> dict[str, Any]:
+    """
+    Rewrites a script against its own scorecard.
+
+    Returns {"script", "model", "before", "after"} where before/after are the
+    two overall scores, so the UI can show whether the rewrite actually helped
+    rather than asserting that it did. A rewrite that scores *worse* is
+    reported as such and the original is kept.
+    """
+    import compliance
+
+    body = str(script or "").strip()
+    if not body:
+        raise GeminiError("There is no script to rewrite.")
+
+    card = card or compliance.viral_scorecard(body)
+    diagnosis_lines: list[str] = list(card.get("fixes") or [])
+    if not diagnosis_lines:
+        for axis in ("hook", "density", "monetization"):
+            diagnosis_lines.extend(card.get(axis, {}).get("notes", []))
+    diagnosis = "\n".join(f"- {line}" for line in diagnosis_lines[:6]) or "- It is generic."
+
+    spec = DURATION_TARGETS.get(target, DURATION_TARGETS[DEFAULT_TARGET])
+    low = int(spec["low"] * WORDS_PER_SECOND * 0.85)
+    high = int(spec["high"] * WORDS_PER_SECOND * 1.05)
+
+    client = get_client()
+    prompt = REWRITE_PROMPT.format(script=body, diagnosis=diagnosis, low=low, high=high)
+
+    last: Exception | None = None
+    for model in MODEL_CANDIDATES:
+        try:
+            if progress:
+                progress(f"Rewriting for retention with {model}...")
+            response = generate_with_retry(client, model, prompt, progress=progress)
+            rewritten = clean_script(getattr(response, "text", "") or "")
+            if len(rewritten.split()) < 8:
+                continue
+
+            after = compliance.viral_scorecard(rewritten)["overall"]
+            return {
+                "script": rewritten,
+                "model": model,
+                "before": float(card.get("overall") or 0.0),
+                "after": after,
+                "improved": after > float(card.get("overall") or 0.0),
+            }
+        except Exception as exc:
+            last = exc
+            continue
+
+    raise GeminiError(
+        f"Could not rewrite the script: {type(last).__name__}: {last}" if last
+        else "No model accepted the rewrite request."
+    )

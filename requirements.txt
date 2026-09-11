@@ -22,6 +22,10 @@ python-dotenv==1.2.3       # loads GEMINI_API_KEY / PEXELS_API_KEY from .env
 yt-dlp==2026.8.19          # TikTok / Reels / Shorts ingestion
 requests==2.34.2           # Pexels and Wikimedia Commons lookups
 
+# Tests only. Not imported by the app, not needed to render anything.
+pytest==9.1.1              # pytest tests/
+
 # Authentication adds nothing: hashlib (PBKDF2-HMAC-SHA256), hmac, secrets and
 # json are all standard library. Verified against the imports in every module --
-# the eleven pins above are exactly the eleven third-party packages used.
+# the eleven runtime pins above are exactly the eleven third-party packages the
+# app imports; pytest is the twelfth and is test-only.

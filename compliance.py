@@ -20,6 +20,7 @@ on it for a monetized channel.
 from __future__ import annotations
 
 import os
+import re
 import json
 import time
 from typing import Any, Sequence
@@ -436,3 +437,306 @@ def summarise_ledger(exports_dir: str) -> dict[str, Any]:
     entries = load_ledger(exports_dir)
     ready = sum(1 for e in entries if publish_readiness(e)["ready"])
     return {"total": len(entries), "ready": ready, "blocked": len(entries) - ready}
+
+
+# ---------------------------------------------------------------------------
+# Viral scorecard
+#
+# Three axes, scored 1-10, deliberately measurable rather than vibes:
+#
+#   Hook intrigue       -- what the first three seconds do. A hook either opens
+#                          a loop the viewer needs closed, or it announces a
+#                          topic and lets them scroll.
+#   Information density -- how much of the script is load-bearing. The failure
+#                          mode of a templated script is not being wrong, it is
+#                          saying nothing: "this costs more than you think"
+#                          carries no number, no name and no mechanism.
+#   Monetization safety -- whether the video survives YouTube's reused-content
+#                          review and TikTok's originality rules.
+#
+# Gemini scores the same three axes when a key is configured
+# (gemini_engine.score_virality). This module is the floor: it always runs, it
+# needs no network, and it is what the tests assert against.
+# ---------------------------------------------------------------------------
+
+VIRAL_TARGET_SCORE = 8.0
+HOOK_SECONDS = 3.0
+# At roughly 2.75 words per second, three seconds of speech is about nine words.
+HOOK_WORDS = 9
+
+# Openings that state a subject instead of opening a loop. Every one of these
+# is a sentence the viewer has heard before, which is the problem.
+_WEAK_HOOK_OPENERS = (
+    "in this video", "today i want to", "today we are", "today we're",
+    "let me tell you", "have you ever wondered", "welcome back",
+    "hey guys", "what's up guys", "here are", "here is", "this is a video",
+    "i'm going to show you", "we are going to talk", "let's talk about",
+    "did you know that", "so basically",
+)
+
+# Phrases that fill runtime without adding information. Counted, not banned --
+# one is a figure of speech, six is a script with nothing in it.
+_FILLER_PHRASES = (
+    "more than you think", "you won't believe", "it's crazy", "it's insane",
+    "game changer", "next level", "at the end of the day", "the truth is",
+    "let that sink in", "trust me", "literally everything", "change your life",
+    "the secret is", "nobody talks about", "most people don't know",
+    "this one simple", "is key", "is everything", "think about it",
+    "believe it or not", "no cap", "mind blowing",
+)
+
+# Openings that do open a loop: a number, a contradiction, a stake, a refusal.
+_STRONG_HOOK_SIGNALS = (
+    "stop", "never", "everyone", "nobody", "wrong", "mistake", "actually",
+    "cost me", "lost", "why", "how i", "the reason", "until i", "before you",
+)
+
+
+def _words(text: str) -> list[str]:
+    return [w for w in re.split(r"\s+", str(text or "").strip()) if w]
+
+
+# List scaffolding: "Number 3", "Mistake #2:", "Tip 4", "5 things", "part two".
+# These digits are structure, not information, and counting them as facts rates
+# a pure-template script the same as a researched one -- measured: the old Reel
+# Studio listicle scored 8.7 "facts per 100 words" on nothing but its own
+# numbering.
+_LIST_MARKER_RE = re.compile(
+    r"\b(?:number|mistake|tip|secret|reason|step|rule|habit|point|way|fact|thing|part|lesson)s?"
+    r"\s*#?\s*(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b",
+    re.IGNORECASE)
+_LEADING_COUNT_RE = re.compile(
+    r"\b\d+\s+(?:things?|ways?|reasons?|facts?|secrets?|tips?|mistakes?|habits?|rules?|steps?|lessons?)\b",
+    re.IGNORECASE)
+
+
+def _strip_list_markers(text: str) -> str:
+    """Removes listicle numbering so it cannot be mistaken for a real figure."""
+    return _LEADING_COUNT_RE.sub(" ", _LIST_MARKER_RE.sub(" ", str(text or "")))
+
+
+# "twenty-three", "forty seven", "a hundred and twelve". Deliberately excludes
+# bare "one" through "ten": "one of the reasons" and "no second chances" are
+# not figures, and counting them would let vague copy score as specific.
+_SPELLED_NUMBER = (
+    r"\b(?:(?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)"
+    r"(?:[- ](?:one|two|three|four|five|six|seven|eight|nine))?"
+    r"|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen"
+    r"|hundred|thousand|million|billion|trillion)\b"
+)
+
+
+def _concrete_tokens(text: str) -> dict[str, int]:
+    """
+    Counts the things that make a sentence checkable.
+
+    Numbers, units, proper nouns and years are what separate "it costs more
+    than you think" from "it costs $1,299, which is $100 over the S24 Ultra".
+    """
+    body = str(text or "")
+    numbers = re.findall(r"(?<![\w.])\d[\d,]*\.?\d*(?![\w])", body)
+    # Spelled-out numbers count too. These scripts are *spoken*, so a writer
+    # aiming at TTS legitimately writes "twenty-three minutes" rather than "23
+    # minutes" -- and a metric that only sees digits rates a well-researched
+    # narration script as empty. Measured on a live Gemini research script:
+    # 60% sentence coverage with digits only, 100% once words are counted.
+    numbers += re.findall(_SPELLED_NUMBER, body, re.IGNORECASE)
+    units = re.findall(
+        r"\b\d[\d,.]*\s?(?:%|percent|dollars?|usd|hours?|hrs?|minutes?|mins?|"
+        r"seconds?|secs?|days?|weeks?|months?|years?|kg|lbs?|km|miles?|mph|hp|"
+        r"gb|mb|tb|x|times|k|m|bn|billion|million|thousand)\b", body, re.IGNORECASE)
+    years = re.findall(r"\b(?:19|20)\d{2}\b", body)
+    # Capitalised words that are not sentence openers: names, brands, places.
+    propers = re.findall(r"(?<![.!?]\s)(?<!^)\b[A-Z][a-zA-Z]{2,}\b", body)
+
+    return {
+        "numbers": len(numbers),
+        "units": len(units),
+        "years": len(years),
+        "propers": len(set(propers)),
+    }
+
+
+def score_hook(script: str) -> dict[str, Any]:
+    """Scores the first three seconds of speech, 1-10, and says why."""
+    words = _words(script)
+    if not words:
+        return {"score": 1.0, "opening": "",
+                "notes": ["There is no script to hook anyone with."]}
+
+    opening = " ".join(words[:HOOK_WORDS])
+    low = opening.lower()
+    notes: list[str] = []
+    score = 5.0
+
+    weak = next((p for p in _WEAK_HOOK_OPENERS if low.startswith(p) or f" {p}" in f" {low}"), "")
+    if weak:
+        score -= 2.5
+        notes.append(f'Opens with "{weak}" -- that announces a topic instead of opening a loop.')
+
+    tokens = _concrete_tokens(opening)
+    if tokens["numbers"] or tokens["units"]:
+        score += 1.5
+        notes.append("Leads with a specific figure, which is a reason to keep watching.")
+    if any(sig in low for sig in _STRONG_HOOK_SIGNALS):
+        score += 1.5
+        notes.append("Opens on a contradiction or a stake rather than a subject.")
+    if "?" in opening:
+        score += 0.5
+        notes.append("Poses a question in the first breath.")
+
+    # A hook that takes twenty words to arrive has already lost the scroll.
+    first_sentence = re.split(r"(?<=[.!?])\s", str(script).strip())[0]
+    if len(_words(first_sentence)) > 18:
+        score -= 1.0
+        notes.append(f"The first sentence runs {len(_words(first_sentence))} words -- "
+                     "it lands after the scroll decision is made.")
+
+    if not notes:
+        notes.append("Neither strong nor weak: it states the topic clearly and nothing more.")
+
+    return {"score": max(1.0, min(10.0, score)), "opening": opening, "notes": notes}
+
+
+def score_density(script: str) -> dict[str, Any]:
+    """Scores how much of the script is load-bearing, 1-10."""
+    words = _words(script)
+    body = str(script or "")
+    low = body.lower()
+    notes: list[str] = []
+
+    if len(words) < 12:
+        return {"score": 1.0, "filler_hits": [], "per_100": 0.0, "covered": 0.0,
+                "notes": ["Too short to carry any information."]}
+
+    stripped = _strip_list_markers(body)
+    tokens = _concrete_tokens(stripped)
+    facts = tokens["numbers"] + tokens["units"] + tokens["years"] + tokens["propers"]
+    per_100 = facts / (len(words) / 100.0)
+
+    # Density is two questions, not one: how much is in the script, and how
+    # evenly it is spread. A script can hit a good per-100 rate from one
+    # fact-stuffed sentence while the other five say nothing -- and those five
+    # are where the viewer leaves. `covered` is the fraction of sentences
+    # carrying at least one checkable token.
+    sentences = [s for s in re.split(r"(?<=[.!?])\s+", stripped.strip()) if len(_words(s)) >= 3]
+    with_fact = sum(1 for s in sentences if sum(_concrete_tokens(s).values()) > 0)
+    covered = with_fact / len(sentences) if sentences else 0.0
+
+    # Calibrated against this project's own output: the Reel Studio template
+    # scores 0 per 100 once its own numbering is discounted, the offline fact
+    # bank lands near 20, and a researched script near 33.
+    score = 2.0 + min(4.0, per_100 * 0.30) + 4.0 * covered
+    notes.append(f"{facts} checkable details in {len(words)} words ({per_100:.1f} per 100); "
+                 f"{with_fact} of {len(sentences)} sentences carry one.")
+
+    filler_hits = [p for p in _FILLER_PHRASES if p in low]
+    if filler_hits:
+        score -= min(4.0, 0.9 * len(filler_hits))
+        shown = ", ".join(f'"{p}"' for p in filler_hits[:4])
+        notes.append(f"{len(filler_hits)} filler phrase(s) doing no work: {shown}.")
+
+    # "Mistake 1:" / "Tip 3:" numbering with nothing behind it is the tell of a
+    # template. The numbering is fine; the numbering *plus* no facts is not.
+    if re.search(r"\b(?:mistake|tip|reason|secret|step|rule)\s*#?\s*\d", low) and per_100 < 3.0:
+        score -= 1.5
+        notes.append("Numbered list structure with almost no specifics behind it -- "
+                     "that is the shape of a template, not a script.")
+
+    if len(set(w.lower() for w in words)) / len(words) < 0.45:
+        score -= 1.0
+        notes.append("Heavily repetitive vocabulary.")
+
+    return {"score": max(1.0, min(10.0, score)), "filler_hits": filler_hits,
+            "per_100": per_100, "covered": covered, "notes": notes}
+
+
+def score_monetization(entry: dict[str, Any], script: str = "") -> dict[str, Any]:
+    """Scores survival odds against reused-content and originality review."""
+    notes: list[str] = []
+    score = 8.0
+
+    licence_key = str(entry.get("licence") or DEFAULT_LICENCE)
+    licence = LICENCES.get(licence_key, LICENCES[DEFAULT_LICENCE])
+    duration = float(entry.get("duration") or 0.0)
+    words = len(_words(script))
+
+    if not licence.commercial:
+        score -= 5.0
+        notes.append(f"Footage licence '{licence.label}' is not cleared for a monetized upload.")
+    elif licence_key == "fair_use":
+        score -= 1.5
+        notes.append("Rests on a fair-use assertion, which reused-content review judges separately.")
+    else:
+        notes.append(f"Footage cleared ({licence.label}).")
+
+    # YouTube's reused-content rule turns on how much of the video is *yours*.
+    # Commentary over someone else's clip with twenty words of narration is the
+    # exact shape that gets refused.
+    if duration > 0 and words:
+        wps = words / duration
+        if wps < 1.2:
+            score -= 2.0
+            notes.append(f"Only {words} words across {duration:.0f}s ({wps:.1f} words/s) -- "
+                         "too little original commentary to read as transformative.")
+        else:
+            notes.append(f"{words} words of original narration over {duration:.0f}s.")
+
+    provider = TTS_PROVIDERS.get(str(entry.get("tts_provider") or ""), {})
+    if provider.get("synthetic") and not entry.get("ai_disclosed"):
+        score -= 1.5
+        notes.append("Synthetic narration is not disclosed -- both platforms require the label.")
+
+    if 0 < duration < TIKTOK_REWARDS_MIN_SECONDS:
+        notes.append(f"Under {TIKTOK_REWARDS_MIN_SECONDS:.0f}s, so it earns nothing from "
+                     "TikTok Creator Rewards (YouTube Shorts is unaffected).")
+
+    return {"score": max(1.0, min(10.0, score)), "notes": notes}
+
+
+def viral_scorecard(script: str, entry: dict[str, Any] | None = None) -> dict[str, Any]:
+    """
+    The full 1-10 scorecard.
+
+    Returns {"overall", "hook", "density", "monetization", "verdict",
+    "needs_rewrite", "source"}. `needs_rewrite` is what the UI hangs the
+    "Rewrite for High Retention" button on.
+
+    The overall is weighted toward the hook because retention is decided in the
+    first three seconds and nothing later in the video recovers a scroll.
+    """
+    entry = entry or {}
+    hook = score_hook(script)
+    density = score_density(script)
+    money = score_monetization(entry, script)
+
+    overall = round(hook["score"] * 0.45 + density["score"] * 0.35 + money["score"] * 0.20, 1)
+
+    # Name the axis that is actually dragging, rather than blaming the hook for
+    # a licensing problem.
+    weakest = min(
+        (("hook", hook["score"], "the first three seconds do not open a loop"),
+         ("density", density["score"], "the script has too little in it"),
+         ("monetization", money["score"], "it will not survive monetization review")),
+        key=lambda item: item[1],
+    )
+
+    if overall >= 8.5:
+        verdict = "Strong on all three axes."
+    elif overall >= VIRAL_TARGET_SCORE:
+        verdict = "Good enough to publish."
+    elif overall >= 6.0:
+        verdict = f"Workable, but {weakest[2]}."
+    else:
+        verdict = f"Not ready: {weakest[2]}."
+
+    return {
+        "overall": overall,
+        "hook": hook,
+        "density": density,
+        "monetization": money,
+        "verdict": verdict,
+        "weakest": weakest[0],
+        "needs_rewrite": overall < VIRAL_TARGET_SCORE,
+        "source": "heuristic",
+    }

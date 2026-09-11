@@ -41,6 +41,25 @@ from video_engine import _SCRATCH_RENDERS, purge_scratch_renders, video_encoder
 CANVAS: tuple[int, int] = (1080, 1920)
 SUPERSAMPLE = 2                       # draw at 2x, box-filter down: free AA
 
+# The bottom band every vertical platform covers with its own chrome: the
+# caption and @handle on TikTok, the description and audio row on Reels, the
+# title and progress scrubber on Shorts. 200px of a 1920 frame is a little over
+# 10%, which clears all three.
+#
+# Enforced in Frame.text and Frame.wrapped rather than left to each template to
+# remember, because it was not remembered: measured across all fifteen
+# templates before this existed, every single one put type inside the band --
+# the payoff line sat at y=1720 and the progress hairline at y=1866, which is
+# underneath TikTok's caption.
+#
+# Geometry is deliberately *not* clamped. A staircase reaching the floor is the
+# picture; a sentence hidden behind a caption is a bug.
+SAFE_BOTTOM = 200
+SAFE_Y: float = CANVAS[1] - SAFE_BOTTOM
+
+# Type stops 30px higher again, which is the room the progress hairline needs.
+TEXT_SAFE_Y: float = SAFE_Y - 30.0
+
 BLACK: tuple[int, int, int] = (0, 0, 0)
 WHITE: tuple[int, int, int] = (255, 255, 255)
 GREY: tuple[int, int, int] = (136, 136, 136)          # #888888
@@ -346,16 +365,27 @@ class Frame:
         s = self.ss
         self.draw.polygon([(p[0] * s, p[1] * s) for p in points], fill=colour)
 
+    def safe_y(self, y: float, size: float) -> float:
+        """
+        Lifts a text baseline out of the platform's bottom chrome.
+
+        0.62 of the point size is the descender-inclusive half-height for a
+        vertically centred line, which is the anchor every caller here uses.
+        """
+        return min(float(y), TEXT_SAFE_Y - size * 0.62)
+
     def text(self, body: str, centre: tuple[float, float], size: int = 56,
              colour: tuple[int, int, int] = WHITE, weight: str = "bold",
-             anchor: str = "mm", tracking: float = 0.0) -> None:
+             anchor: str = "mm", tracking: float = 0.0, clamp_safe: bool = True) -> None:
         """Draws one line. `tracking` spaces the letters, which reads as premium."""
         if not body:
             return
         s = self.ss
         font = load_face(int(size * s), weight)
+        y = self.safe_y(centre[1], size) if clamp_safe else centre[1]
+
         if tracking <= 0:
-            self.draw.text((centre[0] * s, centre[1] * s), body, font=font,
+            self.draw.text((centre[0] * s, y * s), body, font=font,
                            fill=colour, anchor=anchor)
             return
 
@@ -364,7 +394,7 @@ class Frame:
         total = sum(widths) + gap * (len(body) - 1)
         x = centre[0] * s - total / 2
         for ch, w in zip(body, widths):
-            self.draw.text((x, centre[1] * s), ch, font=font, fill=colour, anchor="lm")
+            self.draw.text((x, y * s), ch, font=font, fill=colour, anchor="lm")
             x += w + gap
 
     def wrapped(self, body: str, centre: tuple[float, float], size: int = 44,
@@ -390,8 +420,14 @@ class Frame:
 
         step = size * leading
         top = centre[1] - step * (len(lines) - 1) / 2
+        # Clamp the block, not each line: lifting only the last line would
+        # close the leading and the paragraph would read as a typo.
+        overflow = (top + step * (len(lines) - 1) + size * 0.62) - TEXT_SAFE_Y
+        if overflow > 0:
+            top -= overflow
         for i, line in enumerate(lines):
-            self.text(line, (centre[0], top + i * step), size, colour, weight)
+            self.text(line, (centre[0], top + i * step), size, colour, weight,
+                      clamp_safe=False)
 
     # -- output ------------------------------------------------------------
     def finish(self, glow: float = GLOW_STRENGTH) -> np.ndarray:
@@ -634,17 +670,26 @@ def draw_footer(frame: Frame, spec: dict[str, Any], t: float, duration: float) -
     start = max(0.0, duration - 4.2)
     alpha = fade(t, start, attack=0.8)
     if alpha > 0.01:
+        # Asks for the old y and lets the clamp bottom-align it inside the safe
+        # area, which lands 30px above where it used to sit. Measured across all
+        # fifteen templates: a deliberate move to 1560 collided with each
+        # template's own axis labels (28% mean ink behind the text), while
+        # bottom-aligning leaves 3.8%.
         frame.wrapped(line, (frame.w / 2, 1720), size=52, colour=mix(WHITE, alpha),
                       weight="bold", max_width=900, leading=1.18)
 
 
+# The hairline sits just inside the safe area, not at the foot of the frame,
+# and below TEXT_SAFE_Y so a payoff line can never land on top of it.
+PROGRESS_Y: float = SAFE_Y - 8.0
+
+
 def draw_progress(frame: Frame, t: float, duration: float) -> None:
     """A hairline time bar. Retention furniture: it promises the video is short."""
-    y = 1866.0
-    frame.line((90, y), (990, y), DIM, 4)
+    frame.line((90, PROGRESS_Y), (990, PROGRESS_Y), DIM, 4)
     done = clamp(t / max(duration, 1e-6))
     if done > 0:
-        frame.line((90, y), (90 + 900 * done, y), GREY, 4)
+        frame.line((90, PROGRESS_Y), (90 + 900 * done, PROGRESS_Y), GREY, 4)
 
 
 # ---------------------------------------------------------------------------
@@ -654,7 +699,7 @@ def draw_progress(frame: Frame, t: float, duration: float) -> None:
 _PAIN_CONTROL = [(120, 880), (250, 1120), (400, 1430), (560, 1330),
                  (700, 960), (850, 800), (990, 780)]
 _EASY_CONTROL = [(120, 1020), (330, 1010), (520, 1015), (680, 1040),
-                 (820, 1300), (900, 1560), (960, 1600)]
+                 (820, 1280), (900, 1480), (960, 1510)]
 
 
 def _spikes(frame: Frame, x0: float, x1: float, base: float, height: float,
@@ -689,7 +734,7 @@ def scene_curve(frame: Frame, t: float, spec: dict[str, Any], duration: float) -
     ex, ey = point_at(easy, easy_len, easy_u)
     frame.circle((ex, ey), 20, GREY)
 
-    _spikes(frame, 800, 1000, 1660, 90, 5, mix(GREY, 0.55 + 0.45 * clamp((u - 0.7) / 0.3)))
+    _spikes(frame, 800, 1000, 1570, 90, 5, mix(GREY, 0.55 + 0.45 * clamp((u - 0.7) / 0.3)))
 
     # The hard route: lit as it is travelled.
     frame.polyline(slice_to(pain, pain_len, u), WHITE, 8)
@@ -699,7 +744,7 @@ def scene_curve(frame: Frame, t: float, spec: dict[str, Any], duration: float) -
 
     # Labels, tied to where the ball actually is rather than to the clock.
     if u > 0.16:
-        frame.text(label(spec, "near"), (430, 1580), 44,
+        frame.text(label(spec, "near"), (430, 1500), 44,
                    mix(GREY, fade(t, lead + span * 0.16, 0.5)), tracking=3)
     if u > 0.66:
         frame.text(label(spec, "far"), (760, 690), 46,
@@ -763,8 +808,8 @@ def scene_vessel(frame: Frame, t: float, spec: dict[str, Any], duration: float) 
         y = top - 130 + phase / 0.62 * 130
         frame.circle((x, y), 7, mix(WHITE, 1.0 - phase / 0.62))
 
-    frame.text(f'{label(spec, "unit")} {day}', (frame.w / 2, 1524), 38, GREY, tracking=5)
-    frame.text(f"{growth:.2f}x", (frame.w / 2, 1600), 62,
+    frame.text(f'{label(spec, "unit")} {day}', (frame.w / 2, 1478), 38, GREY, tracking=5)
+    frame.text(f"{growth:.2f}x", (frame.w / 2, 1552), 62,
                WHITE if level > 0.5 else GREY, tracking=2)
 
 
@@ -840,7 +885,10 @@ def scene_staircase(frame: Frame, t: float, spec: dict[str, Any], duration: floa
                    mix(WHITE, fade(t, lead + span * 0.82, 0.5)), tracking=6)
 
     # Effort is linear; reward is not. The crossing is the whole argument.
-    base, height = 1600.0, 140.0
+    # The base sits 40px higher than it reads like it should: the payoff line
+    # now bottom-aligns inside the safe area at ~1626, and these captions used
+    # to be drawn straight through it.
+    base, height = 1560.0, 140.0
     for i, (caption, value, colour) in enumerate((
         (label(spec, "left"), clamp(u), GREY),
         (label(spec, "right"), clamp(u ** 3.2), WHITE),

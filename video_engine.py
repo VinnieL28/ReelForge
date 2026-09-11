@@ -13,6 +13,7 @@ stat badges and a final winner reveal card.
 from __future__ import annotations
 
 import os
+import re
 import math
 import time
 from typing import Any, Callable, Sequence
@@ -132,6 +133,367 @@ def video_encoder(force_cpu: bool = False) -> dict[str, Any]:
                 "gpu": False,
             }
     return _encoder_cache
+
+
+def write_clip(
+    clip: Any,
+    output_path: str,
+    fps: int = 24,
+    with_audio: bool = True,
+    progress_callback: Callable[[str], None] | None = None,
+) -> str:
+    """
+    Encodes a MoviePy clip, falling back to CPU if the GPU encoder gives up
+    mid-render.
+
+    `video_encoder()` probes NVENC with one 256x256 frame, which is a weak
+    promise: the driver can still fail on a 1080x1920 stream once another
+    process is holding the encoder session, and on consumer cards there is a
+    hard cap on concurrent NVENC sessions. When that happens the failure lands
+    at the very end of a long render, so it is caught here and re-encoded on
+    libx264 -preset veryfast rather than thrown away.
+
+    yuv420p is forced on the fallback path because it is the only pixel format
+    every phone decoder accepts; libx264 will otherwise pick yuv444p for some
+    inputs and the file plays as a green screen on iOS.
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    enc = video_encoder()
+
+    try:
+        clip.write_videofile(
+            output_path,
+            fps=fps,
+            codec=enc["codec"],
+            audio_codec="aac" if with_audio else None,
+            preset=enc["preset"],
+            ffmpeg_params=list(enc["ffmpeg_params"]) + ["-pix_fmt", "yuv420p"],
+        )
+        return output_path
+    except Exception as exc:
+        if not enc["gpu"]:
+            raise
+        message = f"{type(exc).__name__}: {exc}"
+
+    # One retry, on the CPU, and the probe result is poisoned so the rest of
+    # the session does not walk into the same wall.
+    global _encoder_cache
+    _encoder_cache = video_encoder(force_cpu=True)
+    if progress_callback:
+        progress_callback(f"GPU encode failed ({message[:90]}) — re-encoding on the CPU.")
+    print(f"Warning: {GPU_CODEC} failed, falling back to {CPU_CODEC}: {message}")
+
+    clip.write_videofile(
+        output_path,
+        fps=fps,
+        codec=CPU_CODEC,
+        audio_codec="aac" if with_audio else None,
+        preset="veryfast",
+        ffmpeg_params=["-crf", CPU_CRF, "-pix_fmt", "yuv420p"],
+    )
+    return output_path
+
+
+# ---------------------------------------------------------------------------
+# Gemini File API pre-flight
+#
+# The File API rejects a clip by accepting the upload and then parking it in
+# FAILED, which surfaces as "Gemini could not process this clip". Every case
+# seen here came from the container, not the content: HEVC/H.265 from an
+# iPhone, VP9 from a YouTube download, variable frame rate from a screen
+# recorder, a rotation matrix in the metadata, or an HDR (bt2020/arib-std-b67)
+# colour profile.
+#
+# Rather than guess which of those the API will tolerate, every ingested clip
+# is normalised to the one profile that has never been refused: H.264 High,
+# yuv420p, constant 30fps, AAC-LC 128k at 44.1kHz, no side data.
+# ---------------------------------------------------------------------------
+
+GEMINI_SAFE_FPS = 30
+GEMINI_SAFE_HEIGHT = 720          # the model reads it at low resolution anyway
+GEMINI_SAFE_AUDIO_RATE = 44100
+GEMINI_SAFE_AUDIO_BITRATE = "128k"
+
+
+_VIDEO_STREAM_RE = re.compile(
+    r"Stream #\d+:\d+.*?: Video: (?P<codec>[\w.]+)[^,]*,\s*"
+    r"(?P<pix>[\w]+)(?:\((?P<colour>[^)]*)\))?", re.IGNORECASE)
+_AUDIO_STREAM_RE = re.compile(
+    r"Stream #\d+:\d+.*?: Audio: (?P<codec>[\w.]+)[^,]*,\s*(?P<rate>\d+) Hz", re.IGNORECASE)
+_SIZE_RE = re.compile(r",\s*(?P<w>\d{2,5})x(?P<h>\d{2,5})[\s,\[]")
+_FPS_RE = re.compile(r",\s*(?P<fps>[\d.]+) fps")
+_ROTATE_RE = re.compile(r"(displaymatrix:\s*rotation|rotate\s*:)", re.IGNORECASE)
+_DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+\.?\d*)")
+
+# Rates a constant-frame-rate file actually reports. A source that lands
+# somewhere else (29.83, 47.95) was assembled from variable timestamps.
+_CFR_RATES = (23.976, 24.0, 25.0, 29.97, 30.0, 48.0, 50.0, 59.94, 60.0)
+
+
+def probe_stream_info(video_path: str) -> dict[str, Any]:
+    """
+    Reads codec, pixel format, colour transfer and frame rate out of a clip.
+
+    ffprobe would be the obvious tool and is used when it is on PATH, but
+    imageio-ffmpeg ships ffmpeg *without* ffprobe, so on a default install of
+    this project there is none. The fallback parses `ffmpeg -i`, whose stream
+    lines carry everything needed:
+
+        Stream #0:0: Video: hevc (Main), yuv420p10le(tv, bt2020nc/bt2020/smpte2084), 1080x1920, 30 fps
+        Stream #0:1: Audio: aac (LC), 44100 Hz, stereo, fltp, 128 kb/s
+
+    Returns {} only if ffmpeg itself could not be run.
+    """
+    import json
+    import shutil
+    import subprocess
+
+    import imageio_ffmpeg
+
+    path = os.path.abspath(video_path)
+
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        guess = os.path.join(os.path.dirname(imageio_ffmpeg.get_ffmpeg_exe()), "ffprobe.exe")
+        ffprobe = guess if os.path.exists(guess) else None
+
+    if ffprobe:
+        try:
+            proc = subprocess.run(
+                [ffprobe, "-v", "error", "-print_format", "json",
+                 "-show_streams", "-show_format", path],
+                capture_output=True, text=True, timeout=60,
+            )
+            if proc.returncode == 0:
+                return _info_from_ffprobe(json.loads(proc.stdout or "{}"))
+        except Exception:
+            pass
+
+    # `ffmpeg -i` with no output file exits 1 and writes the stream table to
+    # stderr. That exit code is expected, not an error.
+    try:
+        proc = subprocess.run(
+            [imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-i", path],
+            capture_output=True, text=True, timeout=60,
+        )
+    except Exception:
+        return {}
+
+    return _info_from_ffmpeg_stderr(proc.stderr or "")
+
+
+def _info_from_ffprobe(data: dict[str, Any]) -> dict[str, Any]:
+    """Normalises ffprobe's JSON into the shape needs_gemini_normalise wants."""
+    video = next((s for s in data.get("streams", []) if s.get("codec_type") == "video"), {})
+    audio = next((s for s in data.get("streams", []) if s.get("codec_type") == "audio"), {})
+
+    def _rate(value: Any) -> float:
+        try:
+            num, _, den = str(value).partition("/")
+            return float(num) / float(den or 1)
+        except (TypeError, ValueError, ZeroDivisionError):
+            return 0.0
+
+    return {
+        "codec": str(video.get("codec_name") or ""),
+        "pix_fmt": str(video.get("pix_fmt") or ""),
+        "transfer": str(video.get("color_transfer") or ""),
+        "primaries": str(video.get("color_primaries") or ""),
+        "width": int(video.get("width") or 0),
+        "height": int(video.get("height") or 0),
+        # r_frame_rate is the container's nominal rate; avg_frame_rate is what
+        # the frames actually came out at. They diverge on VFR sources, which
+        # is exactly the case that has to be caught.
+        "fps": _rate(video.get("r_frame_rate", "0/1")),
+        "avg_fps": _rate(video.get("avg_frame_rate", "0/1")),
+        "rotated": bool(video.get("side_data_list")),
+        "audio_codec": str(audio.get("codec_name") or ""),
+        "audio_rate": int(audio.get("sample_rate") or 0),
+        "has_audio": bool(audio),
+        "duration": float(data.get("format", {}).get("duration") or 0.0),
+        "source": "ffprobe",
+    }
+
+
+def _info_from_ffmpeg_stderr(text: str) -> dict[str, Any]:
+    """Parses the stream table `ffmpeg -i` prints when given no output file."""
+    video_line = ""
+    audio_line = ""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not video_line and ": Video:" in stripped:
+            video_line = stripped
+        elif not audio_line and ": Audio:" in stripped:
+            audio_line = stripped
+
+    if not video_line:
+        return {}
+
+    vm = _VIDEO_STREAM_RE.search(video_line)
+    am = _AUDIO_STREAM_RE.search(audio_line) if audio_line else None
+    size = _SIZE_RE.search(video_line)
+    fps_m = _FPS_RE.search(video_line)
+
+    # "yuv420p10le(tv, bt2020nc/bt2020/smpte2084)" -- the transfer is last.
+    colour = (vm.group("colour") or "") if vm else ""
+    transfer = ""
+    for chunk in colour.replace(",", "/").split("/"):
+        token = chunk.strip()
+        if token in _GEMINI_HDR_TRANSFERS or token in ("bt709", "bt470bg", "smpte170m"):
+            transfer = token
+
+    duration = 0.0
+    dm = _DURATION_RE.search(text)
+    if dm:
+        duration = int(dm.group(1)) * 3600 + int(dm.group(2)) * 60 + float(dm.group(3))
+
+    fps = float(fps_m.group("fps")) if fps_m else 0.0
+    return {
+        "codec": (vm.group("codec") if vm else "").lower(),
+        "pix_fmt": (vm.group("pix") if vm else "").lower(),
+        "transfer": transfer,
+        "primaries": "bt2020" if "bt2020" in colour else "",
+        "width": int(size.group("w")) if size else 0,
+        "height": int(size.group("h")) if size else 0,
+        "fps": fps,
+        # `ffmpeg -i` reports one averaged rate, so there is no second number
+        # to compare against. `needs_gemini_normalise` falls back to checking
+        # that the rate is one a CFR encoder would actually produce.
+        "avg_fps": fps,
+        "rotated": bool(_ROTATE_RE.search(text)),
+        "audio_codec": (am.group("codec") if am else "").lower(),
+        "audio_rate": int(am.group("rate")) if am else 0,
+        "has_audio": bool(audio_line),
+        "duration": duration,
+        "source": "ffmpeg",
+    }
+
+
+# Everything outside this set has been observed to fail, be re-wrapped, or be
+# silently degraded by the File API.
+_GEMINI_OK_CODECS = frozenset({"h264"})
+_GEMINI_OK_PIX_FMTS = frozenset({"yuv420p", "yuvj420p"})
+_GEMINI_HDR_TRANSFERS = frozenset({"smpte2084", "arib-std-b67"})
+
+
+def needs_gemini_normalise(info: dict[str, Any]) -> tuple[bool, str]:
+    """
+    Decides whether a clip has to be transcoded, and says why.
+
+    An empty `info` (no ffprobe) means transcode: the cost of a needless
+    ~4s transcode is far below the cost of a failed upload after a 40MB push.
+    """
+    if not info:
+        return True, "could not probe the container"
+
+    if info.get("codec") not in _GEMINI_OK_CODECS:
+        return True, f"{info.get('codec') or 'unknown'} video (needs H.264)"
+    if info.get("pix_fmt") not in _GEMINI_OK_PIX_FMTS:
+        return True, f"{info.get('pix_fmt') or 'unknown'} pixels (needs yuv420p)"
+    if info.get("transfer") in _GEMINI_HDR_TRANSFERS:
+        return True, f"HDR transfer ({info.get('transfer')})"
+    if info.get("rotated"):
+        return True, "a rotation matrix in the metadata"
+
+    fps, avg = float(info.get("fps") or 0.0), float(info.get("avg_fps") or 0.0)
+    if fps <= 0:
+        return True, "no declared frame rate"
+    if avg > 0 and abs(fps - avg) > 0.75:
+        return True, f"variable frame rate ({avg:.1f} avg vs {fps:.1f} nominal)"
+    if fps > GEMINI_SAFE_FPS + 1:
+        return True, f"{fps:.0f}fps (needs {GEMINI_SAFE_FPS} CFR)"
+    # Without ffprobe there is only one rate to look at, so VFR is inferred
+    # from the rate being one no CFR encoder emits -- a screen recording that
+    # averages 29.83fps is variable whatever the container claims.
+    if not any(abs(fps - rate) < 0.05 for rate in _CFR_RATES):
+        return True, f"{fps:.2f}fps is not a constant rate"
+
+    if info.get("has_audio") and info.get("audio_codec") not in ("aac",):
+        return True, f"{info.get('audio_codec')} audio (needs AAC)"
+
+    return False, "already a baseline H.264 MP4"
+
+
+def normalize_for_gemini(
+    video_path: str,
+    dest_dir: str | None = None,
+    progress: Callable[[str], None] | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    """
+    Returns a clip the Gemini File API will accept, transcoding only if needed.
+
+    {"path", "transcoded", "reason", "info"}. `path` is the original file when
+    no work was required, so nothing is copied for a clip that is already fine.
+
+    The output is deliberately small: 720p is above what the model samples, and
+    a 40MB TikTok rip becomes ~6MB, which is most of the upload wait.
+    """
+    import subprocess
+
+    import imageio_ffmpeg
+
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(video_path)
+
+    info = probe_stream_info(video_path)
+    needed, reason = needs_gemini_normalise(info)
+    if not needed and not force:
+        return {"path": video_path, "transcoded": False, "reason": reason, "info": info}
+
+    dest_dir = dest_dir or os.path.dirname(os.path.abspath(video_path))
+    os.makedirs(dest_dir, exist_ok=True)
+    stem = os.path.splitext(os.path.basename(video_path))[0]
+    out_path = os.path.join(dest_dir, f"{stem}_gemini.mp4")
+
+    if progress:
+        progress(f"Normalising for Gemini — {reason}...")
+
+    # scale keeps the aspect and forces even dimensions: H.264 cannot encode an
+    # odd height in yuv420p and ffmpeg fails outright rather than rounding.
+    vf = (f"scale=-2:'min({GEMINI_SAFE_HEIGHT},ih)':flags=bicubic,"
+          f"format=yuv420p,fps={GEMINI_SAFE_FPS}")
+
+    command = [
+        imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-hide_banner", "-loglevel", "error",
+        # ffmpeg auto-rotates by default, so a phone clip's rotation matrix is
+        # baked into the pixels here and the re-encode emits none of its own.
+        "-i", os.path.abspath(video_path),
+        "-map_metadata", "-1", "-map_chapters", "-1",
+        "-vf", vf,
+        "-c:v", "libx264", "-profile:v", "high", "-level", "4.0",
+        "-preset", "veryfast", "-crf", "24",
+        # Constant frame rate, stated three ways: the filter above sets the
+        # rate, -vsync cfr stops ffmpeg dropping or duplicating around it, and
+        # -r pins the container. A VFR screen recording needs all three.
+        "-vsync", "cfr", "-r", str(GEMINI_SAFE_FPS),
+        "-g", str(GEMINI_SAFE_FPS * 2), "-pix_fmt", "yuv420p",
+        # Strip HDR / non-standard primaries by asserting plain bt709.
+        "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
+        "-movflags", "+faststart",
+    ]
+    if info.get("has_audio", True):
+        command += ["-c:a", "aac", "-b:a", GEMINI_SAFE_AUDIO_BITRATE,
+                    "-ar", str(GEMINI_SAFE_AUDIO_RATE), "-ac", "2"]
+    else:
+        command += ["-an"]
+    command.append(out_path)
+
+    proc = subprocess.run(command, capture_output=True, text=True, timeout=900)
+    if proc.returncode != 0 or not os.path.exists(out_path):
+        raise RuntimeError(
+            "Could not normalise the clip for Gemini:\n"
+            + (proc.stderr or "ffmpeg gave no reason").strip()[-700:]
+        )
+
+    _SCRATCH_RENDERS.append(out_path)
+    if progress:
+        before = os.path.getsize(video_path) / 1_048_576
+        after = os.path.getsize(out_path) / 1_048_576
+        progress(f"Normalised: {before:.1f} MB → {after:.1f} MB, H.264 / {GEMINI_SAFE_FPS} CFR.")
+
+    return {"path": out_path, "transcoded": True, "reason": reason,
+            "info": info, "output_info": probe_stream_info(out_path)}
 
 
 def fit_image_to_aspect(
@@ -1776,665 +2138,30 @@ def export_muted_video(
 
 # ---------------------------------------------------------------------------
 # Versus Duel Engine
+#
+# Lives in duel_engine.py. It is imported lazily -- inside the functions that
+# need it -- rather than here, so the dependency runs one way: duel_engine may
+# import this module at its top, and nothing imports back.
+#
+# The names below are re-exported for callers (and ledger entries) that still
+# reach for video_engine.duel_*.
 # ---------------------------------------------------------------------------
 
-DUEL_ACCENT_A: RGB = (34, 211, 238)     # cyan
-DUEL_ACCENT_B: RGB = (251, 191, 36)     # amber
-DUEL_GOLD: RGB = (255, 199, 61)
 
-_GLASS_FILL = (14, 17, 24, 176)         # translucent card body
-_GLASS_EDGE = (255, 255, 255, 46)
-_GLASS_HILITE = (255, 255, 255, 92)     # top bevel that sells the glass
+def __getattr__(name: str):
+    """Forwards the duel symbols to duel_engine on first access."""
+    if name in _DUEL_EXPORTS:
+        import duel_engine
 
+        return getattr(duel_engine, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
-def _ease_out_back(t: float, overshoot: float = 1.70158) -> float:
-    """Pop easing: overshoots slightly then settles, so cards 'snap' in."""
-    t = min(1.0, max(0.0, t)) - 1.0
-    return t * t * ((overshoot + 1.0) * t + overshoot) + 1.0
 
-
-def _ease_out_cubic(t: float) -> float:
-    t = min(1.0, max(0.0, t))
-    return 1.0 - (1.0 - t) ** 3
-
-
-def format_stat(value: float, unit: str = "", decimals: int | None = None) -> str:
-    """
-    Formats a duel score: '$1,299', '23h', '3.8s', '94'.
-
-    `decimals` should be pinned to the *final* score's precision while a counter
-    animates -- inferring it per frame makes an integer target flicker through
-    values like '$323.04' on the way up.
-    """
-    if decimals is None:
-        decimals = 0 if float(value).is_integer() else 1
-    body = f"{value:,.{decimals}f}"
-    return f"${body}" if unit == "$" else f"{body}{unit}"
-
-
-def duel_round_beats(duration: float) -> dict[str, float]:
-    """
-    The animation clock for one round, shared by the renderer and the SFX
-    scheduler so hits land exactly on the frame the card appears.
-    """
-    return {
-        "a_in": 0.12 * duration,
-        "b_in": 0.42 * duration,
-        "count": max(0.45, 0.22 * duration),
-        "reveal": 0.72 * duration,
-    }
-
-
-def _draw_trophy(draw: ImageDraw.ImageDraw, xy: tuple[float, float], size: float, color: RGB) -> None:
-    """Draws a trophy glyph -- the display fonts carry no emoji coverage."""
-    x, y = xy
-    cup_w, cup_h = size * 0.62, size * 0.52
-    fill = color + (255,)
-
-    draw.rounded_rectangle([x, y, x + cup_w, y + cup_h], radius=int(size * 0.10), fill=fill)
-    draw.pieslice([x + cup_w * 0.10, y + cup_h * 0.45, x + cup_w * 0.90, y + cup_h * 1.25], 0, 180, fill=fill)
-    for side in (0, 1):
-        hx = x - size * 0.16 if side == 0 else x + cup_w
-        draw.arc([hx, y + cup_h * 0.05, hx + size * 0.16, y + cup_h * 0.62],
-                 start=(90 if side == 0 else 270), end=(270 if side == 0 else 90),
-                 fill=fill, width=max(2, int(size * 0.07)))
-    draw.rectangle([x + cup_w * 0.42, y + cup_h * 0.95, x + cup_w * 0.58, y + size * 0.80], fill=fill)
-    draw.rounded_rectangle([x + cup_w * 0.18, y + size * 0.78, x + cup_w * 0.82, y + size * 0.94],
-                           radius=int(size * 0.05), fill=fill)
-
-
-def _wrap_to_width(draw: ImageDraw.ImageDraw, text: str, font: Any, max_w: int) -> list[str]:
-    """Greedy word wrap against a pixel width."""
-    words = text.split()
-    lines: list[str] = []
-    cur: list[str] = []
-    for word in words:
-        trial = " ".join(cur + [word])
-        if cur and draw.textlength(trial, font=font) > max_w:
-            lines.append(" ".join(cur))
-            cur = [word]
-        else:
-            cur.append(word)
-    if cur:
-        lines.append(" ".join(cur))
-    return lines or [text]
-
-
-def _panel_bounds(size: tuple[int, int], layout: str) -> tuple[list[int], list[int], list[int]]:
-    """
-    Full-bleed panel boxes plus the divider band between them.
-
-    Panels butt directly against the divider -- edge-to-edge photography reads
-    far more premium than a photo floating inside a card.
-    """
-    w, h = size
-    if layout == "side_by_side":
-        band = int(w * 0.018)
-        mid = w // 2
-        return ([0, 0, mid - band // 2, h],
-                [mid + band // 2, 0, w, h],
-                [mid - band // 2, 0, mid + band // 2, h])
-
-    band = int(h * 0.016)
-    mid = int(h * 0.49)
-    return ([0, 0, w, mid - band // 2],
-            [0, mid + band // 2, w, h],
-            [0, mid - band // 2, w, mid + band // 2])
-
-
-def _prep_panel_source(img: Image.Image, box: list[int], headroom: float = 1.34) -> Image.Image:
-    """
-    Pre-scales a source photo to just above panel size.
-
-    Ken Burns then crops a window out of this each frame; resizing from a
-    modest intermediate rather than a 1920px original is what keeps the render
-    fast enough to be usable.
-    """
-    pw, ph = box[2] - box[0], box[3] - box[1]
-    tw, th = int(pw * headroom), int(ph * headroom)
-
-    src = img.convert("RGB")
-    sw, sh = src.size
-    scale = max(tw / sw, th / sh)
-    src = src.resize((max(1, int(sw * scale)), max(1, int(sh * scale))), Image.Resampling.LANCZOS)
-
-    sw, sh = src.size
-    left, top = (sw - tw) // 2, (sh - th) // 2
-    return src.crop((left, top, left + tw, top + th))
-
-
-def _ken_burns_panel(source: Image.Image, box: list[int], progress: float, zoom_in: bool) -> Image.Image:
-    """Crops a slowly drifting window out of the prepped source for one frame."""
-    pw, ph = box[2] - box[0], box[3] - box[1]
-    sw, sh = source.size
-
-    # 1.0 -> full source (widest); larger zoom = tighter crop.
-    span = 0.86 if zoom_in else 0.98
-    drift = 0.12 * (progress if zoom_in else (1.0 - progress))
-    factor = span - drift
-
-    cw, ch = max(2, int(sw * factor)), max(2, int(sh * factor))
-    x = (sw - cw) // 2
-    y = (sh - ch) // 2
-    return source.crop((x, y, x + cw, y + ch)).resize((pw, ph), Image.Resampling.BILINEAR)
-
-
-def _panel_scrim(size: tuple[int, int], accent: RGB) -> Image.Image:
-    """
-    Gradient scrim laid over a panel photo.
-
-    Darkens BOTH ends and leaves the middle clear: the name plate sits at the
-    top of a panel and the stat card at the bottom, so a single-ended ramp
-    always left one of them stranded on bright photography.
-    """
-    pw, ph = size
-    grad = Image.new("RGBA", (pw, ph), (0, 0, 0, 0))
-    gd = ImageDraw.Draw(grad)
-    for i in range(ph):
-        p = i / max(1, ph - 1)
-        # Distance from the clear middle band, 0 at centre -> 1 at either edge.
-        d = min(1.0, abs(p - 0.5) * 2.0)
-        shade = int(214 * (d ** 1.9))
-        tint = d ** 2.4
-        gd.line([(0, i), (pw, i)], fill=(
-            int(accent[0] * 0.16 * tint), int(accent[1] * 0.16 * tint), int(accent[2] * 0.18 * tint), shade,
-        ))
-    return grad
-
-
-def _glass_card(
-    draw: ImageDraw.ImageDraw,
-    box: list[int],
-    accent: RGB,
-    alpha: float = 1.0,
-    glow: float = 0.0,
-) -> None:
-    """Translucent glass panel: dark body, bright top bevel, accent edge."""
-    radius = int(min(box[2] - box[0], box[3] - box[1]) * 0.22)
-    radius = max(10, min(radius, 30))
-    a = max(0.0, min(1.0, alpha))
-
-    if glow > 0:
-        for i, spread in enumerate((12, 7, 3)):
-            draw.rounded_rectangle(
-                [box[0] - spread, box[1] - spread, box[2] + spread, box[3] + spread],
-                radius=radius + spread, outline=accent + (int(150 * glow / (i + 1.5)),), width=3,
-            )
-
-    body = (_GLASS_FILL[0], _GLASS_FILL[1], _GLASS_FILL[2], int(_GLASS_FILL[3] * a))
-    draw.rounded_rectangle(box, radius=radius, fill=body,
-                           outline=(_GLASS_EDGE[0], _GLASS_EDGE[1], _GLASS_EDGE[2], int(_GLASS_EDGE[3] * a)),
-                           width=2)
-    draw.rounded_rectangle(box, radius=radius,
-                           outline=accent + (int((90 + 150 * glow) * a),), width=int(2 + 2 * glow))
-    # Top bevel highlight -- the cue that reads as "glass" at a glance.
-    draw.line([(box[0] + radius, box[1] + 2), (box[2] - radius, box[1] + 2)],
-              fill=(_GLASS_HILITE[0], _GLASS_HILITE[1], _GLASS_HILITE[2], int(_GLASS_HILITE[3] * a)), width=2)
-
-
-def _progress_bar(
-    draw: ImageDraw.ImageDraw,
-    box: list[int],
-    fraction: float,
-    accent: RGB,
-    alpha: float = 1.0,
-) -> None:
-    """Animated magnitude bar: dark track with an accent fill and a hot tip."""
-    x0, y0, x1, y1 = box
-    h = y1 - y0
-    r = max(2, h // 2)
-    a = max(0.0, min(1.0, alpha))
-
-    draw.rounded_rectangle(box, radius=r, fill=(255, 255, 255, int(26 * a)))
-    frac = max(0.0, min(1.0, fraction))
-    if frac <= 0.001:
-        return
-
-    fill_w = max(h, int((x1 - x0) * frac))
-    draw.rounded_rectangle([x0, y0, x0 + fill_w, y1], radius=r, fill=accent + (int(232 * a),))
-    # Bright leading edge so the fill reads as energy, not a static block.
-    tip = min(x0 + fill_w, x1)
-    draw.ellipse([tip - r - 1, y0 - 1, tip + r + 1, y1 + 1], fill=(255, 255, 255, int(200 * a)))
-
-
-def _draw_name_plate(
-    draw: ImageDraw.ImageDraw,
-    origin: tuple[int, int],
-    width: int,
-    side: str,
-    name: str,
-    hook: str,
-    accent: RGB,
-    canvas_w: int,
-) -> int:
-    """Side tag + product name + hook. Returns the y below the block."""
-    x, y = origin
-
-    tag_font = _load_bold_font(max(16, int(canvas_w * 0.024)))
-    tag_h = int(canvas_w * 0.040)
-    tag_w = int(canvas_w * 0.052)
-    draw.rounded_rectangle([x, y, x + tag_w, y + tag_h], radius=int(tag_h * 0.30), fill=accent + (240,))
-    tb = draw.textbbox((0, 0), side.upper(), font=tag_font)
-    draw.text((x + (tag_w - (tb[2] - tb[0])) / 2 - tb[0], y + (tag_h - (tb[3] - tb[1])) / 2 - tb[1]),
-              side.upper(), font=tag_font, fill=(6, 8, 14))
-
-    name_font = _load_bold_font(int(canvas_w * 0.050))
-    line_step = int(canvas_w * 0.060)
-    ny = y + tag_h + int(canvas_w * 0.018)
-    lines = _wrap_to_width(draw, name, name_font, width)[:2]
-    for i, line in enumerate(lines):
-        draw.text((x, ny + i * line_step), line, font=name_font,
-                  fill=(255, 255, 255), stroke_width=max(2, int(canvas_w * 0.004)), stroke_fill=(0, 0, 0, 220))
-    # Clear the full height of the name block before the hook goes under it.
-    ny += len(lines) * line_step + int(canvas_w * 0.006)
-
-    if hook:
-        hook_font = _load_bold_font(int(canvas_w * 0.027))
-        draw.text((x, ny), hook, font=hook_font, fill=(212, 220, 236),
-                  stroke_width=2, stroke_fill=(0, 0, 0, 205))
-        ny += int(canvas_w * 0.038)
-
-    return ny
-
-
-def _draw_divider(
-    frame: Image.Image,
-    divider: list[int],
-    layout: str,
-    accent_a: RGB,
-    accent_b: RGB,
-    pulse: float = 0.0,
-) -> None:
-    """High-gloss centre divider with cyan/amber neon bleed into both panels."""
-    w, h = frame.size
-    glow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    gd = ImageDraw.Draw(glow)
-
-    if layout == "side_by_side":
-        cx = (divider[0] + divider[2]) // 2
-        reach = int(w * 0.055)
-        for i in range(reach):
-            k = (1.0 - i / reach) ** 2.3
-            gd.line([(cx - i, 0), (cx - i, h)], fill=accent_a + (int(120 * k),))
-            gd.line([(cx + i, 0), (cx + i, h)], fill=accent_b + (int(120 * k),))
-        gd.line([(cx, 0), (cx, h)], fill=(255, 255, 255, 226), width=max(2, int(w * 0.004)))
-    else:
-        cy = (divider[1] + divider[3]) // 2
-        reach = int(h * 0.045)
-        for i in range(reach):
-            k = (1.0 - i / reach) ** 2.3
-            gd.line([(0, cy - i), (w, cy - i)], fill=accent_a + (int(120 * k),))
-            gd.line([(0, cy + i), (w, cy + i)], fill=accent_b + (int(120 * k),))
-        gd.line([(0, cy), (w, cy)], fill=(255, 255, 255, 226), width=max(2, int(h * 0.0022)))
-
-    frame.paste(Image.alpha_composite(frame.convert("RGBA"), glow).convert("RGB"), (0, 0))
-
-
-def _draw_vs_medallion(draw: ImageDraw.ImageDraw, center: tuple[int, int], radius: int, scale: float = 1.0) -> None:
-    """Chromed VS medallion that sits on the divider."""
-    cx, cy = center
-    r = max(8, int(radius * scale))
-
-    for i, spread in enumerate((16, 9, 4)):
-        draw.ellipse([cx - r - spread, cy - r - spread, cx + r + spread, cy + r + spread],
-                     outline=(255, 255, 255, int(66 / (i + 1.3))), width=3)
-    draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(9, 11, 17, 248), outline=(255, 255, 255, 132), width=3)
-    draw.arc([cx - r, cy - r, cx + r, cy + r], start=200, end=340, fill=(255, 255, 255, 190), width=3)
-
-    f = _load_bold_font(max(12, int(r * 1.02)))
-    b = draw.textbbox((0, 0), "VS", font=f)
-    draw.text((cx - (b[2] - b[0]) / 2 - b[0], cy - (b[3] - b[1]) / 2 - b[1]), "VS", font=f, fill=(255, 255, 255))
-
-
-def _compose_duel_frame(
-    size: tuple[int, int],
-    sources: dict[str, Image.Image],
-    boxes: dict[str, list[int]],
-    layout: str,
-    progress: float,
-    accent_a: RGB,
-    accent_b: RGB,
-) -> Image.Image:
-    """Builds the photographic base for one frame: both panels + scrims + divider."""
-    w, h = size
-    frame = Image.new("RGB", (w, h), (8, 9, 13))
-
-    for key, accent, zoom_in in (("a", accent_a, True), ("b", accent_b, False)):
-        box = boxes[key]
-        panel = _ken_burns_panel(sources[key], box, progress, zoom_in)
-        pw, ph = box[2] - box[0], box[3] - box[1]
-        panel = Image.alpha_composite(panel.convert("RGBA"), _panel_scrim((pw, ph), accent)).convert("RGB")
-        frame.paste(panel, (box[0], box[1]))
-
-    _draw_divider(frame, boxes["divider"], layout, accent_a, accent_b)
-    return frame
-
-
-def _duel_sources(
-    size: tuple[int, int],
-    item_a: dict[str, Any],
-    item_b: dict[str, Any],
-    layout: str,
-) -> tuple[dict[str, Image.Image], dict[str, list[int]]]:
-    """Prepares panel boxes and pre-scaled Ken Burns sources for both sides."""
-    box_a, box_b, divider = _panel_bounds(size, layout)
-    boxes = {"a": box_a, "b": box_b, "divider": divider}
-
-    sources: dict[str, Image.Image] = {}
-    for key, item, box in (("a", item_a, box_a), ("b", item_b, box_b)):
-        img = item.get("image")
-        if not isinstance(img, Image.Image):
-            pw, ph = box[2] - box[0], box[3] - box[1]
-            img = Image.new("RGB", (max(2, pw), max(2, ph)), (16, 18, 26))
-        sources[key] = _prep_panel_source(img, box)
-
-    return sources, boxes
-
-
-def create_duel_intro_clip(
-    size: tuple[int, int],
-    item_a: dict[str, Any],
-    item_b: dict[str, Any],
-    headline: str = "",
-    duration: float = 4.0,
-    layout: str = "stacked",
-    watermark_text: str = "",
-    accent_a: RGB = DUEL_ACCENT_A,
-    accent_b: RGB = DUEL_ACCENT_B,
-) -> VideoClip:
-    """Opening card: both contenders full-bleed, the hook line, and a VS slam."""
-    w, h = size
-    sources, boxes = _duel_sources(size, item_a, item_b, layout)
-    watermark = make_watermark_tile((w, h), watermark_text, position="bottom_right")
-
-    vx = (boxes["divider"][0] + boxes["divider"][2]) // 2
-    vy = (boxes["divider"][1] + boxes["divider"][3]) // 2
-    r0 = int(min(w, h) * 0.056)
-
-    name_a = str(item_a.get("name", "Item A"))
-    name_b = str(item_b.get("name", "Item B"))
-    hook_a = str(item_a.get("hook", "") or "")
-    hook_b = str(item_b.get("hook", "") or "")
-
-    def make_frame(t: float):
-        p = min(1.0, t / duration)
-        frame = _compose_duel_frame(size, sources, boxes, layout, p, accent_a, accent_b)
-        draw = ImageDraw.Draw(frame, "RGBA")
-
-        margin = int(w * 0.06)
-        plate_w = int(w * (0.40 if layout == "side_by_side" else 0.62))
-        # Clear the headline banner that sits over panel A.
-        head_clear = int(h * 0.115) if (headline and layout != "side_by_side") else int(h * 0.055)
-        _draw_name_plate(draw, (boxes["a"][0] + margin, boxes["a"][1] + head_clear),
-                         plate_w, "a", name_a, hook_a, accent_a, w)
-        _draw_name_plate(draw, (boxes["b"][0] + margin, boxes["b"][1] + int(h * 0.045)),
-                         plate_w, "b", name_b, hook_b, accent_b, w)
-
-        if headline:
-            f = _load_bold_font(int(w * 0.050))
-            lines = _wrap_to_width(draw, headline.upper(), f, int(w * 0.86))[:2]
-            for i, line in enumerate(lines):
-                lw = draw.textlength(line, font=f)
-                draw.text(((w - lw) / 2, int(h * 0.022) + i * int(w * 0.058)), line, font=f,
-                          fill=(255, 255, 255), stroke_width=max(3, int(w * 0.006)), stroke_fill=(0, 0, 0, 238))
-
-        slam = _ease_out_back(min(1.0, t / 0.5))
-        scale = (2.3 - 1.3 * slam) if t < 0.5 else 1.0 + 0.035 * math.sin(t * 3.4)
-        _draw_vs_medallion(draw, (vx, vy), r0, scale)
-
-        if watermark is not None:
-            tile, pos = watermark
-            frame.paste(tile, pos, tile)
-        return np.array(frame)
-
-    return VideoClip(make_frame, duration=duration)
-
-
-def create_duel_round_clip(
-    size: tuple[int, int],
-    item_a: dict[str, Any],
-    item_b: dict[str, Any],
-    round_info: dict[str, Any],
-    duration: float = 5.0,
-    layout: str = "stacked",
-    watermark_text: str = "",
-    accent_a: RGB = DUEL_ACCENT_A,
-    accent_b: RGB = DUEL_ACCENT_B,
-) -> VideoClip:
-    """
-    One comparison round over live photography: glass stat cards snap in one
-    after the other, their numbers count up, magnitude bars fill, then the
-    winning side is revealed with a glow and WINNER tag.
-    """
-    w, h = size
-    sources, boxes = _duel_sources(size, item_a, item_b, layout)
-    watermark = make_watermark_tile((w, h), watermark_text, position="bottom_right")
-
-    metric = str(round_info.get("metric", "Round"))
-    note = str(round_info.get("note", "") or "")
-    unit = str(round_info.get("unit", "") or "")
-    a_score = float(round_info.get("a_score", 0) or 0)
-    b_score = float(round_info.get("b_score", 0) or 0)
-    winner = str(round_info.get("winner", "") or "").upper()
-
-    # Pin counter precision to the final values so integers never flicker decimals.
-    a_dec = 0 if a_score.is_integer() else 1
-    b_dec = 0 if b_score.is_integer() else 1
-
-    # Bars show "how well this side did", not raw magnitude. On a lower-is-better
-    # metric like price, a pure magnitude bar gives the WINNER the shorter bar,
-    # which reads as a contradiction. The winner flag tells us the direction.
-    lo, hi = min(abs(a_score), abs(b_score)), max(abs(a_score), abs(b_score))
-    winner_score = a_score if winner == "A" else (b_score if winner == "B" else None)
-    lower_is_better = winner_score is not None and hi > lo and abs(winner_score) == lo
-
-    def bar_fraction(value: float) -> float:
-        v = abs(value)
-        if lower_is_better:
-            return min(1.0, lo / v) if v > 1e-9 else 1.0
-        return min(1.0, v / hi) if hi > 1e-9 else 0.0
-
-    name_a = str(item_a.get("name", "Item A"))
-    name_b = str(item_b.get("name", "Item B"))
-    hook_a = str(item_a.get("hook", "") or "")
-    hook_b = str(item_b.get("hook", "") or "")
-
-    beats = duel_round_beats(duration)
-    vx = (boxes["divider"][0] + boxes["divider"][2]) // 2
-    vy = (boxes["divider"][1] + boxes["divider"][3]) // 2
-
-    def make_frame(t: float):
-        p = min(1.0, t / duration)
-        frame = _compose_duel_frame(size, sources, boxes, layout, p, accent_a, accent_b)
-        draw = ImageDraw.Draw(frame, "RGBA")
-
-        # --- metric header pill -------------------------------------------
-        title_font = _load_bold_font(int(w * 0.058))
-        tw = draw.textlength(metric.upper(), font=title_font)
-        pill_w, pill_h = int(tw + w * 0.14), int(w * 0.105)
-        pill_x, pill_y = int((w - pill_w) / 2), int(h * 0.022)
-        _glass_card(draw, [pill_x, pill_y, pill_x + pill_w, pill_y + pill_h], (255, 255, 255), alpha=0.92)
-        draw.text(((w - tw) / 2, pill_y + pill_h * 0.16), metric.upper(), font=title_font,
-                  fill=(255, 255, 255), stroke_width=max(2, int(w * 0.004)), stroke_fill=(0, 0, 0, 220))
-        if note:
-            nf = _load_bold_font(int(w * 0.024))
-            nw = draw.textlength(note.upper(), font=nf)
-            draw.text(((w - nw) / 2, pill_y + pill_h + int(h * 0.008)), note.upper(), font=nf,
-                      fill=(178, 188, 208), stroke_width=2, stroke_fill=(0, 0, 0, 200))
-
-        show_winner = _ease_out_cubic((t - beats["reveal"]) / max(0.25, duration - beats["reveal"])) \
-            if t >= beats["reveal"] else 0.0
-
-        # --- per-side name plate + glass stat card -------------------------
-        margin = int(w * 0.06)
-        plate_w = int(w * (0.36 if layout == "side_by_side" else 0.56))
-
-        for key, name, hook, score, dec, accent in (
-            ("a", name_a, hook_a, a_score, a_dec, accent_a),
-            ("b", name_b, hook_b, b_score, b_dec, accent_b),
-        ):
-            box = boxes[key]
-            is_winner = winner == key.upper()
-
-            # Panel A's plate must clear the metric header pill above it;
-            # stacked layouts put that pill directly over panel A.
-            head_clear = int(h * 0.125) if (key == "a" and layout != "side_by_side") else int(h * 0.035)
-            _draw_name_plate(draw, (box[0] + margin, box[1] + head_clear),
-                             plate_w, key, name, hook, accent, w)
-
-            start = beats["a_in"] if key == "a" else beats["b_in"]
-            if t < start:
-                continue
-
-            pop = _ease_out_back(min(1.0, (t - start) / 0.45))
-            fade = min(1.0, (t - start) / 0.30)
-            counted = score * _ease_out_cubic((t - start) / beats["count"]) \
-                if t < start + beats["count"] else score
-
-            card_w = int(w * (0.40 if layout == "side_by_side" else 0.60) * (0.94 + 0.06 * pop))
-            card_h = int(w * 0.185 * (0.94 + 0.06 * pop))
-            card_x = box[0] + margin
-            card_y = box[3] - card_h - int(h * (0.045 if key == "a" else 0.075))
-            card = [card_x, card_y, card_x + card_w, card_y + card_h]
-
-            _glass_card(draw, card, accent, alpha=fade, glow=show_winner if is_winner else 0.0)
-
-            val_font = _load_bold_font(max(22, int(card_h * 0.46)))
-            draw.text((card_x + int(card_h * 0.22), card_y + int(card_h * 0.12)),
-                      format_stat(counted, unit, dec), font=val_font, fill=accent + (int(255 * fade),),
-                      stroke_width=max(2, int(card_h * 0.030)), stroke_fill=(0, 0, 0, int(230 * fade)))
-
-            lab_font = _load_bold_font(max(13, int(card_h * 0.155)))
-            draw.text((card_x + int(card_h * 0.23), card_y + int(card_h * 0.60)), metric.upper(),
-                      font=lab_font, fill=(176, 186, 206, int(255 * fade)))
-
-            bar_y = card_y + int(card_h * 0.80)
-            _progress_bar(draw, [card_x + int(card_h * 0.22), bar_y,
-                                 card_x + card_w - int(card_h * 0.22), bar_y + max(6, int(card_h * 0.10))],
-                          bar_fraction(counted), accent, alpha=fade)
-
-            if is_winner and show_winner > 0.15:
-                tag_font = _load_bold_font(max(15, int(card_h * 0.20)))
-                tag = "WINNER"
-                tw2 = draw.textlength(tag, font=tag_font)
-                tag_w, tag_h = int(tw2 + card_h * 0.36), int(card_h * 0.34)
-                tx, ty = card[2] - tag_w - int(card_h * 0.16), card_y - tag_h // 2
-                draw.rounded_rectangle([tx, ty, tx + tag_w, ty + tag_h], radius=int(tag_h * 0.42),
-                                       fill=accent + (int(246 * show_winner),))
-                draw.text((tx + int(card_h * 0.18), ty + tag_h * 0.18), tag, font=tag_font, fill=(6, 8, 14))
-
-        _draw_vs_medallion(draw, (vx, vy), int(min(w, h) * 0.050))
-
-        if watermark is not None:
-            tile, pos = watermark
-            frame.paste(tile, pos, tile)
-        return np.array(frame)
-
-    return VideoClip(make_frame, duration=duration)
-
-
-def create_winner_clip(
-    size: tuple[int, int],
-    winner_item: dict[str, Any],
-    tally: tuple[int, int],
-    duration: float = 4.0,
-    is_a: bool = True,
-    headline: str = "",
-    watermark_text: str = "",
-    accent_a: RGB = DUEL_ACCENT_A,
-    accent_b: RGB = DUEL_ACCENT_B,
-) -> VideoClip:
-    """Gold-accented end card: the winning photograph, a trophy badge, the tally."""
-    w, h = size
-    side_accent = accent_a if is_a else accent_b
-
-    photo = winner_item.get("image")
-    if not isinstance(photo, Image.Image):
-        photo = Image.new("RGB", (w, h), (16, 18, 26))
-    full_box = [0, 0, w, h]
-    source = _prep_panel_source(photo, full_box, headroom=1.22)
-
-    name = str(winner_item.get("name", "Winner"))
-    cta = (headline or "WHICH ONE WOULD YOU PICK?").upper()
-    watermark = make_watermark_tile((w, h), watermark_text, position="bottom_right")
-
-    def make_frame(t: float):
-        p = min(1.0, t / duration)
-
-        # Slow push-in on the winner's photo, heavily darkened for the card.
-        frame = _ken_burns_panel(source, full_box, p, zoom_in=True)
-        veil = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        vd = ImageDraw.Draw(veil)
-        for i in range(h):
-            k = abs((i / max(1, h - 1)) - 0.46)
-            # Keep the winning product readable -- the veil is for type contrast,
-            # not for hiding the photo the whole card is celebrating.
-            shade = int(96 + 130 * min(1.0, k * 2.0))
-            vd.line([(0, i), (w, i)], fill=(6, 7, 11, shade))
-        frame = Image.alpha_composite(frame.convert("RGBA"), veil).convert("RGB")
-        draw = ImageDraw.Draw(frame, "RGBA")
-
-        # Gold vignette frame.
-        inset = int(w * 0.045)
-        draw.rounded_rectangle([inset, inset, w - inset, h - inset], radius=int(w * 0.045),
-                               outline=DUEL_GOLD + (150,), width=3)
-
-        # --- trophy badge, stamped in then held with a gentle pulse ---------
-        pop = _ease_out_back(min(1.0, t / 0.55))
-        pulse = 1.0 + 0.022 * math.sin(t * 4.0)
-        scale = pop * pulse
-
-        badge_r = int(w * 0.115 * scale)
-        bx, by = w // 2, int(h * 0.235)
-        for i, spread in enumerate((22, 13, 6)):
-            draw.ellipse([bx - badge_r - spread, by - badge_r - spread,
-                          bx + badge_r + spread, by + badge_r + spread],
-                         outline=DUEL_GOLD + (int(120 / (i + 1.2)),), width=3)
-        draw.ellipse([bx - badge_r, by - badge_r, bx + badge_r, by + badge_r],
-                     fill=(10, 12, 18, 242), outline=DUEL_GOLD + (245,), width=4)
-        _draw_trophy(draw, (bx - badge_r * 0.34, by - badge_r * 0.44), badge_r * 1.05, DUEL_GOLD)
-
-        # --- "WINNER" wordmark ---------------------------------------------
-        wf = _load_bold_font(int(w * 0.072))
-        label = "WINNER"
-        lw = draw.textlength(label, font=wf)
-        ly = by + badge_r + int(h * 0.022)
-        draw.text(((w - lw) / 2, ly), label, font=wf, fill=DUEL_GOLD,
-                  stroke_width=max(3, int(w * 0.006)), stroke_fill=(0, 0, 0, 240))
-
-        # --- winner name ----------------------------------------------------
-        nf = _load_bold_font(int(w * 0.078))
-        ny = ly + int(w * 0.098)
-        name_step = int(w * 0.086)
-        name_lines = _wrap_to_width(draw, name, nf, int(w * 0.84))[:2]
-        for i, line in enumerate(name_lines):
-            nw2 = draw.textlength(line, font=nf)
-            draw.text(((w - nw2) / 2, ny + i * name_step), line, font=nf, fill=(255, 255, 255),
-                      stroke_width=max(3, int(w * 0.007)), stroke_fill=(0, 0, 0, 240))
-        ny_last = ny + max(0, len(name_lines) - 1) * name_step
-
-        # --- tally chip ------------------------------------------------------
-        tf = _load_bold_font(int(w * 0.044))
-        tally_text = f"{tally[0]} — {tally[1]}  ROUNDS"
-        tw2 = draw.textlength(tally_text, font=tf)
-        chip_w, chip_h = int(tw2 + w * 0.10), int(w * 0.086)
-        cx0, cy0 = int((w - chip_w) / 2), ny_last + int(w * 0.10)
-        _glass_card(draw, [cx0, cy0, cx0 + chip_w, cy0 + chip_h], side_accent, alpha=1.0)
-        draw.text(((w - tw2) / 2, cy0 + chip_h * 0.20), tally_text, font=tf, fill=(255, 255, 255))
-
-        # --- CTA --------------------------------------------------------------
-        cf = _load_bold_font(int(w * 0.036))
-        for i, line in enumerate(_wrap_to_width(draw, cta, cf, int(w * 0.82))[:2]):
-            cw2 = draw.textlength(line, font=cf)
-            draw.text(((w - cw2) / 2, int(h * 0.865) + i * int(w * 0.048)), line, font=cf,
-                      fill=(226, 232, 240), stroke_width=2, stroke_fill=(0, 0, 0, 210))
-
-        if watermark is not None:
-            tile, pos = watermark
-            frame.paste(tile, pos, tile)
-        return np.array(frame)
-
-    return VideoClip(make_frame, duration=duration)
+_DUEL_EXPORTS = frozenset({
+    "DUEL_ACCENT_A", "DUEL_ACCENT_B", "DUEL_GOLD",
+    "format_stat", "duel_round_beats", "title_gate",
+    "create_duel_intro_clip", "create_duel_round_clip", "create_winner_clip",
+})
 
 
 def _schedule_sfx(
@@ -2451,6 +2178,7 @@ def _schedule_sfx(
     animates to, which is what keeps picture and sound locked together.
     """
     from audio_engine import SFX_CHIME, SFX_IMPACT, SFX_WHOOSH
+    from duel_engine import duel_round_beats
 
     cues: list[tuple[float, str]] = []
     hard_cut = transition_type == "cut" or transition_dur <= 0
@@ -2508,6 +2236,10 @@ def build_reel_video(
 
     if progress_callback:
         progress_callback(1, total_steps, "Stage 2/4 · Visual rendering — preparing slides and motion...")
+
+    from duel_engine import (
+        create_duel_intro_clip, create_duel_round_clip, create_winner_clip,
+    )
 
     raw_clips = []
     accent_colors = [(255, 105, 180), (56, 189, 248), (250, 204, 21), (168, 85, 247)]
@@ -2587,6 +2319,14 @@ def build_reel_video(
             timeline_clips.append(c.with_start(curr_time))
             curr_time += c.duration
         final_video = CompositeVideoClip(timeline_clips)
+    elif transition_type == "crossfade":
+        # The common path, and the one worth not going through
+        # CompositeVideoClip for. vfx.CrossFadeIn masks the clip for its whole
+        # duration, so every frame pays for a full-canvas alpha composite even
+        # when nothing is overlapping: 131ms per frame against 54ms to draw it.
+        from duel_engine import crossfade_sequence
+
+        final_video, slide_start_times = crossfade_sequence(raw_clips, transition_dur)
     else:
         timeline_clips = []
         curr_time = 0.0
@@ -2726,15 +2466,7 @@ def build_reel_video(
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     final_duration = final_video.duration
-    enc = video_encoder()
-    final_video.write_videofile(
-        output_path,
-        fps=fps,
-        codec=enc["codec"],
-        audio_codec="aac" if audio_clip is not None else None,
-        preset=enc["preset"],
-        ffmpeg_params=list(enc["ffmpeg_params"]),
-    )
+    write_clip(final_video, output_path, fps=fps, with_audio=audio_clip is not None)
 
     for c in raw_clips:
         c.close()

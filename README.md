@@ -10,8 +10,41 @@ gate that refuses to call something publish-ready when it is not.
 | 📖 Narrative Studio | Episodic storytelling: Gemini writes the script and casts the world, then a storyboard becomes Ken Burns shots cut to the voice |
 | ◼️ Minimalist Motion | Draws a 1080×1920 vector animation from code — seven metaphor templates, no footage, no stock, no model-generated imagery |
 | 📦 Batch Studio | Queues topics and renders them back to back |
-| 🎬 Reel Studio | Slide-based reels from photos and licensed stock |
+| 🎬 Reel Studio | Slide-based reels from photos and licensed stock, scripted from sourced facts |
 | ⚔️ Versus Duel | Split-screen comparison shorts with animated stat badges |
+
+Every page opens with the same three things: four live telemetry readings
+(renders, storage, the encoder this machine will actually use, and whether the
+compliance gate is holding anything back), a card saying what the engine is for
+and roughly how long a render takes, and a drawer of the last four things you
+made.
+
+---
+
+## The Viral Scorecard
+
+Every mode scores its script 1-10 on the preview step, on three axes, before
+you publish it.
+
+| Axis | What it measures |
+|---|---|
+| **Hook intrigue (0-3s)** | Whether the first nine words open a loop or announce a topic |
+| **Information density** | How much of the script is load-bearing -- figures, names, mechanisms |
+| **Monetization safety** | Whether it survives YouTube's reused-content review and TikTok originality |
+
+The offline card always runs; a button blends in a model read of the same three
+axes. Under 8.0 you get a one-click **Rewrite for High Retention**, which
+rewrites against the card's own diagnosis and then *re-scores the result* --
+if the rewrite came out worse, it says so and keeps the original.
+
+The density metric is worth one note, because getting it wrong is subtle. It
+originally counted any number as a fact, which rated the old Reel Studio
+listicle template 8.7 "facts per 100 words" on nothing but its own `Number 1 /
+Number 2` scaffolding -- higher than a researched script. List ordinals are now
+stripped before counting, and a second term measures how *evenly* the facts are
+spread, because a script with one fact-stuffed sentence and five empty ones
+loses the viewer in the five. Measured after the fix: every one of the five old
+templates scores under 6.0, the offline fact bank 6.6-7.6, a researched script 8.7.
 
 ---
 
@@ -231,27 +264,43 @@ git check-ignore -v .env users.json exports    # all three should print a rule
 ## Layout
 
 ```
-app.py            Streamlit UI, login gate, all five studios
+app.py            Streamlit UI, login gate, the command centre, all six studios
 auth.py           password hashing, roles, user store, login rate limiting
 paths.py          project-relative paths and cross-platform font resolution
 narrative_engine.py  the episodic pipeline (Narrative Studio)
 minimalist_engine.py  the vector animation engine (Minimalist Motion)
 vector_rig.py     the stick-figure rig: ten poses, a two-segment torso,
                   solved by forward kinematics
-video_engine.py   reframing, looping, captions, the duel engine
+duel_engine.py    the Versus Duel: split panels, stat cards, the winner reveal
+reel_engine.py    domain detection, the fact bank, fact-carrying scripts
+video_engine.py   reframing, looping, captions, encoding, the Gemini pre-flight
 audio_engine.py   TTS, synthesized music beds, SFX, ducking
-gemini_engine.py  scripts, scene specs, video grounding
-compliance.py     licence model, provenance ledger, publish gate
-tests/            narrative unit tests and the ffmpeg pipeline suite
+gemini_engine.py  scripts, scene specs, video grounding, the viral scorecard
+compliance.py     licence model, provenance ledger, publish gate, the scorecard
+tests/            the pytest suite, plus the standalone `suite_*.py` scripts
 ```
 
 Run the tests:
 
 ```bash
-.venv\Scripts\python tests\test_narrative_unit.py     # no network, ~2s
-.venv\Scripts\python tests\test_narrative_ffmpeg.py   # needs ffmpeg, ~90s
-.venv\Scripts\python tests\test_vector_scenes.py     # no network, ~30s
-.venv\Scripts\python tests\test_url_ingest.py        # needs network, ~20s
+.venv\Scripts\python -m pytest tests/                  # ~2 min, 103 tests
+.venv\Scripts\python -m pytest tests/ -m "not slow"    # ~15s, no ffmpeg
+.venv\Scripts\python -m pytest tests/ --network        # also the live download
+```
+
+The `suite_*.py` files are scripts rather than pytest modules on purpose: they
+print a readable account of what they measured, which is what you want while
+working on the engine they cover. They are named `suite_` rather than `test_`
+because pytest imports every `test_*.py` at collection time — as `test_*.py`
+their whole bodies ran during `--collect-only`, which made collection take 30
+seconds and fired a live TikTok download before a single test executed.
+`test_suites.py` runs each of them as a subprocess instead.
+
+```bash
+.venv\Scripts\python tests\suite_narrative_unit.py    # no network, ~2s
+.venv\Scripts\python tests\suite_narrative_ffmpeg.py  # needs ffmpeg, ~90s
+.venv\Scripts\python tests\suite_vector_scenes.py     # no network, ~30s
+.venv\Scripts\python tests\suite_url_ingest.py        # needs network, ~20s
 ```
 
 ---

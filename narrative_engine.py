@@ -115,6 +115,17 @@ DEFAULT_AESTHETIC = "vector_comic"
 DEFAULT_TONE = "reflection"
 DEFAULT_FORMAT = "short"
 
+# Shorts eligibility.
+#
+# YouTube treats anything up to 3 minutes as a Short, but the vertical feeds
+# that matter here are stricter in practice, and an episode that lands at 60.4s
+# is not a Short at all -- it is a normal video with a vertical crop, and it
+# leaves the Shorts shelf entirely. The band is deliberately short of the limit:
+# encoders round frame counts up, and a board cut to exactly 60.0s ships at
+# 60.03s.
+SHORTS_MIN_SECONDS = 55.0
+SHORTS_MAX_SECONDS = 58.0
+
 # Narration pace. Measured against Gemini TTS at its default rate, which is a
 # little slower than edge-tts with the +12% boost this project uses elsewhere.
 WORDS_PER_SECOND = 2.6
@@ -928,7 +939,19 @@ def segment_still(segment: dict[str, Any], entities: dict[str, Any],
 # Stage 4 -- Ken Burns, assembly, subtitles
 # ---------------------------------------------------------------------------
 
-KEN_BURNS_ZOOM = 0.16           # how far in or out over a whole segment
+# 1.00x -> 1.08x over a whole segment.
+#
+# 0.16 was too much: on a four-second shot that is 4% of the frame per second,
+# which reads as a push rather than as a drift, and it is the single thing that
+# makes a still-based episode look like a slideshow with an effect applied. 8%
+# across the shot is the move you notice only if you look for it.
+KEN_BURNS_ZOOM = 0.08
+
+# Sideways travel as a fraction of the room the zoom opens up. At 8% zoom the
+# available travel is small, so the pan moves are given all of it and the
+# centred moves a third, which is enough to stop a pure zoom feeling locked.
+KEN_BURNS_DRIFT = 0.34
+
 _MOVES = ("in_center", "out_center", "in_left", "in_right", "pan_left", "pan_right")
 
 
@@ -936,12 +959,22 @@ def ken_burns_clip(still_path: str, output_path: str, duration: float,
                    size: tuple[int, int], fps: int = 30, move: str = "in_center",
                    ffmpeg: str | None = None) -> str:
     """
-    Turns a still into a moving shot.
+    Turns a still into a moving shot: a smooth 1.00x-1.08x zoom plus slow drift.
 
     zoompan works on the *input* frame, so the still is scaled up first: zoom
     on a source at output resolution resamples from fewer and fewer pixels and
     the shot goes soft exactly as it gets closest. Scaling to 2x first means
     every zoom level still has real pixels behind it.
+
+    Two things make the move read as camera rather than as filter:
+
+    * **The zoom is eased, not stepped.** The old `zoom+step` form is linear,
+      and a linear zoom starts and stops instantly -- the two frames a viewer
+      actually notices. This uses an absolute smoothstep on the frame index, so
+      the move accelerates in and settles out. Absolute also means the zoom
+      cannot accumulate rounding drift over a 300-frame shot.
+    * **Nothing is a pure zoom.** Even the centred moves drift a third of the
+      available travel, so the frame is never locked to the middle of the still.
     """
     import subprocess
 
@@ -952,32 +985,45 @@ def ken_burns_clip(still_path: str, output_path: str, duration: float,
     frames = max(2, int(round(duration * fps)))
     big_w, big_h = width * 2, height * 2
 
-    zoom_in = not move.startswith("out")
-    # zoompan's `zoom` is evaluated per output frame; stepping it by a constant
-    # gives a linear move, which is what reads as deliberate rather than eased.
-    step = KEN_BURNS_ZOOM / frames
-    if zoom_in:
-        zoom_expr = f"min(zoom+{step:.6f},{1 + KEN_BURNS_ZOOM:.4f})"
-        start_zoom = 1.0
-    else:
-        zoom_expr = f"max({1 + KEN_BURNS_ZOOM:.4f}-{step:.6f}*on,1.0)"
-        start_zoom = 1 + KEN_BURNS_ZOOM
+    # Smoothstep on normalised frame index: 3p² - 2p³, zero slope at both ends.
+    p = f"(on/{frames - 1})"
+    ease = f"(3*pow({p},2)-2*pow({p},3))"
 
-    centre_x = "iw/2-(iw/zoom/2)"
-    centre_y = "ih/2-(ih/zoom/2)"
-    if move.endswith("left"):
-        x_expr = f"(iw-iw/zoom)*(on/{frames})" if "pan" in move else "0"
-    elif move.endswith("right"):
-        x_expr = f"(iw-iw/zoom)*(1-on/{frames})" if "pan" in move else "iw-iw/zoom"
+    zoom_in = not move.startswith("out")
+    if zoom_in:
+        zoom_expr = f"1+{KEN_BURNS_ZOOM:.4f}*{ease}"
     else:
-        x_expr = centre_x
+        zoom_expr = f"{1 + KEN_BURNS_ZOOM:.4f}-{KEN_BURNS_ZOOM:.4f}*{ease}"
+
+    # zoompan re-evaluates x and y per frame against the *current* zoom, so
+    # these are written against `zoom` rather than against a precomputed value.
+    room_x, room_y = "(iw-iw/zoom)", "(ih-ih/zoom)"
+    mid_x, mid_y = f"{room_x}/2", f"{room_y}/2"
+
+    if "pan" in move:
+        # A full traverse of the room the zoom opens up.
+        x_expr = f"{room_x}*{ease}" if move.endswith("left") else f"{room_x}*(1-{ease})"
+    elif move.endswith("left"):
+        x_expr = f"{mid_x}-{room_x}*{KEN_BURNS_DRIFT:.3f}*{ease}"
+    elif move.endswith("right"):
+        x_expr = f"{mid_x}+{room_x}*{KEN_BURNS_DRIFT:.3f}*{ease}"
+    else:
+        # Centre moves drift vertically instead, so a run of them does not all
+        # slide the same way.
+        x_expr = mid_x
+
+    if move.endswith("center"):
+        direction = -1.0 if zoom_in else 1.0
+        y_expr = f"{mid_y}{direction * KEN_BURNS_DRIFT:+.3f}*{room_y}*{ease}"
+    else:
+        y_expr = mid_y
 
     command = [
         ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
         "-loop", "1", "-i", os.path.abspath(still_path),
         "-vf", (f"scale={big_w}:{big_h}:force_original_aspect_ratio=increase,"
                 f"crop={big_w}:{big_h},"
-                f"zoompan=z='{zoom_expr}':x='{x_expr}':y='{centre_y}':"
+                f"zoompan=z='{zoom_expr}':x='{x_expr}':y='{y_expr}':"
                 f"d={frames}:s={width}x{height}:fps={fps}"),
         "-frames:v", str(frames), "-an",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
@@ -986,7 +1032,6 @@ def ken_burns_clip(still_path: str, output_path: str, duration: float,
     proc = subprocess.run(command, capture_output=True, text=True, timeout=300)
     if proc.returncode != 0 or not os.path.exists(output_path):
         raise RuntimeError(f"Ken Burns pass failed: {(proc.stderr or '')[:300]}")
-    _ = start_zoom
     return output_path
 
 
@@ -1150,6 +1195,47 @@ def fit_storyboard_to(segments: Sequence[dict[str, Any]], total: float) -> list[
     return segments
 
 
+def cap_for_shorts(segments: Sequence[dict[str, Any]],
+                   limit: float = SHORTS_MAX_SECONDS) -> tuple[list[dict[str, Any]], bool]:
+    """
+    Forces a storyboard inside the Shorts window, dropping tail segments if it
+    has to.
+
+    Returns (segments, trimmed). Two passes, in this order:
+
+      1. If it is only a little long, compress every segment proportionally.
+         Nothing is lost and the pacing tightens slightly.
+      2. If proportional compression would push segments under
+         MIN_SEGMENT_SECONDS -- a shot so short it reads as a flash frame --
+         segments are dropped from the end instead and the remainder re-fitted.
+
+    Dropping from the end rather than the middle is deliberate: the narration
+    was written as an arc, and losing the landing is obvious where losing a
+    middle beat is merely abrupt. The caller is told it happened so it can warn
+    that the script needs to be shorter, which is the real fix.
+    """
+    board = [dict(s) for s in segments]
+    if not board:
+        return board, False
+
+    runtime = storyboard_runtime(board)
+    if runtime <= limit:
+        return board, False
+
+    # Pass 1: would proportional compression keep every shot watchable?
+    scale = limit / runtime
+    shortest = min(float(s["duration"]) for s in board) * scale
+    if shortest >= MIN_SEGMENT_SECONDS:
+        return fit_storyboard_to(board, limit), False
+
+    # Pass 2: drop from the end until what is left can hold the limit.
+    while len(board) > 1:
+        board.pop()
+        if len(board) * MIN_SEGMENT_SECONDS <= limit:
+            break
+    return fit_storyboard_to(board, limit), True
+
+
 def _move_for(segment: dict[str, Any]) -> str:
     """
     Which Ken Burns move this segment gets.
@@ -1181,6 +1267,8 @@ def produce_episode(
     ambient: bool = True,
     ambient_volume: float = AMBIENT_VOLUME,
     image_providers: Sequence[str] = IMAGE_PROVIDERS,
+    shorts_mode: bool = False,
+    shorts_limit: float = SHORTS_MAX_SECONDS,
     progress: ProgressFn | None = None,
 ) -> dict[str, Any]:
     """
@@ -1228,6 +1316,20 @@ def produce_episode(
     # Whichever path ran, the picture has to outlast the voice: the mux trims
     # to the shorter stream, so a picture that ends first clips the last words.
     segments = cover_narration(segments, speech)
+
+    # Shorts mode is a hard cap, applied after the voice has decided the
+    # timing -- capping the estimate instead would leave the real narration
+    # overrunning it.
+    shorts_trimmed = False
+    if shorts_mode:
+        before = storyboard_runtime(segments)
+        segments, shorts_trimmed = cap_for_shorts(segments, shorts_limit)
+        after = storyboard_runtime(segments)
+        if after < before - 0.05:
+            say(f"Shorts mode: {before:.1f}s cut to {after:.1f}s"
+                + (f", dropping {shorts_trimmed and 'tail segments' or ''}"
+                   if shorts_trimmed else "."))
+
     runtime = storyboard_runtime(segments)
 
     # --- stills ------------------------------------------------------------
@@ -1349,6 +1451,11 @@ def produce_episode(
         "transition": transition,
         "subtitles": subtitle_path,
         "ambient": bool(ambient),
+        "shorts_mode": bool(shorts_mode),
+        # True when the cap could not be met by compression alone and beats
+        # were dropped -- the UI has to say so rather than ship a truncated arc
+        # quietly.
+        "shorts_trimmed": bool(shorts_trimmed),
     }
 
 
