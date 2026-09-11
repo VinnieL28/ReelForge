@@ -13,12 +13,21 @@ refuses to call something publish-ready when it is not.
 | 🎬 Reel Studio | Slide-based reels from photos and licensed stock, scripted from sourced facts |
 | ⚔️ Versus Duel | Split-screen comparison shorts with animated stat badges |
 | 🌙 Atmosphere Studio | 30-minute to 8-hour ambient/sleep video with a synthesized soundtrack, published straight to YouTube |
+| 📁 Exports Library | Every render this account has made: filter, play, download, reveal, delete |
 
-Every page opens with the same three things: four live telemetry readings
+Every page opens with the same two things: four live telemetry readings
 (renders, storage, the encoder this machine will actually use, and whether the
-compliance gate is holding anything back), a card saying what the engine is for
-and roughly how long a render takes, and a drawer of the last four things you
-made.
+compliance gate is holding anything back), and a card saying what the engine is
+for and roughly how long a render takes. Then the work, and nothing after it —
+the creation pages end at their own render button.
+
+Everything you have made lives in **📁 Exports Library**, a mode of its own:
+a grid of every render in `exports/<username>/` with its duration, size, date
+and aspect tag, filterable by the engine that made it, with play, download,
+reveal-in-folder and delete on each card. It used to be a four-item strip
+pinned under every creation page, which meant every workflow ended in a row of
+unrelated thumbnails and a video player that stayed open across mode switches.
+It is a destination now, not a footer.
 
 ---
 
@@ -271,8 +280,8 @@ again. Only `app.py` itself is hot.
 
 | Role | Engines | Can also |
 |---|---|---|
-| `admin` | all five, plus the Admin panel | manage users, set API keys, see every workspace |
-| `creator` (`member`) | Commentary Machine, Minimalist Motion | nothing else — own files only |
+| `admin` | all seven, plus the Exports Library and the Admin panel | manage users, set API keys, see every workspace |
+| `creator` (`member`) | Commentary Machine, Minimalist Motion, Narrative Studio, and their own Exports Library | nothing else — own files only |
 
 Users live in `users.json` (gitignored) or in environment variables. Passwords
 are stored as **PBKDF2-HMAC-SHA256**, salted per user, 240,000 iterations.

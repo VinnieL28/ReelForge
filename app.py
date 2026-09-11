@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import copy
 import glob
 import time
@@ -889,40 +890,119 @@ def render_mode_guide(mode: str) -> None:
 # Recent exports drawer
 # ---------------------------------------------------------------------------
 
-def recent_exports(limit: int = 4) -> list[dict[str, Any]]:
-    """The newest finished renders for the signed-in user, newest first."""
+# ---------------------------------------------------------------------------
+# Exports Library
+#
+# Everything the signed-in account has rendered, in one place. It used to be a
+# four-item strip pinned under every creation page, which meant every workflow
+# ended in a row of unrelated thumbnails and a video player that stayed open
+# across mode switches. It is a destination now, not a footer.
+#
+# Scoped to user_exports() and nowhere else: one account cannot see, play or
+# delete another's work through this page any more than through any other.
+# ---------------------------------------------------------------------------
+
+# Filename prefix -> what made it. The render paths write these, so the prefix
+# is a reliable tag without opening the file.
+EXPORT_KINDS: dict[str, str] = {
+    "commentary_": "🎙️ Commentary",
+    "minimalist_": "◼️ Minimalist",
+    "narrative_": "📖 Narrative",
+    "batch_": "📦 Batch",
+    "reel_": "🎬 Reel",
+    "duel_": "⚔️ Duel",
+    "atmosphere_": "🌙 Atmosphere",
+    "licensed_": "🎞️ Licensed clip",
+}
+
+# Intermediates. They live in the same folder and are not finished work, so
+# they are hidden here and swept by the command centre's purge button instead.
+SCRATCH_PREFIXES = ("source_", "muted_", "reframed_", "narration_", "music_", "preview_")
+
+SORT_MODES: dict[str, str] = {
+    "newest": "🕑 Newest first",
+    "oldest": "🕐 Oldest first",
+    "largest": "💾 Largest first",
+    "name": "🔤 Name",
+}
+
+# st.download_button reads the whole file into memory and pushes it through the
+# websocket. An eight-hour Atmosphere render is several gigabytes; offering a
+# browser download for that would hang the tab and can take the server with it.
+DOWNLOAD_LIMIT_BYTES = 400 * 1024 * 1024
+
+
+def export_kind(name: str) -> str:
+    """The engine that produced a file, from its filename prefix."""
+    lowered = name.lower()
+    for prefix, label in EXPORT_KINDS.items():
+        if lowered.startswith(prefix):
+            return label
+    return "📄 Other"
+
+
+def aspect_tag(width: int, height: int) -> str:
+    """'9:16', '16:9', '1:1' or the raw ratio when it is none of those."""
+    if width <= 0 or height <= 0:
+        return ""
+    ratio = width / height
+    for label, value in (("9:16", 9 / 16), ("16:9", 16 / 9), ("1:1", 1.0), ("4:5", 4 / 5)):
+        if abs(ratio - value) < 0.02:
+            return label
+    return f"{ratio:.2f}:1"
+
+
+def list_exports(sort: str = "newest", kind: str = "all",
+                 include_scratch: bool = False) -> list[dict[str, Any]]:
+    """Every finished render for the signed-in user, filtered and sorted."""
     root = user_exports()
     found: list[dict[str, Any]] = []
 
     for entry in os.scandir(root) if os.path.isdir(root) else ():
-        name = entry.name.lower()
-        if not entry.is_file() or not name.endswith(".mp4"):
+        name = entry.name
+        lowered = name.lower()
+        if not entry.is_file() or not lowered.endswith((".mp4", ".webm", ".mov", ".mkv")):
             continue
-        if name.startswith(("source_", "muted_", "reframed_")) or name.endswith("_gemini.mp4"):
+        if not include_scratch and (lowered.startswith(SCRATCH_PREFIXES)
+                                    or lowered.endswith("_gemini.mp4")):
             continue
         try:
             stat = entry.stat()
         except OSError:
             continue
-        found.append({"path": entry.path, "name": entry.name,
+
+        label = export_kind(name)
+        if kind != "all" and label != kind:
+            continue
+
+        found.append({"path": entry.path, "name": name, "kind": label,
                       "bytes": stat.st_size, "mtime": stat.st_mtime})
 
-    found.sort(key=lambda item: item["mtime"], reverse=True)
-    return found[:limit]
+    keys = {
+        "newest": (lambda item: item["mtime"], True),
+        "oldest": (lambda item: item["mtime"], False),
+        "largest": (lambda item: item["bytes"], True),
+        "name": (lambda item: item["name"].lower(), False),
+    }
+    key, reverse = keys.get(sort, keys["newest"])
+    found.sort(key=key, reverse=reverse)
+    return found
 
 
-@st.cache_data(show_spinner=False, max_entries=32)
-def _export_card(path: str, mtime: float, size: int) -> dict[str, Any]:
+@st.cache_data(show_spinner=False, max_entries=64)
+def export_details(path: str, mtime: float, size: int) -> dict[str, Any]:
     """
-    Duration and a poster frame for one export.
+    Duration, resolution and a poster frame for one file.
 
     Keyed on (path, mtime, size) so a re-render to the same filename produces a
     new cache entry rather than showing the previous video's thumbnail.
     """
-    info: dict[str, Any] = {"duration": 0.0, "thumb": None}
+    info: dict[str, Any] = {"duration": 0.0, "width": 0, "height": 0, "thumb": None}
     try:
         probe = probe_stream_info(path)
         info["duration"] = float(probe.get("duration") or 0.0)
+        info["width"] = int(probe.get("width") or 0)
+        info["height"] = int(probe.get("height") or 0)
     except Exception:
         pass
 
@@ -932,11 +1012,16 @@ def _export_card(path: str, mtime: float, size: int) -> dict[str, Any]:
         with VideoFileClip(path) as clip:
             if not info["duration"]:
                 info["duration"] = float(clip.duration or 0.0)
-            # A frame at 12% rather than 0: the first frame of a duel is a
-            # half-drawn VS medallion and of a reel is a fade from black.
-            frame = clip.get_frame(min(max(0.3, clip.duration * 0.12), max(0.0, clip.duration - 0.1)))
+            if not info["width"]:
+                info["width"], info["height"] = int(clip.w), int(clip.h)
+            # 12% in rather than frame zero -- a duel opens on a half-drawn VS
+            # medallion and a reel on a fade from black. Capped at 30s because
+            # seeking an hour into a multi-gigabyte file to make a thumbnail is
+            # not worth the wait.
+            at = min(max(0.3, clip.duration * 0.12), 30.0, max(0.0, clip.duration - 0.1))
+            frame = clip.get_frame(at)
         thumb = Image.fromarray(frame)
-        thumb.thumbnail((320, 320))
+        thumb.thumbnail((480, 480))
         info["thumb"] = thumb
     except Exception:
         pass
@@ -944,50 +1029,213 @@ def _export_card(path: str, mtime: float, size: int) -> dict[str, Any]:
     return info
 
 
-def render_exports_drawer(limit: int = 4) -> None:
-    """A four-item gallery of the newest renders, with open/download actions."""
-    items = recent_exports(limit)
-    if not items:
+def reveal_in_file_manager(path: str) -> str:
+    """
+    Opens the folder containing `path` in the OS file manager.
+
+    Returns "" on success or a reason it could not. Worth being explicit about
+    what this does: it opens a window on the machine running Streamlit, which
+    is the server. Over a tunnel, or in Docker, that is not the machine looking
+    at the page -- so the UI offers the path to copy as well.
+    """
+    import subprocess
+
+    folder = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(folder):
+        return f"{folder} does not exist"
+
+    try:
+        if sys.platform == "win32":
+            # /select, highlights the file rather than just opening the folder.
+            subprocess.Popen(["explorer", "/select,", os.path.abspath(path)])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", os.path.abspath(path)])
+        else:
+            subprocess.Popen(["xdg-open", folder])
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+    return ""
+
+
+def delete_export(path: str) -> str:
+    """
+    Removes one render. Returns "" on success or the reason it failed.
+
+    The provenance ledger entry is deliberately left alone: it is the record of
+    what was made from what, and it is the thing that answers a copyright claim
+    months later. Deleting a video does not un-make it.
+    """
+    target = os.path.abspath(path)
+    root = os.path.abspath(user_exports())
+
+    # Never delete outside the signed-in account's own folder, whatever a
+    # crafted path says.
+    if os.path.commonpath([target, root]) != root:
+        return "That file is outside your workspace."
+    if not os.path.isfile(target):
+        return "That file is already gone."
+
+    try:
+        os.remove(target)
+    except OSError as exc:
+        return f"{type(exc).__name__}: {exc}"
+    return ""
+
+
+def render_exports_library() -> None:
+    """The gallery: everything this account has rendered."""
+    st.markdown("### 📁 Exports Library")
+
+    root = user_exports()
+    everything = list_exports()
+    kinds = sorted({item["kind"] for item in everything})
+
+    if not everything:
+        st.info(
+            "Nothing rendered yet. Anything you make in the production modes lands "
+            f"here, in `{root}`.", icon="📭")
         return
 
-    divider()
-    st.markdown('<div class="rf-section">Recent exports</div>', unsafe_allow_html=True)
+    # --- filters ----------------------------------------------------------
+    with st.container(border=True):
+        f1, f2, f3 = st.columns([1.4, 1.4, 1])
+        with f1:
+            sort = pick("Sort", list(SORT_MODES), "newest", "lib_sort",
+                        format_func=lambda k: SORT_MODES[k])
+        with f2:
+            kind = pick("Made by", ["all"] + kinds, "all", "lib_kind",
+                        format_func=lambda k: "All modes" if k == "all" else k)
+        with f3:
+            columns = st.selectbox("Per row", [2, 3, 4], index=1, key="lib_cols")
 
-    cols = st.columns(len(items))
-    for col, item in zip(cols, items):
-        with col, st.container(border=True):
-            card = _export_card(item["path"], item["mtime"], item["bytes"])
-            if card["thumb"] is not None:
-                st.image(card["thumb"], width="stretch")
-            else:
-                st.markdown('<div class="rf-thumb-blank">▶</div>', unsafe_allow_html=True)
+        items = list_exports(sort=sort, kind=kind)
+        total = sum(item["bytes"] for item in everything)
+        shown = sum(item["bytes"] for item in items)
+        stat_row([
+            ("Videos", f"{len(items)}" + (f" of {len(everything)}"
+                                          if len(items) != len(everything) else ""), "violet"),
+            ("Shown", _human_bytes(shown), "cyan"),
+            ("Library total", _human_bytes(total), "amber"),
+            ("Folder", os.path.basename(root) or root, ""),
+        ])
 
-            st.markdown(
-                f'<div class="rf-export-name">{item["name"]}</div>'
-                f'<div class="rf-export-meta">{card["duration"]:.1f}s · '
-                f'{_human_bytes(item["bytes"])} · '
-                f'{time.strftime("%d %b %H:%M", time.localtime(item["mtime"]))}</div>',
-                unsafe_allow_html=True,
-            )
+    if not items:
+        st.caption("Nothing matches that filter.")
+        return
 
-            a, b = st.columns(2)
-            with a:
-                if st.button("▶", key=f"open_{item['name']}", width="stretch",
-                             help="Play it here"):
-                    st.session_state["drawer_playing"] = item["path"]
-                    st.rerun()
-            with b:
-                with open(item["path"], "rb") as handle:
-                    st.download_button("⬇", data=handle.read(), file_name=item["name"],
-                                       mime="video/mp4", width="stretch",
-                                       key=f"drawerdl_{item['name']}", help="Download")
-
-    playing = st.session_state.get("drawer_playing")
+    # --- the expanded player, above the grid -------------------------------
+    playing = str(st.session_state.get("library_playing") or "")
     if playing and os.path.exists(playing):
-        st.video(playing)
-        if st.button("Close player", key="close_drawer_player"):
-            st.session_state.pop("drawer_playing", None)
+        with st.container(border=True):
+            st.markdown(f"#### ▶ {os.path.basename(playing)}")
+            st.video(playing)
+            if st.button("Close player", key="lib_close_player"):
+                st.session_state.pop("library_playing", None)
+                st.rerun()
+    elif playing:
+        # The file was deleted while it was open.
+        st.session_state.pop("library_playing", None)
+
+    # --- confirmation, which has to be resolved before anything else --------
+    pending = str(st.session_state.get("library_pending_delete") or "")
+    if pending:
+        with st.container(border=True):
+            st.warning(
+                f"Delete **{os.path.basename(pending)}** permanently? "
+                f"This frees "
+                f"{_human_bytes(os.path.getsize(pending) if os.path.exists(pending) else 0)} "
+                f"and cannot be undone. The provenance entry is kept.",
+                icon="⚠️")
+            yes, no = st.columns(2)
+            with yes:
+                if st.button("Delete it", key="lib_confirm_delete", type="primary",
+                             width="stretch"):
+                    problem = delete_export(pending)
+                    st.session_state.pop("library_pending_delete", None)
+                    if str(st.session_state.get("library_playing") or "") == pending:
+                        st.session_state.pop("library_playing", None)
+                    if problem:
+                        st.error(problem)
+                    else:
+                        st.toast(f"Deleted {os.path.basename(pending)}", icon="🗑️")
+                        st.rerun()
+            with no:
+                if st.button("Keep it", key="lib_cancel_delete", width="stretch"):
+                    st.session_state.pop("library_pending_delete", None)
+                    st.rerun()
+
+    # --- the grid ----------------------------------------------------------
+    for row_start in range(0, len(items), columns):
+        row = items[row_start:row_start + columns]
+        cols = st.columns(columns)
+        for col, item in zip(cols, row):
+            with col, st.container(border=True):
+                _render_export_tile(item)
+
+
+def _render_export_tile(item: dict[str, Any]) -> None:
+    """One card: poster, metadata, and the four actions."""
+    details = export_details(item["path"], item["mtime"], item["bytes"])
+    key = item["name"]
+
+    if details["thumb"] is not None:
+        st.image(details["thumb"], width="stretch")
+    else:
+        st.markdown('<div class="rf-thumb-blank">▶</div>', unsafe_allow_html=True)
+
+    ratio = aspect_tag(details["width"], details["height"])
+    st.markdown(
+        badge(item["kind"], "violet")
+        + (badge(ratio, "cyan") if ratio else "")
+        + (badge(f"{details['width']}×{details['height']}", "")
+           if details["width"] else ""),
+        unsafe_allow_html=True,
+    )
+
+    duration = details["duration"]
+    length = (f"{duration / 3600:.1f} h" if duration >= 3600
+              else f"{duration / 60:.0f} min" if duration >= 120
+              else f"{duration:.1f}s")
+    st.markdown(
+        f'<div class="rf-export-name" title="{item["name"]}">{item["name"]}</div>'
+        f'<div class="rf-export-meta">{length} · {_human_bytes(item["bytes"])} · '
+        f'{time.strftime("%d %b %Y, %H:%M", time.localtime(item["mtime"]))}</div>',
+        unsafe_allow_html=True,
+    )
+
+    play, download = st.columns(2)
+    with play:
+        if st.button("▶ Play", key=f"lib_play_{key}", width="stretch"):
+            st.session_state["library_playing"] = item["path"]
             st.rerun()
+    with download:
+        if item["bytes"] <= DOWNLOAD_LIMIT_BYTES:
+            with open(item["path"], "rb") as handle:
+                st.download_button("⬇ Download", data=handle.read(),
+                                   file_name=item["name"], mime="video/mp4",
+                                   width="stretch", key=f"lib_dl_{key}")
+        else:
+            st.button("⬇ Download", key=f"lib_dl_{key}", width="stretch", disabled=True,
+                      help=f"{_human_bytes(item['bytes'])} is too large to push through "
+                           f"the browser — copy it from disk instead.")
+
+    reveal, remove = st.columns(2)
+    with reveal:
+        if st.button("📂 Reveal", key=f"lib_open_{key}", width="stretch",
+                     help="Opens the folder in the file manager on the machine "
+                          "running Streamlit — which is the server, not "
+                          "necessarily the device you are reading this on."):
+            problem = reveal_in_file_manager(item["path"])
+            if problem:
+                st.error(f"Could not open the folder: {problem}")
+            else:
+                st.toast("Opened on the server's desktop.", icon="📂")
+    with remove:
+        if st.button("🗑 Delete", key=f"lib_del_{key}", width="stretch"):
+            st.session_state["library_pending_delete"] = item["path"]
+            st.rerun()
+
+    st.caption(f"`{item['path']}`")
 
 
 # ---------------------------------------------------------------------------
@@ -1479,7 +1727,7 @@ def clear_duel_widget_state() -> None:
     # The photo cache is keyed on (preset, side) so it is safe to keep, but the
     # free-text search cache is keyed on the query string alone and would hand
     # back the previous matchup's result for a repeated query.
-    st.session_state.pop("drawer_playing", None)
+    st.session_state.pop("library_playing", None)
 
 
 def duel_from_preset(preset_name: str) -> dict[str, Any]:
@@ -5773,6 +6021,7 @@ MODE_LABELS: dict[str, str] = {
     "reel": "🎬 Reel Studio",
     "duel": "⚔️ Versus Duel",
     "atmosphere": "🌙 Atmosphere Studio",
+    "library": "📁 Exports Library",
     "admin": "🛠️ Admin",
 }
 
@@ -5864,6 +6113,10 @@ def main() -> None:
         render_admin_studio()
         return
 
+    if mode == "library":
+        render_exports_library()
+        return
+
     # Every production page opens with the same three things: what this engine
     # is for, the work, then what came out of it last time.
     render_mode_guide(mode)
@@ -5897,8 +6150,6 @@ def main() -> None:
             render_preview(aspect_name, fps)
         with tabs[4]:
             render_export(aspect_name, fit_mode, transition_type, transition_dur, fps, watermark_text)
-
-    render_exports_drawer()
 
 
 if __name__ == "__main__":

@@ -31,10 +31,12 @@ SYNC_TOLERANCE = 0.05
 # Every mode the app offers. This list is deliberately hardcoded rather than
 # read from app.MODE_LABELS: its job is to fail when a mode is added, so that
 # adding one forces a guidance card and a role entry to be added with it.
-# "atmosphere" was appended when Atmosphere Studio landed, and the two tests
-# below then re-asserted that it has both.
 ALL_MODES = ("commentary", "minimalist", "narrative", "batch", "reel", "duel",
-             "atmosphere", "admin")
+             "atmosphere", "library", "admin")
+
+# Modes that do not make anything. They get no guidance card, because "best
+# for" and "~90s per render" are answers to questions they do not raise.
+NON_PRODUCTION_MODES = ("admin", "library")
 
 
 def av_offset(path: str) -> tuple[float, float, float]:
@@ -70,8 +72,10 @@ def test_every_mode_is_reachable_and_has_a_guide():
 
     assert set(app.MODE_LABELS) == set(ALL_MODES)
     for mode in ALL_MODES:
-        if mode == "admin":
-            continue          # the admin panel is not a production mode
+        if mode in NON_PRODUCTION_MODES:
+            assert mode not in app.MODE_GUIDES, (
+                f"{mode} makes nothing, so it should not carry a production card")
+            continue
         assert mode in app.MODE_GUIDES, f"{mode} has no guidance card"
         guide = app.MODE_GUIDES[mode]
         assert guide["badges"] and guide["niche"] and guide["eta"]
@@ -85,6 +89,9 @@ def test_roles_gate_the_mode_list():
     assert admin >= creator
     assert "admin" in admin and "admin" not in creator
     assert admin <= set(ALL_MODES)
+    # The library is scoped to the signed-in account's own folder, so a creator
+    # seeing it is a creator seeing their own work and nobody else's.
+    assert "library" in creator
 
 
 # ---------------------------------------------------------------------------
