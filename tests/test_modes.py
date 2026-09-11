@@ -32,11 +32,11 @@ SYNC_TOLERANCE = 0.05
 # read from app.MODE_LABELS: its job is to fail when a mode is added, so that
 # adding one forces a guidance card and a role entry to be added with it.
 ALL_MODES = ("commentary", "minimalist", "narrative", "batch", "reel", "duel",
-             "atmosphere", "library", "admin")
+             "atmosphere", "scout", "library", "admin")
 
 # Modes that do not make anything. They get no guidance card, because "best
 # for" and "~90s per render" are answers to questions they do not raise.
-NON_PRODUCTION_MODES = ("admin", "library")
+NON_PRODUCTION_MODES = ("admin", "library", "scout")
 
 
 def av_offset(path: str) -> tuple[float, float, float]:
@@ -92,6 +92,9 @@ def test_roles_gate_the_mode_list():
     # The library is scoped to the signed-in account's own folder, so a creator
     # seeing it is a creator seeing their own work and nobody else's.
     assert "library" in creator
+    # Research feeds the production modes a creator already has, so it is not
+    # an admin-only tool.
+    assert "scout" in creator
 
 
 # ---------------------------------------------------------------------------

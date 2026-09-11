@@ -13,6 +13,7 @@ refuses to call something publish-ready when it is not.
 | 🎬 Reel Studio | Slide-based reels from photos and licensed stock, scripted from sourced facts |
 | ⚔️ Versus Duel | Split-screen comparison shorts with animated stat badges |
 | 🌙 Atmosphere Studio | 30-minute to 8-hour ambient/sleep video with a synthesized soundtrack, published straight to YouTube |
+| 🎯 Niche Scout | Finds a faceless niche worth entering, measures how crowded it is, and plans a season of episodes |
 | 📁 Exports Library | Every render this account has made: filter, play, download, reveal, delete |
 
 Every page opens with the same three things: a header whose subtitle names the
@@ -154,6 +155,82 @@ impact, and slow motes drifting up through the frame.
 
 ---
 
+## Niche Scout
+
+Research and strategy for a faceless channel, and a feeder into the production
+modes. It renders nothing.
+
+**Two entry flows.** *I need ideas* returns 12 niches that work without a face
+on camera — each one a format rather than a subject, with its honest downsides,
+because the cons are the useful half of that list. *Validate my niche* takes
+anything you type and scores it on evergreen longevity, faceless fit,
+production cost, CPM band and measured saturation.
+
+**Then seven content pillars**, three researched episodes under each, with a
+hook title, the named psychological mechanism it uses, and a complete SEO
+package — title, description with timestamped chapters, and tags trimmed to
+YouTube's 450-character budget.
+
+### Two things it refuses to ask a model
+
+A model will answer confidently either way, and the answer would be fiction.
+
+**CPM.** Ask a model what a niche pays and it will produce "$18–24 RPM" for
+anything, including niches that do not monetize. What is real is that
+advertiser *categories* have broadly reported ranges, so the figure comes from
+a table with its basis stated, and the model's job shrinks to classifying the
+niche into a category — which it can actually do. The card always shows a range
+and always shows the caveat: it is a US/UK/CA/AU-weighted category range, Q4
+runs 2–3× January, and a global audience runs a fraction of a US one.
+
+**Saturation.** Computed from real YouTube results, not guessed. The signal
+that a niche is open is not how many videos exist — it is whether *small
+channels are getting large views*. A 9,000-subscriber channel with a 310,000
+median says more about the opportunity than any opinion. Three measured
+signals, weighted: small-channel breakthrough (45%), median view-to-subscriber
+ratio (35%), and how far the leader's median dwarfs the rest (20%).
+
+With no data the score is 50 and flagged **unmeasured** — because a missing API
+key rendering as "wide open" is an invitation to enter a market blind.
+
+### Competitor recon
+
+Real channels ranking in the niche over the last 90 days: subscriber count,
+median view count, view-to-subscriber ratio, and their top three videos.
+
+It needs a **YouTube Data API v3** key, which is *not* the Gemini key — an AI
+Studio key returns 401 against this API. Enable YouTube Data API v3 on a Google
+Cloud project, create an API key, and set `YOUTUBE_API_KEY` in `.env`.
+Everything else in Niche Scout works without it.
+
+The call pattern matters for cost. A naive implementation searches once per
+channel at 100 quota units each; this searches once, then walks each channel's
+uploads playlist at 1 unit a page — six channels for ~105 units rather than
+~700, against a 10,000/day default.
+
+### Handoffs
+
+Each episode carries three buttons:
+
+| | |
+|---|---|
+| **⚡ Send to Batch Studio** | Queues the hook title. Pressing it twice does not duplicate. |
+| **🎬 Produce in Narrative Studio** | Pre-fills premise, aesthetic and tone — a history channel gets Nordic Noir and a suspense voice, a finance one gets flat graphic and stoic. |
+| **📋 Copy full brief & SEO** | Title, hook, angle, description and tags in one copyable block. |
+
+The Narrative handoff clears `nv_topic`, `nv_look`, `nv_tone` and `nv_format`
+as well as writing the state. A Streamlit widget whose key already exists
+ignores its `value=` argument, so writing the state alone would leave the old
+premise on screen — the same trap the duel presets hit.
+
+One thing worth knowing about the descriptions: models routinely return
+chapters inline — `Chapters: 0:00 Intro, 2:15 The Rise` — and YouTube only
+builds a clickable chapter list when each timestamp starts its own line. The
+description is rewritten onto separate lines on the way in, so the text you
+copy actually produces chapters.
+
+---
+
 ## Atmosphere Studio
 
 Long-form ambient and sleep video — 16:9, 30 minutes to 8 hours — with an
@@ -281,8 +358,8 @@ again. Only `app.py` itself is hot.
 
 | Role | Engines | Can also |
 |---|---|---|
-| `admin` | all seven, plus the Exports Library and the Admin panel | manage users, set API keys, see every workspace |
-| `creator` (`member`) | Commentary Machine, Minimalist Motion, Narrative Studio, and their own Exports Library | nothing else — own files only |
+| `admin` | all seven, plus Niche Scout, the Exports Library and the Admin panel | manage users, set API keys, see every workspace |
+| `creator` (`member`) | Commentary Machine, Minimalist Motion, Narrative Studio, Niche Scout, and their own Exports Library | nothing else — own files only |
 
 Users live in `users.json` (gitignored) or in environment variables. Passwords
 are stored as **PBKDF2-HMAC-SHA256**, salted per user, 240,000 iterations.
@@ -386,6 +463,7 @@ vector_rig.py     the stick-figure rig: ten poses, a two-segment torso,
                   solved by forward kinematics
 duel_engine.py    the Versus Duel: split panels, stat cards, the winner reveal
 ambient_engine.py the Atmosphere soundscape synthesizer and visual canvas
+niche_engine.py   Niche Scout: CPM bands, measured saturation, competitor recon
 publisher.py      YouTube Data API v3: OAuth, resumable upload, SEO metadata
 reel_engine.py    domain detection, the fact bank, fact-carrying scripts
 video_engine.py   reframing, looping, captions, encoding, the Gemini pre-flight

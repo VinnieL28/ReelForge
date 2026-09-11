@@ -75,6 +75,7 @@ from compliance import (
 )
 import auth
 import ambient_engine
+import niche_engine
 import publisher
 import reel_engine
 from narrative_engine import (
@@ -1844,6 +1845,19 @@ if "duel" not in st.session_state:
 # Atmosphere Studio keeps its own state for the same reason the other wizards
 # do: Streamlit drops the state of widgets it stops drawing, and a multi-hour
 # render is not something to lose to a mode switch.
+# Niche Scout's research is expensive to regenerate -- three model calls and a
+# YouTube quota spend -- so it survives a mode switch like the other wizards.
+if "scout" not in st.session_state:
+    st.session_state.scout = {
+        "flow": "validate",
+        "topic": "",
+        "ideas": None,
+        "assessment": None,
+        "recon": None,
+        "buckets": None,
+        "handoff": "",
+    }
+
 if "atmosphere" not in st.session_state:
     st.session_state.atmosphere = {
         "bed": next(iter(ambient_engine.PRIMARY_BEDS)),
@@ -6030,6 +6044,355 @@ def render_atmosphere_publisher() -> None:
             if uploaded.get("publish_at"):
                 st.caption(f"Goes public at {uploaded['publish_at']}.")
 
+# ---------------------------------------------------------------------------
+# Niche Scout
+#
+# Research and strategy, and a feeder into the production modes. It renders
+# nothing and imports no rendering engine; the handoff buttons write plain
+# dicts into the target mode's session state.
+# ---------------------------------------------------------------------------
+
+def _ns() -> dict[str, Any]:
+    """Niche Scout's own state, kept out of the widget keys."""
+    return st.session_state.scout
+
+
+def scout_send_to_batch(topic: dict[str, Any]) -> str:
+    """Queues an episode in Batch Studio. Returns the line that was queued."""
+    line = niche_engine.batch_handoff(topic)
+    queue: list[dict[str, Any]] = st.session_state.setdefault("batch_queue", [])
+    if not any(str(job.get("topic")) == line for job in queue):
+        queue.append(_batch_job(line))
+    return line
+
+
+def scout_send_to_narrative(topic: dict[str, Any], band: str) -> None:
+    """
+    Pre-fills Narrative Studio with an episode.
+
+    The widget keys have to go, not just the state: a Streamlit widget whose
+    key already exists ignores its `value=` argument, so writing the topic into
+    `state` alone would leave the old premise on screen. This is the same trap
+    the duel presets hit.
+    """
+    payload = niche_engine.narrative_handoff(topic, band)
+    state = st.session_state.narrative
+    state.update(payload)
+    # A new premise invalidates the script and storyboard built from the old one.
+    state.update({"episode": None, "result": None, "pack": "", "entry_name": ""})
+    for key in ("nv_topic", "nv_look", "nv_tone", "nv_format"):
+        st.session_state.pop(key, None)
+
+
+def _scout_topic_actions(topic: dict[str, Any], band: str, key: str,
+                         allowed: Sequence[str]) -> None:
+    """The three handoff buttons under one episode concept."""
+    can_batch = "batch" in allowed
+    can_narrative = "narrative" in allowed
+
+    left, right = st.columns(2)
+    with left:
+        if st.button("⚡ Send to Batch Studio", key=f"ns_batch_{key}", width="stretch",
+                     disabled=not can_batch,
+                     help=None if can_batch else "Your role does not have Batch Studio."):
+            line = scout_send_to_batch(topic)
+            st.toast(f"Queued: {line[:48]}", icon="⚡")
+    with right:
+        if st.button("🎬 Produce in Narrative Studio", key=f"ns_narr_{key}",
+                     width="stretch", disabled=not can_narrative,
+                     help=None if can_narrative
+                     else "Your role does not have Narrative Studio."):
+            scout_send_to_narrative(topic, band)
+            _ns()["handoff"] = topic.get("hook_title", "")
+            st.toast("Narrative Studio is pre-filled — switch to it in the sidebar.",
+                     icon="🎬")
+
+    with st.expander("📋 Copy full script brief & SEO"):
+        # st.code carries Streamlit's own copy button, which is more reliable
+        # than a clipboard shim and works over the tunnel.
+        st.code(niche_engine.seo_block(topic), language="text")
+        chapters = niche_engine.chapters_of(str(topic.get("description") or ""))
+        if chapters:
+            st.caption(f"{len(chapters)} chapters, first at {chapters[0][0]} — "
+                       f"YouTube only builds a clickable list when each timestamp "
+                       f"starts its own line and the first is 0:00.")
+
+
+def render_scout_scorecard(assessment: dict[str, Any]) -> None:
+    """The opportunity card: CPM band, saturation meter, verdict."""
+    cpm = assessment["cpm"]
+    saturation = assessment["saturation"]
+
+    with st.container(border=True):
+        st.markdown("#### ② Opportunity scorecard")
+
+        head, meter = st.columns([1.1, 1.4])
+        with head:
+            tone = ("green" if assessment["overall"] >= 7.5
+                    else "amber" if assessment["overall"] >= 5.0 else "red")
+            st.markdown(
+                f'<div class="rf-score {tone}"><span class="n">{assessment["overall"]:.1f}</span>'
+                f'<span class="d">/ 10</span></div>'
+                f'<div class="rf-score-verdict">{assessment["verdict"]}</div>'
+                f'<div class="rf-score-src">{assessment.get("model", "")}</div>',
+                unsafe_allow_html=True)
+        with meter:
+            measured = saturation["measured"]
+            st.markdown(
+                f'<div class="rf-axis {"green" if saturation["score"] <= 35 else "amber" if saturation["score"] <= 60 else "red"}">'
+                f'<div class="k">Saturation {"(measured)" if measured else "(no data)"}</div>'
+                f'<div class="v">{saturation["score"]}<span style="font-size:.6em">/100</span></div>'
+                f'<div class="rf-axis-bar"><i style="width:{saturation["score"]}%"></i></div>'
+                f'</div>', unsafe_allow_html=True)
+            st.caption(saturation["verdict"])
+            if measured:
+                signals = saturation["signals"]
+                st.caption(
+                    f"From {signals['channels_sampled']} channels: "
+                    f"{signals['small_channel_share']:.0%} under 50k subs, "
+                    f"median video reaches {signals['median_view_to_sub']:.1f}× the "
+                    f"subscriber count, leader is {signals['leader_concentration']:.1f}× "
+                    f"the rest.")
+            else:
+                st.caption("Run Competitor Recon below to measure this. Without it "
+                           "the score is a placeholder, not an estimate.")
+
+        stat_row([
+            ("CPM band", f"${cpm['low']:.1f}–${cpm['high']:.0f}", "violet"),
+            ("Category", cpm["label"], "cyan"),
+            ("Evergreen", f"{assessment['evergreen']['score']:.0f}/10", ""),
+            ("Faceless fit", f"{assessment['faceless_fit']['score']:.0f}/10", ""),
+        ])
+        st.caption(f"💰 {cpm['why']}")
+        st.caption(f"⚠️ {cpm['caveat']}")
+
+        if assessment.get("summary"):
+            st.markdown(assessment["summary"])
+
+        a, b = st.columns(2)
+        with a:
+            st.markdown("**Risks**")
+            for risk in assessment.get("risks", []):
+                st.markdown(f"- 🚩 {risk}")
+        with b:
+            st.markdown("**Angles that would differentiate you**")
+            for angle in assessment.get("angles", []):
+                st.markdown(f"- 🎯 {angle}")
+
+
+def render_scout_recon(state: dict[str, Any]) -> None:
+    """Real channels working the niche, and what is working for them."""
+    with st.container(border=True):
+        st.markdown("#### 🔭 Competitor recon")
+        st.caption(f"Real channels ranking for this niche in the last "
+                   f"{niche_engine.RECON_WINDOW_DAYS} days, from the YouTube Data API.")
+
+        if not niche_engine.has_youtube_key():
+            st.info(
+                "Needs a **YouTube Data API v3** key, which is not the Gemini key — "
+                "an AI Studio key returns 401 here. In Google Cloud Console: enable "
+                "YouTube Data API v3, create an API key, then put it in `.env` as "
+                "`YOUTUBE_API_KEY`. Everything else in Niche Scout works without it; "
+                "only the saturation score goes unmeasured.",
+                icon="🔑")
+            return
+
+        if st.button("🔭 Run recon", key="ns_recon", width="stretch"):
+            note = st.empty()
+            try:
+                with st.spinner("Reading YouTube..."):
+                    state["recon"] = niche_engine.competitor_recon(
+                        state["topic"], progress=lambda m: note.caption(m))
+            except niche_engine.NicheError as exc:
+                note.empty()
+                st.error(str(exc), icon="🚫")
+                return
+            note.empty()
+            # A fresh recon means the saturation score can now be measured.
+            if state.get("assessment"):
+                state["assessment"]["saturation"] = niche_engine.saturation_from_recon(
+                    state["recon"])
+            st.rerun()
+
+        recon = state.get("recon") or {}
+        channels = recon.get("channels") or []
+        if not channels:
+            return
+
+        st.caption(f"{len(channels)} channels · {recon.get('quota_units', 0)} quota units "
+                   f"spent of the 10,000/day default")
+
+        for channel in channels:
+            with st.container(border=True):
+                subs = ("hidden" if channel["hidden_subs"]
+                        else f"{channel['subscribers']:,} subs")
+                st.markdown(
+                    f"**[{channel['name']}]({channel['url']})** &nbsp; "
+                    + badge(subs, "cyan")
+                    + badge(f"median {channel['median_views']:,} views", "violet")
+                    + badge(f"{channel['view_to_sub']:.1f}× subs", "green"
+                            if channel["view_to_sub"] >= 1 else "")
+                    + badge(f"{channel['videos_in_window']} uploads", ""),
+                    unsafe_allow_html=True)
+                for video in channel["top_videos"]:
+                    st.markdown(
+                        f"- [{video['title']}](https://youtu.be/{video['video_id']}) — "
+                        f"{video['views']:,} views, {video['published']}")
+
+
+def render_niche_scout() -> None:
+    """Discover or validate a niche, then plan and hand off episodes."""
+    state = _ns()
+    role = auth.normalise_role(current_user().get("role"))
+    allowed = auth.allowed_modes(role)
+
+    if state.get("handoff"):
+        st.success(f"Narrative Studio is pre-filled with **{state['handoff']}** — "
+                   f"switch to it in the sidebar.", icon="🎬")
+        state["handoff"] = ""
+
+    # ---- Step 1: the entry flow -------------------------------------------
+    with st.container(border=True):
+        st.markdown("#### ① What are you looking for?")
+        state["flow"] = pick(
+            "Mode", ["validate", "ideas"], state.get("flow", "validate"), "ns_flow",
+            format_func=lambda k: {"validate": "🔍 Validate my niche",
+                                   "ideas": "💡 I need ideas"}[k])
+
+        if state["flow"] == "validate":
+            topic = st.text_input(
+                "Your niche", value=str(state.get("topic") or ""), key="ns_topic",
+                placeholder="e.g. Ancient mysteries and lost cities",
+                help="A format, not just a subject. 'Declassified military logistics, "
+                     "10-minute archival documentaries' beats 'history'.")
+            if topic.strip():
+                band = niche_engine.classify_band(topic)
+                preview = niche_engine.cpm_estimate(topic)
+                st.markdown(
+                    badge(preview["label"], "cyan")
+                    + badge(f"${preview['low']:.1f}–${preview['high']:.0f} CPM band", "violet"),
+                    unsafe_allow_html=True)
+
+            if st.button("🔍 Validate this niche", type="primary", width="stretch",
+                         key="ns_validate", disabled=not topic.strip()):
+                note = st.empty()
+                try:
+                    with st.spinner("Assessing..."):
+                        state["topic"] = topic.strip()
+                        state["assessment"] = niche_engine.validate_niche(
+                            topic, state.get("recon"), progress=lambda m: note.caption(m))
+                        state["buckets"] = None
+                except niche_engine.NicheError as exc:
+                    note.empty()
+                    st.error(str(exc), icon="🚫")
+                    st.stop()
+                note.empty()
+                st.rerun()
+        else:
+            st.caption("Twelve niches that work without a face on camera, each with "
+                       "its honest downsides — the cons are the useful half.")
+            if st.button("💡 Suggest 12 niches", type="primary", width="stretch",
+                         key="ns_ideas"):
+                note = st.empty()
+                try:
+                    with st.spinner("Researching..."):
+                        state["ideas"] = niche_engine.suggest_niches(
+                            progress=lambda m: note.caption(m))
+                except niche_engine.NicheError as exc:
+                    note.empty()
+                    st.error(str(exc), icon="🚫")
+                    st.stop()
+                note.empty()
+                st.rerun()
+
+    # ---- the idea list ----------------------------------------------------
+    ideas = state.get("ideas") or {}
+    if state["flow"] == "ideas" and ideas.get("niches"):
+        st.markdown('<div class="rf-section">12 faceless niches</div>',
+                    unsafe_allow_html=True)
+        rows = ideas["niches"]
+        for start in range(0, len(rows), 2):
+            cols = st.columns(2)
+            for col, niche in zip(cols, rows[start:start + 2]):
+                with col, st.container(border=True):
+                    cpm = niche["cpm"]
+                    st.markdown(f"**{niche['name']}**")
+                    st.markdown(
+                        badge(f"${cpm['low']:.1f}–${cpm['high']:.0f}", "violet")
+                        + badge(cpm["label"], "cyan"), unsafe_allow_html=True)
+                    st.caption(niche["format"])
+                    for pro in niche["pros"]:
+                        st.markdown(f"- ✅ {pro}")
+                    for con in niche["cons"]:
+                        st.markdown(f"- ⚠️ {con}")
+                    if niche["monetization"]:
+                        st.caption(f"💰 {niche['monetization']}")
+                    if st.button("🔍 Validate this one", key=f"ns_pick_{niche['name'][:40]}",
+                                 width="stretch"):
+                        state["topic"] = niche["name"]
+                        state["flow"] = "validate"
+                        state["assessment"] = None
+                        state["buckets"] = None
+                        state["recon"] = None
+                        st.session_state.pop("ns_topic", None)
+                        st.session_state.pop("ns_flow", None)
+                        st.rerun()
+
+    # ---- Step 2: the scorecard --------------------------------------------
+    assessment = state.get("assessment")
+    if not assessment:
+        return
+
+    render_scout_scorecard(assessment)
+    render_scout_recon(state)
+
+    # ---- Step 3: the content plan -----------------------------------------
+    with st.container(border=True):
+        st.markdown("#### ③ Content buckets")
+        st.caption("Seven recurring pillars, three researched episodes under each — "
+                   "with the hook, the psychological angle, and a complete SEO package.")
+
+        if st.button("🗂️ Generate 7 content buckets", type="primary", width="stretch",
+                     key="ns_buckets"):
+            note = st.empty()
+            try:
+                with st.spinner("Planning 21 episodes..."):
+                    state["buckets"] = niche_engine.content_buckets(
+                        state["topic"], assessment, progress=lambda m: note.caption(m))
+            except niche_engine.NicheError as exc:
+                note.empty()
+                st.error(str(exc), icon="🚫")
+                st.stop()
+            note.empty()
+            st.rerun()
+
+    buckets = state.get("buckets") or {}
+    pillars = buckets.get("pillars") or []
+    if not pillars:
+        return
+
+    band = assessment["cpm"]["band"]
+    total = sum(len(p["topics"]) for p in pillars)
+    st.markdown(
+        f'<div class="rf-section">{len(pillars)} pillars · {total} episodes</div>',
+        unsafe_allow_html=True)
+
+    for index, pillar in enumerate(pillars):
+        with st.expander(f"▸ {pillar['pillar']} — {pillar['premise'][:90]}",
+                         expanded=index == 0):
+            for slot, topic in enumerate(pillar["topics"]):
+                with st.container(border=True):
+                    st.markdown(f"**{topic['hook_title']}**")
+                    st.caption(f"🧠 {topic['why_it_works']}")
+                    tags = topic.get("tags") or []
+                    st.markdown(
+                        badge(f"{len(tags)} tags", "cyan")
+                        + badge(f"{sum(len(t) for t in tags)}/{niche_engine.TAGS_TOTAL_LIMIT} chars",
+                                "green" if sum(len(t) for t in tags) <= niche_engine.TAGS_TOTAL_LIMIT
+                                else "amber"),
+                        unsafe_allow_html=True)
+                    _scout_topic_actions(topic, band, f"{index}_{slot}", allowed)
+
 MODE_SUBTITLES: dict[str, str] = {
     "commentary": "Drop a raw clip, let Gemini analyze the visual beats, and publish "
                   "high-retention editorial commentary.",
@@ -6045,6 +6408,8 @@ MODE_SUBTITLES: dict[str, str] = {
             "audience voting polls.",
     "atmosphere": "Synthesize multi-hour ambient soundscapes and publish directly to "
                   "YouTube with automated SEO.",
+    "scout": "Find a faceless niche worth entering, measure how crowded it is, and turn "
+             "it into a season of episodes.",
     "library": "Preview, download, reveal in explorer, and manage rendered media across "
                "all engines.",
     "admin": "Manage accounts, API keys and every workspace on this deployment.",
@@ -6058,6 +6423,7 @@ MODE_LABELS: dict[str, str] = {
     "reel": "🎬 Reel Studio",
     "duel": "⚔️ Versus Duel",
     "atmosphere": "🌙 Atmosphere Studio",
+    "scout": "🎯 Niche Scout",
     "library": "📁 Exports Library",
     "admin": "🛠️ Admin",
 }
@@ -6160,6 +6526,12 @@ def main() -> None:
 
     if mode == "library":
         render_exports_library()
+        return
+
+    # Research rather than production: no render card, no ETA, no guidance
+    # banner about how long a render takes.
+    if mode == "scout":
+        render_niche_scout()
         return
 
     # Every production page opens with the same three things: what this engine
