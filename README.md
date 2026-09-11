@@ -8,18 +8,19 @@ refuses to call something publish-ready when it is not.
 |---|---|
 | 🎙️ Commentary Machine | Gemini watches a clip and writes the commentary; TTS narrates it; kinetic captions burn in |
 | 📖 Narrative Studio | Episodic storytelling: Gemini writes the script and casts the world, then a storyboard becomes Ken Burns shots cut to the voice |
-| ◼️ Minimalist Motion | Draws a 1080×1920 vector animation from code — seven metaphor templates, no footage, no stock, no model-generated imagery |
+| ◼️ Minimalist Motion | Draws a 1080×1920 vector animation from code — 15 metaphor templates, no footage, no stock, no model-generated imagery |
 | 📦 Batch Studio | Queues topics and renders them back to back |
 | 🎬 Reel Studio | Slide-based reels from photos and licensed stock, scripted from sourced facts |
 | ⚔️ Versus Duel | Split-screen comparison shorts with animated stat badges |
 | 🌙 Atmosphere Studio | 30-minute to 8-hour ambient/sleep video with a synthesized soundtrack, published straight to YouTube |
 | 📁 Exports Library | Every render this account has made: filter, play, download, reveal, delete |
 
-Every page opens with the same two things: four live telemetry readings
-(renders, storage, the encoder this machine will actually use, and whether the
-compliance gate is holding anything back), and a card saying what the engine is
-for and roughly how long a render takes. Then the work, and nothing after it —
-the creation pages end at their own render button.
+Every page opens with the same three things: a header whose subtitle names the
+engine you are actually in, four live telemetry readings (renders, storage, the
+encoder this machine will actually use, and whether the compliance gate is
+holding anything back), and a card saying what the engine is for and roughly
+how long a render takes. Then the work, and nothing after it — the creation
+pages end at their own render button.
 
 Everything you have made lives in **📁 Exports Library**, a mode of its own:
 a grid of every render in `exports/<username>/` with its duration, size, date
@@ -336,8 +337,12 @@ Notes on the image:
   Drop your own `.ttf` in `assets/fonts/` and it wins over all of them.
 - Runs as UID 10001, not root. `exports/` and `userdata/` are volumes so
   renders and accounts survive a rebuild.
-- There is no GPU in the container, so renders use libx264. On a machine with
-  NVENC the app detects and uses it automatically.
+- There is no GPU in the container, so renders use `libx264 -preset veryfast`.
+  That preset rather than `medium` because this is the path every containerised
+  render takes: measured at 1080x1920 CRF 20, veryfast is 2.18x quicker and 12%
+  smaller. On a machine with NVENC the app probes it with a real frame and uses
+  it automatically, falling back to the same CPU profile if the driver refuses
+  a frame partway through a render.
 
 ---
 

@@ -185,7 +185,7 @@ html, body, .stApp, [class*="css"] {
 }
 
 #MainMenu, footer, header [data-testid="stStatusWidget"] { visibility: hidden; }
-.block-container { padding-top: 1.5rem; padding-bottom: 3rem; max-width: 1500px; }
+.block-container { padding-top: 3rem !important; padding-bottom: 3rem; max-width: 1500px; }
 
 h1, h2, h3, h4, h5 { font-family: 'Inter', sans-serif; color: var(--text-hi); letter-spacing: -0.022em; }
 h1 { font-weight: 800; }
@@ -203,7 +203,13 @@ p, span, label, li { color: var(--text-mid); }
     font-size: 21px; box-shadow: 0 8px 26px rgba(139, 92, 246, 0.42);
 }
 .rf-title {
-    font-size: 1.85rem; font-weight: 800; letter-spacing: -0.03em; line-height: 1.1;
+    /* line-height was 1.1, which is the whole clipping bug: at 1.85rem that is
+       a 32.6px line box around glyphs that need about 35.5px, and because the
+       fill is background-clip:text there is no ink outside the box to spill --
+       the ascenders were simply cut off. 1.3 plus an inline-block gives the
+       gradient a box big enough to paint the whole letterform. */
+    font-size: 1.85rem; font-weight: 800; letter-spacing: -0.03em; line-height: 1.3;
+    display: inline-block; padding-block: 2px;
     background: linear-gradient(92deg, #FFFFFF 8%, #C4B5FD 48%, #FBBF24 96%);
     -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
 }
@@ -3560,6 +3566,15 @@ def render_duel_studio() -> None:
                     st.success(f"Duel built — {len(st.session_state.slides)} slides. Render it in Export.")
                     st.rerun()
 
+    # The duel's script is the narration across its slides. Worth scoring for
+    # the same reason as any other: the opening hook decides the scroll.
+    spoken = " ".join(str(slide.get("voiceover") or "")
+                      for slide in st.session_state.get("slides") or []
+                      if str(slide.get("role") or "").startswith("duel"))
+    if spoken.strip():
+        entry = find_entry(user_exports(), str(st.session_state.get("duel_video_name") or ""))
+        render_viral_scorecard(spoken, scope="duel", entry=entry or {})
+
     show_rendered_video("duel", "Your Versus Duel", slot="duelstudio")
 
 
@@ -4238,14 +4253,6 @@ def run_batch_job(
 
 def render_batch_studio() -> None:
     """Queue several topics and render them one after another."""
-    st.markdown(
-        '<div class="rf-brand"><div class="rf-logo">📦</div>'
-        '<div><div class="rf-title">Batch Studio</div></div></div>'
-        '<div class="rf-sub">Queue topics, walk away, come back to finished vertical videos '
-        '— each one sourced, scripted, voiced and licence-logged.</div>',
-        unsafe_allow_html=True,
-    )
-
     queue: list[dict[str, Any]] = st.session_state.setdefault("batch_queue", [])
 
     with st.container(border=True):
@@ -4390,6 +4397,16 @@ def render_batch_studio() -> None:
                             st.markdown(f"- 🚫 {blocker}")
 
                     st.markdown(f"*{str(job['script'])[:220]}...*")
+
+                    # Each queued topic gets its own reading. A batch is where a
+                    # weak template does the most damage, because it ships ten
+                    # times before anyone reads one of them.
+                    render_viral_scorecard(
+                        str(job["script"]), scope=f"batch{index}",
+                        entry={"licence": str(job["licence"]),
+                               "duration": float(job["duration"] or 0.0),
+                               "tts_provider": str(job.get("tts_provider") or "edge"),
+                               "ai_disclosed": bool(job.get("ai_disclosed"))})
 
                     path = str(job["video_path"])
                     if os.path.exists(path):
@@ -6013,6 +6030,26 @@ def render_atmosphere_publisher() -> None:
             if uploaded.get("publish_at"):
                 st.caption(f"Goes public at {uploaded['publish_at']}.")
 
+MODE_SUBTITLES: dict[str, str] = {
+    "commentary": "Drop a raw clip, let Gemini analyze the visual beats, and publish "
+                  "high-retention editorial commentary.",
+    "minimalist": "Generate original, code-driven 2D vector psychology and finance "
+                  "metaphors with zero copyright risk.",
+    "narrative": "Produce multi-scene narrative shorts with consistent characters, "
+                 "dynamic drift, and cinematic pacing.",
+    "batch": "Queue video concepts in bulk and let ReelForge script, voice, and render "
+             "in the background.",
+    "reel": "Create hook-driven vertical listicles and fact reels with kinetic subtitles "
+            "and curated loops.",
+    "duel": "Build split-screen comparison duels with animated stat reveal meters and "
+            "audience voting polls.",
+    "atmosphere": "Synthesize multi-hour ambient soundscapes and publish directly to "
+                  "YouTube with automated SEO.",
+    "library": "Preview, download, reveal in explorer, and manage rendered media across "
+               "all engines.",
+    "admin": "Manage accounts, API keys and every workspace on this deployment.",
+}
+
 MODE_LABELS: dict[str, str] = {
     "commentary": "🎙️ Commentary Machine",
     "minimalist": "◼️ Minimalist Motion",
@@ -6035,19 +6072,27 @@ def main() -> None:
     # Housekeeping: clear stale render intermediates once per session.
     sweep_scratch_files()
 
+    role = auth.normalise_role(current_user().get("role"))
+    modes = list(auth.allowed_modes(role))
+
+    # The header is drawn before the sidebar, but the subtitle has to name the
+    # mode the sidebar is about to show. Streamlit writes a widget's value into
+    # session state *before* the rerun that follows a click, so by the time this
+    # line runs "app_mode" already holds the newly picked mode -- there is no
+    # need for a placeholder, and no one-rerun lag.
+    active = str(st.session_state.get("app_mode") or modes[0])
+    if active not in modes:
+        active = modes[0]
+
     st.markdown(
         '<div class="rf-brand"><div class="rf-logo">🎬</div>'
-        '<div><div class="rf-title">Reelforge Studio</div></div></div>'
-        '<div class="rf-sub">Drop a raw clip, let Gemini watch it and write the commentary, '
-        'then publish a narrated vertical short.</div>',
+        '<div><div class="rf-title">ReelForge Studio</div></div></div>'
+        f'<div class="rf-sub">{MODE_SUBTITLES.get(active, "")}</div>',
         unsafe_allow_html=True,
     )
 
     render_command_center()
     divider()
-
-    role = auth.normalise_role(current_user().get("role"))
-    modes = list(auth.allowed_modes(role))
 
     with st.sidebar:
         render_identity_bar()
