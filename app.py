@@ -73,6 +73,8 @@ from compliance import (
     MONETIZATION_NOTES,
 )
 import auth
+import ambient_engine
+import publisher
 import reel_engine
 from narrative_engine import (
     DEFAULT_AESTHETIC as NARRATIVE_DEFAULT_AESTHETIC,
@@ -849,6 +851,14 @@ MODE_GUIDES: dict[str, dict[str, Any]] = {
         "note": "Beats come from researched facts with sources attached, not from a "
                 "template with the nouns swapped.",
     },
+    "atmosphere": {
+        "badges": ["16:9 Horizontal", "30 min – 8 hours", "Original Soundscape"],
+        "niche": "Sleep, study and focus channels — rain, storms, brown noise, fire.",
+        "eta": "1-4 min",
+        "note": "Every audio layer is synthesized rather than licensed, and the loop "
+                "points are crossfaded, so there is nothing to claim and nothing to "
+                "click. Publishes straight to YouTube.",
+    },
     "duel": {
         "badges": ["9:16 Vertical", "Split Screen", "High RPM"],
         "niche": "Comparison content — cars, phones, watches. Strong comment sections.",
@@ -1577,6 +1587,28 @@ if "duel" not in st.session_state:
 # Narrative Studio keeps its wizard state here for the same reason Minimalist
 # Motion does: Streamlit drops the state of widgets it stops drawing, and an
 # episode is far too expensive to lose to a mode switch.
+# Atmosphere Studio keeps its own state for the same reason the other wizards
+# do: Streamlit drops the state of widgets it stops drawing, and a multi-hour
+# render is not something to lose to a mode switch.
+if "atmosphere" not in st.session_state:
+    st.session_state.atmosphere = {
+        "bed": next(iter(ambient_engine.PRIMARY_BEDS)),
+        "texture": "none",
+        "bed_volume": 1.0,
+        "texture_volume": 0.35,
+        "duration_key": ambient_engine.DEFAULT_DURATION,
+        "source_mode": "preset",
+        "preset": ambient_engine.DEFAULT_CANVAS,
+        "visual_source": "",
+        "drift": "cycle",
+        "grain": 6.0,
+        "vignette": True,
+        "result": None,
+        "render_path": "",
+        "meta": None,
+        "uploaded": None,
+    }
+
 if "narrative" not in st.session_state:
     st.session_state.narrative = {
         "topic": "",
@@ -5267,6 +5299,472 @@ def render_narrative_pack() -> None:
                     f"· {segment.get('image_provider', '')} · {segment['line']}"
                 )
 
+# ---------------------------------------------------------------------------
+# Atmosphere Studio
+#
+# Long-form ambient and sleep video, plus direct publishing to YouTube.
+# Entirely additive: the engine is ambient_engine, the uploader is publisher,
+# and neither is touched by any other mode.
+# ---------------------------------------------------------------------------
+
+def _at() -> dict[str, Any]:
+    """Atmosphere Studio's own state, kept out of the widget keys."""
+    return st.session_state.atmosphere
+
+
+def atmosphere_soundscape_name(state: dict[str, Any]) -> str:
+    """A human phrase for the current mix, used in filenames and SEO prompts."""
+    bed = ambient_engine.PRIMARY_BEDS.get(
+        str(state.get("bed")), {}).get("label", "Ambient")
+    # Strip the leading emoji the picker labels carry.
+    bed = bed.split(" ", 1)[-1] if " " in bed else bed
+
+    texture = str(state.get("texture") or "none")
+    if texture == "none":
+        return bed
+    tex = ambient_engine.SECONDARY_TEXTURES.get(texture, {}).get("label", "")
+    tex = tex.split(" ", 1)[-1] if " " in tex else tex
+    return f"{bed} with {tex}"
+
+
+def render_atmosphere_monetization() -> None:
+    """The guidance banner: what gets an ambient channel demonetized."""
+    with st.container(border=True):
+        st.markdown("#### 💰 Before you publish relaxation content")
+        st.caption("YouTube's Reused Content policy is enforced harder in this niche "
+                   "than almost any other. These are the specifics.")
+        for note in ambient_engine.MONETIZATION_NOTES:
+            st.markdown(f"- {note}")
+
+
+def render_atmosphere_studio() -> None:
+    """Soundscape → canvas → render → publish."""
+    state = _at()
+
+    # ---- Step 1: the soundscape -------------------------------------------
+    with st.container(border=True):
+        st.markdown("#### ① Soundscape")
+        st.caption("Every layer is synthesized here and now — nothing is a licensed "
+                   "loop, which is what keeps the audio your own work.")
+
+        beds = list(ambient_engine.PRIMARY_BEDS)
+        state["bed"] = pick(
+            "Primary bed", beds, state.get("bed", beds[0]), "at_bed",
+            format_func=lambda k: ambient_engine.PRIMARY_BEDS[k]["label"],
+        )
+        st.caption(ambient_engine.PRIMARY_BEDS[state["bed"]]["blurb"])
+
+        textures = list(ambient_engine.SECONDARY_TEXTURES)
+        state["texture"] = pick(
+            "Secondary texture", textures, state.get("texture", "none"), "at_texture",
+            format_func=lambda k: ambient_engine.SECONDARY_TEXTURES[k]["label"],
+        )
+        st.caption(ambient_engine.SECONDARY_TEXTURES[state["texture"]]["blurb"])
+
+        c1, c2 = st.columns(2)
+        with c1:
+            state["bed_volume"] = st.slider(
+                "Bed level", 0.2, 1.0, float(state.get("bed_volume", 1.0)), 0.05,
+                key="at_bedvol")
+        with c2:
+            state["texture_volume"] = st.slider(
+                "Texture level", 0.0, 1.0, float(state.get("texture_volume", 0.35)), 0.05,
+                key="at_texvol",
+                disabled=state["texture"] == "none",
+                help="Kept well under the bed by default. A texture you notice is a "
+                     "texture that wakes people up.")
+
+        durations = list(ambient_engine.DURATIONS)
+        state["duration_key"] = pick(
+            "Runtime", durations, state.get("duration_key", ambient_engine.DEFAULT_DURATION),
+            "at_duration",
+            format_func=lambda k: ambient_engine.DURATIONS[k]["label"],
+        )
+        st.caption(ambient_engine.DURATIONS[state["duration_key"]]["note"])
+
+        if st.button("🔊 Preview 20 seconds of this mix", key="at_preview",
+                     width="stretch"):
+            with st.spinner("Synthesizing a preview..."):
+                try:
+                    work = os.path.join(user_exports(), "atmosphere_preview")
+                    ensure_dir(work)
+                    state["preview_path"] = ambient_engine.render_preview(
+                        state["bed"], state["texture"], work,
+                        float(state["bed_volume"]), float(state["texture_volume"]))
+                except Exception as exc:
+                    st.error(f"Preview failed: `{type(exc).__name__}: {exc}`")
+
+        if state.get("preview_path") and os.path.exists(state["preview_path"]):
+            st.audio(state["preview_path"])
+            if state["texture"].startswith("drone_"):
+                st.caption("🎧 The binaural offset only exists between the two ears — "
+                           "on a speaker it collapses to one tone.")
+
+    # ---- Step 2: the canvas -----------------------------------------------
+    with st.container(border=True):
+        st.markdown("#### ② Visual canvas")
+        st.caption("16:9, 1920×1080. Slow drift and grain are added at render time. "
+                   "The sidebar's aspect, fit, FPS and transition controls belong to "
+                   "the short-form pipeline and are not read here — this mode fixes "
+                   "its own format.")
+
+        source_mode = pick(
+            "Background", ["preset", "upload"], state.get("source_mode", "preset"),
+            "at_srcmode",
+            format_func=lambda k: {"preset": "🎨 Drawn preset",
+                                   "upload": "⬆️ Upload image or loop"}[k],
+        )
+        state["source_mode"] = source_mode
+
+        if source_mode == "preset":
+            presets = list(ambient_engine.CANVAS_PRESETS)
+            state["preset"] = pick(
+                "Preset", presets, state.get("preset", ambient_engine.DEFAULT_CANVAS),
+                "at_preset",
+                format_func=lambda k: ambient_engine.CANVAS_PRESETS[k]["label"],
+            )
+            st.caption(ambient_engine.CANVAS_PRESETS[state["preset"]]["blurb"])
+            try:
+                work = os.path.join(user_exports(), "atmosphere_preview")
+                ensure_dir(work)
+                path = ambient_engine.build_canvas_preset(state["preset"], work)
+                state["visual_source"] = path
+                st.image(path, width="stretch")
+            except Exception as exc:
+                st.error(f"Could not draw that preset: `{type(exc).__name__}: {exc}`")
+        else:
+            upload = st.file_uploader(
+                "Background image or seamless video loop",
+                type=["jpg", "jpeg", "png", "webp", "mp4", "mov", "mkv", "webm"],
+                key="at_upload",
+                help="A 4K still is ideal — the zoom resamples from it, so more "
+                     "pixels than the output is exactly the headroom it wants.",
+            )
+            if upload is not None:
+                work = os.path.join(user_exports(), "atmosphere_preview")
+                ensure_dir(work)
+                path = os.path.join(work, f"upload_{upload.name}")
+                with open(path, "wb") as handle:
+                    handle.write(upload.getbuffer())
+                state["visual_source"] = path
+                if not ambient_engine.looks_like_video(path):
+                    st.image(path, width="stretch")
+                else:
+                    st.video(path)
+                    st.caption("A video loop keeps its own motion — the drift zoom is "
+                               "skipped, because zooming a moving plate reads as a mistake.")
+
+        m1, m2, m3 = st.columns(3)
+        with m1:
+            state["drift"] = pick(
+                "Drift", list(ambient_engine.DRIFT_MODES),
+                state.get("drift", "cycle"), "at_drift",
+                format_func=lambda k: ambient_engine.DRIFT_MODES[k],
+            )
+        with m2:
+            state["grain"] = st.slider("Grain", 0.0, 16.0,
+                                       float(state.get("grain", 6.0)), 1.0, key="at_grain")
+        with m3:
+            state["vignette"] = st.checkbox("Vignette",
+                                            value=bool(state.get("vignette", True)),
+                                            key="at_vignette")
+
+        seconds = float(ambient_engine.DURATIONS[state["duration_key"]]["seconds"])
+        if state["drift"] == "continuous" and seconds > 3600:
+            st.warning(
+                f"Continuous drift renders every frame of "
+                f"{seconds / 3600:.0f} hours — about "
+                f"{ambient_engine.estimate_render_seconds(seconds, 'continuous') / 3600:.1f} "
+                f"hours of encoding. The looping drift gives the same 1.00×–1.05× move "
+                f"in about a minute, and at this runtime the difference is a zoom of "
+                f"0.000002× per frame. Pick it unless you have a reason not to.",
+                icon="⏳",
+            )
+
+    # ---- Step 3: render ----------------------------------------------------
+    with st.container(border=True):
+        st.markdown("#### ③ Render")
+
+        seconds = float(ambient_engine.DURATIONS[state["duration_key"]]["seconds"])
+        estimate = ambient_engine.estimate_render_seconds(seconds, state["drift"])
+        gpu = ambient_engine.has_nvenc()
+        stat_row([
+            ("Runtime", ambient_engine.DURATIONS[state["duration_key"]]["label"], "cyan"),
+            ("Est. render", f"{estimate / 60:.0f} min" if estimate > 90
+             else f"{estimate:.0f}s", "amber"),
+            ("Encoder", "NVENC" if gpu else "libx264 (CPU)", "green" if gpu else ""),
+            ("Est. size", f"{seconds * 4.3 / 8 / 1024:.1f} GB"
+             if seconds * 4.3 / 8 / 1024 >= 1 else f"{seconds * 4.3 / 8:.0f} MB", ""),
+        ])
+
+        if not gpu:
+            st.caption("⚠️ No usable NVENC encoder was detected, so this will fall back "
+                       "to libx264. It still works; it is several times slower.")
+
+        if st.button("🌙 Render Atmosphere", type="primary", width="stretch",
+                     disabled=not state.get("visual_source")):
+            if not state.get("visual_source"):
+                st.error("Pick a background first.")
+            else:
+                tracker = StageProgress(label="Starting...")
+                status = st.empty()
+
+                def on_progress(fraction: float, message: str) -> None:
+                    tracker.update(fraction, message)
+                    status.markdown(f"**{message}**")
+
+                try:
+                    stamp = int(time.time())
+                    out_path = os.path.join(user_exports(), f"atmosphere_{stamp}.mp4")
+                    work = os.path.join(user_exports(), f"atmosphere_{stamp}_work")
+                    result = ambient_engine.render_atmosphere(
+                        bed=state["bed"], texture=state["texture"],
+                        visual_source=str(state["visual_source"]),
+                        duration_key=state["duration_key"],
+                        output_path=out_path, workspace=work,
+                        bed_volume=float(state["bed_volume"]),
+                        texture_volume=float(state["texture_volume"]),
+                        fps=ambient_engine.DEFAULT_FPS,
+                        drift=state["drift"], grain=float(state["grain"]),
+                        vignette=bool(state["vignette"]),
+                        progress=on_progress,
+                    )
+                except Exception as exc:
+                    tracker.empty()
+                    status.empty()
+                    st.error(f"**Render failed:** `{type(exc).__name__}: {exc}`")
+                    st.code(traceback.format_exc())
+                    st.stop()
+
+                elapsed = tracker.finish("Atmosphere complete.")
+                status.empty()
+
+                # The render is the user's own work outright: synthesized audio
+                # and either a drawn preset or their own upload.
+                try:
+                    entry = append_ledger(user_exports(), {
+                        "video_name": os.path.basename(out_path),
+                        "video_path": out_path,
+                        "duration": float(result["duration"]),
+                        "licence": "own" if state["source_mode"] == "preset" else "unverified",
+                        "licence_reference": "",
+                        "source_title": atmosphere_soundscape_name(state),
+                        "source_author": "", "source_url": "",
+                        "source_provider": "reelforge-ambient",
+                        "tts_provider": "none", "voice": "",
+                        "script_model": "", "ai_disclosed": True,
+                        "script": "", "template": "atmosphere",
+                    })
+                    state["entry_name"] = entry["video_name"]
+                except Exception:
+                    state["entry_name"] = os.path.basename(out_path)
+
+                state["result"] = result
+                state["render_path"] = out_path
+                notify_complete(
+                    "Atmosphere rendered",
+                    f"{result['duration_label']} — {result['size_bytes'] / 1_073_741_824:.2f} GB "
+                    f"in {elapsed / 60:.0f} min")
+                st.balloons()
+                st.rerun()
+
+        result = state.get("result")
+        if result and os.path.exists(str(state.get("render_path") or "")):
+            st.success(
+                f"{os.path.basename(state['render_path'])} — "
+                f"{result['duration'] / 3600:.2f} h, "
+                f"{result['size_bytes'] / 1_073_741_824:.2f} GB, "
+                f"{result['encoder']}, rendered in {result['render_seconds'] / 60:.1f} min",
+                icon="✅")
+            stat_row([
+                ("Audio loop", f"{result['loop_seconds']:.0f}s", "cyan"),
+                ("Seeds", str(result["variants"]), ""),
+                ("Loops", str(result["audio_loops"]), ""),
+                ("Drift", ambient_engine.DRIFT_MODES.get(result["drift"], "—"), "amber"),
+            ])
+            # A multi-gigabyte file is not something to push through the
+            # browser -- the path and the publisher are the way out.
+            st.caption(f"Saved to `{state['render_path']}`. Files this size are not "
+                       f"offered as a browser download; publish it below or copy it "
+                       f"from disk.")
+
+    # ---- Step 4: publish ---------------------------------------------------
+    render_atmosphere_publisher()
+    render_atmosphere_monetization()
+
+
+def render_atmosphere_publisher() -> None:
+    """Authorize a channel, write the metadata, upload."""
+    state = _at()
+    path = str(state.get("render_path") or "")
+
+    with st.expander("④ 📺 Publish to YouTube", expanded=bool(path)):
+        status = publisher.account_status()
+
+        # --- connection ----------------------------------------------------
+        if status["connected"]:
+            st.markdown(
+                badge("channel connected", "green")
+                + badge(status["channel"] or "authorized", "cyan"),
+                unsafe_allow_html=True)
+            if st.button("Disconnect this channel", key="at_disconnect"):
+                publisher.forget_channel()
+                st.rerun()
+        else:
+            st.markdown(badge("not connected", "amber"), unsafe_allow_html=True)
+            if status["error"]:
+                st.error(status["error"])
+
+            st.caption(
+                "One-time setup: in Google Cloud Console create a project, enable "
+                "**YouTube Data API v3**, then create an **OAuth client ID** of type "
+                "**Desktop app** and upload the JSON it gives you."
+            )
+            secret = st.file_uploader("client_secrets.json", type=["json"],
+                                      key="at_secret")
+            if secret is not None:
+                try:
+                    publisher.save_client_secrets(secret.getvalue())
+                    st.success("Client secret stored in `.secrets/` (gitignored).")
+                except publisher.PublishError as exc:
+                    st.error(str(exc))
+
+            if publisher.has_client_secrets():
+                st.caption("Authorizing opens a Google consent page in a browser on "
+                           "**this machine**. Over a tunnel or on a headless server "
+                           "that will not work — generate the token locally and copy "
+                           "`.secrets/youtube_token.json` across.")
+                if st.button("🔐 Authorize channel", key="at_authorize", type="primary"):
+                    with st.spinner("Waiting for Google consent in your browser..."):
+                        try:
+                            publisher.authorize()
+                            st.success("Channel authorized.")
+                            st.rerun()
+                        except publisher.PublishError as exc:
+                            st.error(str(exc))
+
+        if not path:
+            st.info("Render something first and the uploader will open here.", icon="🎬")
+            return
+
+        divider()
+
+        # --- metadata -------------------------------------------------------
+        soundscape = atmosphere_soundscape_name(state)
+        seconds = float((state.get("result") or {}).get("duration") or 0.0)
+
+        if st.button("✨ Auto-Generate High-CTR Title & Description",
+                     key="at_seo", width="stretch"):
+            with st.spinner("Writing for search intent..."):
+                try:
+                    meta = publisher.generate_seo(soundscape, seconds)
+                except Exception as exc:
+                    st.warning(f"Gemini unavailable ({type(exc).__name__}); using the "
+                               f"offline template instead.")
+                    meta = publisher.fallback_seo(soundscape, seconds)
+                state["meta"] = meta
+                st.rerun()
+
+        meta = state.get("meta") or publisher.fallback_seo(soundscape, seconds)
+        if state.get("meta"):
+            st.caption(f"Written by {meta.get('model', '?')}")
+
+        title = st.text_input("Title", value=meta["title"], key="at_title",
+                              max_chars=publisher.TITLE_LIMIT)
+        description = st.text_area("Description", value=meta["description"],
+                                   height=200, key="at_desc")
+        tags_raw = st.text_area("Tags (comma separated)",
+                                value=", ".join(meta["tags"]), height=80, key="at_tags")
+        tags = publisher.parse_tags(tags_raw)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            category = st.selectbox(
+                "Category", list(publisher.CATEGORIES),
+                index=list(publisher.CATEGORIES).index(publisher.DEFAULT_CATEGORY),
+                format_func=lambda k: f"{k} · {publisher.CATEGORIES[k]}",
+                key="at_category")
+        with c2:
+            privacy = st.selectbox(
+                "Privacy", list(publisher.PRIVACY_STATUSES),
+                index=list(publisher.PRIVACY_STATUSES).index(publisher.DEFAULT_PRIVACY),
+                format_func=lambda k: publisher.PRIVACY_STATUSES[k],
+                key="at_privacy")
+
+        publish_at = ""
+        if privacy == "scheduled":
+            import datetime as _dt
+
+            d1, d2 = st.columns(2)
+            with d1:
+                when_date = st.date_input(
+                    "Publish date",
+                    value=_dt.date.today() + _dt.timedelta(days=1), key="at_date")
+            with d2:
+                when_time = st.time_input("Publish time (your local time)",
+                                          value=_dt.time(20, 0), key="at_time")
+            publish_at = publisher.to_rfc3339(
+                _dt.datetime.combine(when_date, when_time))
+            st.caption(f"Sent to YouTube as `{publish_at}` — it stays private until then.")
+
+        notify = st.checkbox("Notify subscribers", value=True, key="at_notify")
+
+        problems = publisher.validate_metadata(title, description, tags)
+        counts = (f"title {len(title)}/{publisher.TITLE_LIMIT} · "
+                  f"description {len(description)}/{publisher.DESCRIPTION_LIMIT} · "
+                  f"tags {sum(len(t) for t in tags)}/{publisher.TAGS_TOTAL_LIMIT}")
+        st.caption(counts)
+        for problem in problems:
+            st.error(problem, icon="🚫")
+
+        size_gb = os.path.getsize(path) / 1_073_741_824 if os.path.exists(path) else 0.0
+        ready = status["connected"] and not problems and os.path.exists(path)
+
+        if st.button(f"🚀 Upload {size_gb:.2f} GB to YouTube", key="at_upload_go",
+                     type="primary", width="stretch", disabled=not ready):
+            tracker = StageProgress(label="Preparing upload...")
+            line = st.empty()
+
+            def on_progress(fraction: float, message: str) -> None:
+                # A negative fraction is a retry notice, not progress.
+                if fraction >= 0:
+                    tracker.update(fraction, message)
+                line.markdown(f"**{message}**")
+
+            try:
+                uploaded = publisher.upload_video(
+                    path, title=title, description=description, tags=tags,
+                    category_id=category, privacy=privacy, publish_at=publish_at,
+                    notify_subscribers=notify, progress=on_progress,
+                )
+            except publisher.PublishError as exc:
+                tracker.empty()
+                line.empty()
+                st.error(str(exc), icon="🚫")
+                return
+            except Exception as exc:
+                tracker.empty()
+                line.empty()
+                st.error(f"**Upload failed:** `{type(exc).__name__}: {exc}`")
+                st.code(traceback.format_exc())
+                return
+
+            tracker.finish("Uploaded.")
+            line.empty()
+            state["uploaded"] = uploaded
+            notify_complete("Upload complete", f"{title[:60]} is on YouTube")
+            st.rerun()
+
+        uploaded = state.get("uploaded")
+        if uploaded:
+            st.success(
+                f"Uploaded as **{uploaded['privacy']}** in "
+                f"{uploaded['seconds'] / 60:.1f} min — {uploaded['url']}", icon="✅")
+            st.markdown(f"[Open the video]({uploaded['url']}) · "
+                        f"[Edit in Studio]({uploaded['studio_url']})")
+            if uploaded.get("publish_at"):
+                st.caption(f"Goes public at {uploaded['publish_at']}.")
+
 MODE_LABELS: dict[str, str] = {
     "commentary": "🎙️ Commentary Machine",
     "minimalist": "◼️ Minimalist Motion",
@@ -5274,6 +5772,7 @@ MODE_LABELS: dict[str, str] = {
     "batch": "📦 Batch Studio",
     "reel": "🎬 Reel Studio",
     "duel": "⚔️ Versus Duel",
+    "atmosphere": "🌙 Atmosphere Studio",
     "admin": "🛠️ Admin",
 }
 
@@ -5378,6 +5877,8 @@ def main() -> None:
         render_narrative_studio()
     elif mode == "batch":
         render_batch_studio()
+    elif mode == "atmosphere":
+        render_atmosphere_studio()
     else:
         if mode == "duel":
             tabs = st.tabs(["⚔️ Versus Duel", "🖼️ Slide Studio", "🎵 Audio", "👁️ Preview", "🚀 Export"])

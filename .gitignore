@@ -12,6 +12,14 @@
 secrets.json
 credentials.json
 
+# OAuth material for the YouTube publisher: the client secret downloaded from
+# Google Cloud Console and the refresh token written after authorizing. The
+# refresh token is a long-lived credential that can upload to the channel
+# until it is revoked -- committing it hands that away.
+.secrets/
+client_secrets.json
+*token.json
+
 # The user store. Holds PBKDF2 password hashes -- not plaintext, but a hash
 # file is still a target list, and committing it would publish who has access.
 # Ship users.example.json instead and let each deployment create its own.

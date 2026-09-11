@@ -28,7 +28,13 @@ from audio_engine import generate_synth_music, save_wav_to_file
 # sub-frame and cannot be seen or heard. The engines aim for 0.00s.
 SYNC_TOLERANCE = 0.05
 
-ALL_MODES = ("commentary", "minimalist", "narrative", "batch", "reel", "duel", "admin")
+# Every mode the app offers. This list is deliberately hardcoded rather than
+# read from app.MODE_LABELS: its job is to fail when a mode is added, so that
+# adding one forces a guidance card and a role entry to be added with it.
+# "atmosphere" was appended when Atmosphere Studio landed, and the two tests
+# below then re-asserted that it has both.
+ALL_MODES = ("commentary", "minimalist", "narrative", "batch", "reel", "duel",
+             "atmosphere", "admin")
 
 
 def av_offset(path: str) -> tuple[float, float, float]:

@@ -45,7 +45,7 @@ ROLES: dict[str, dict[str, Any]] = {
         "label": "Admin",
         "blurb": "Every engine, the API configuration and user management.",
         "modes": ("commentary", "minimalist", "narrative", "batch", "reel",
-                  "duel", "admin"),
+                  "duel", "atmosphere", "admin"),
         "manage_users": True,
         "manage_keys": True,
     },

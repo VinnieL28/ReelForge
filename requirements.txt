@@ -22,10 +22,16 @@ python-dotenv==1.2.3       # loads GEMINI_API_KEY / PEXELS_API_KEY from .env
 yt-dlp==2026.8.19          # TikTok / Reels / Shorts ingestion
 requests==2.34.2           # Pexels and Wikimedia Commons lookups
 
+# Atmosphere Studio's YouTube publisher. Only imported by publisher.py, so the
+# other six modes run without them installed.
+google-auth-oauthlib==1.4.1        # the installed-app OAuth 2.0 flow
+google-api-python-client==2.200.0  # YouTube Data API v3, resumable upload
+
 # Tests only. Not imported by the app, not needed to render anything.
 pytest==9.1.1              # pytest tests/
 
 # Authentication adds nothing: hashlib (PBKDF2-HMAC-SHA256), hmac, secrets and
 # json are all standard library. Verified against the imports in every module --
 # the eleven runtime pins above are exactly the eleven third-party packages the
-# app imports; pytest is the twelfth and is test-only.
+# app imports, plus the two google-api packages that only Atmosphere Studio's
+# publisher touches; pytest is test-only.

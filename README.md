@@ -1,8 +1,8 @@
 # ReelForge Studio
 
-A private, multi-user short-form video workshop. Five generation engines behind
-a login, each render sandboxed to the account that made it, and a compliance
-gate that refuses to call something publish-ready when it is not.
+A private, multi-user video workshop. Seven generation engines behind a login,
+each render sandboxed to the account that made it, and a compliance gate that
+refuses to call something publish-ready when it is not.
 
 | Engine | What it does |
 |---|---|
@@ -12,6 +12,7 @@ gate that refuses to call something publish-ready when it is not.
 | 📦 Batch Studio | Queues topics and renders them back to back |
 | 🎬 Reel Studio | Slide-based reels from photos and licensed stock, scripted from sourced facts |
 | ⚔️ Versus Duel | Split-screen comparison shorts with animated stat badges |
+| 🌙 Atmosphere Studio | 30-minute to 8-hour ambient/sleep video with a synthesized soundtrack, published straight to YouTube |
 
 Every page opens with the same three things: four live telemetry readings
 (renders, storage, the encoder this machine will actually use, and whether the
@@ -140,6 +141,88 @@ to ~45px, and a faint atmosphere reaching 140px. One pass is either a tight rim
 or a wide wash and cannot be both, which is what makes single-pass bloom look
 like a filter. Behind it all sits a faint grid that pulses outward from the
 impact, and slow motes drifting up through the frame.
+
+---
+
+## Atmosphere Studio
+
+Long-form ambient and sleep video — 16:9, 30 minutes to 8 hours — with an
+originally synthesized soundtrack and a one-click upload to YouTube.
+
+| Layer | Options |
+|---|---|
+| **Primary bed** | Rain on Window · Heavy Thunderstorm · Deep Brown Noise · Gentle Stream · Crackling Fireplace |
+| **Secondary texture** | Distant Thunder · Soft Room Wind · Night Crickets · Binaural Drone 432Hz / 528Hz |
+| **Canvas** | Five drawn presets, or your own 4K still or seamless video loop |
+| **Runtime** | 60s test render · 30 min · 1 hour · 3 hours · 8 hours |
+
+**Nothing is a stock loop.** Every layer is synthesized in numpy for each
+render — filtered noise for the beds, scattered transients for droplets,
+crackles and cricket chirps, and a genuinely stereo drone whose whole effect is
+the few-Hz difference between the ears. That matters commercially, not just
+aesthetically: this niche is where YouTube's Reused Content policy is enforced
+hardest, and "the same purchased loop for eight hours" is the example it names.
+
+**The seams are the product.** A loop that clicks once every two minutes is
+worse than no loop at all, because the listener is asleep and the click wakes
+them. Three different seeds are synthesized, each made continuous at its own
+wrap point with an equal-power crossfade, then chained with `acrossfade` into a
+two-minute super-loop and repeated with `aloop`. Measured on the finished AAC:
+the step at the loop point is **0.95×** the size of an ordinary sample-to-sample
+step — i.e. smaller than the signal around it, which is why it cannot be heard.
+
+### Why an eight-hour render takes minutes
+
+An 8-hour video at 24fps is 691,200 frames. Nothing can touch them all.
+
+- **Audio is synthesized short and looped long.** Eight hours of rain costs the
+  same as two minutes of it.
+- **Video is rendered short and looped long.** The drift zoom follows a raised
+  cosine — 1.00× at both ends, 1.05× in the middle — so a ten-minute segment
+  joins to itself exactly and is stream-copied for the rest of the timeline.
+  Verified geometrically: the last frame returns to **1.0007×**.
+- **The mux is a stream copy.** Both tracks are already in their final codecs.
+
+A true monotonic 1.00×–1.05× push over the whole runtime is offered as
+*Continuous drift* and is honest about the cost — at eight hours it is about an
+hour of encoding, for a zoom of 0.000002× per frame that nobody can see.
+
+Two performance findings, both measured rather than assumed:
+
+- **ffmpeg's `vignette` was 60% of the render** — 195 fps without it, 82 with,
+  and `eval=init` changes nothing. It is now baked into the canvas once with
+  PIL, which is visually identical at this zoom range.
+- **zoompan, not NVENC, is the limit.** The encoder was never the bottleneck,
+  so the NVENC profile is chosen for quality (`p4`, `-tune hq`, 4Mbps with an
+  8Mbit buffer) rather than for speed. libx264 is the automatic fallback.
+
+### Publishing to YouTube
+
+One-time setup: in Google Cloud Console create a project, enable **YouTube Data
+API v3**, create an **OAuth client ID** of type **Desktop app**, and upload the
+JSON in Step 4.
+
+```
+.secrets/client_secrets.json   the OAuth client   (gitignored)
+.secrets/youtube_token.json    the refresh token  (gitignored)
+```
+
+- **Upload-only scope.** `youtube.upload` and nothing else — no read or write
+  access to comments, playlists or the channel itself.
+- **Resumable, chunked upload.** A three-hour render is several gigabytes; a
+  single held-open request will fail, and when it does a retry costs one 8MB
+  chunk rather than the whole file.
+- **Private by default.** Going public is a deliberate choice. A *scheduled*
+  upload is forced to `private` first, because `publishAt` is only honoured on
+  a private video — send it with `public` and YouTube ignores the date and
+  publishes immediately.
+- **✨ Auto-Generate** writes the title, description and tags with Gemini,
+  aimed at what this audience actually types at 1am. There is an offline
+  template when no key is configured.
+
+Authorization opens a Google consent page in a browser **on the machine running
+Streamlit**. Over a tunnel or on a headless box, generate the token locally and
+copy `.secrets/youtube_token.json` across.
 
 ---
 
@@ -288,6 +371,8 @@ minimalist_engine.py  the vector animation engine (Minimalist Motion)
 vector_rig.py     the stick-figure rig: ten poses, a two-segment torso,
                   solved by forward kinematics
 duel_engine.py    the Versus Duel: split panels, stat cards, the winner reveal
+ambient_engine.py the Atmosphere soundscape synthesizer and visual canvas
+publisher.py      YouTube Data API v3: OAuth, resumable upload, SEO metadata
 reel_engine.py    domain detection, the fact bank, fact-carrying scripts
 video_engine.py   reframing, looping, captions, encoding, the Gemini pre-flight
 audio_engine.py   TTS, synthesized music beds, SFX, ducking
