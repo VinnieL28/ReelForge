@@ -351,3 +351,76 @@ def duration_chip(seconds: float) -> str:
     if value >= 10:
         return f"{value:.0f}s"
     return f"{value:.1f}s"
+
+
+# ---------------------------------------------------------------------------
+# Tiers and render credits
+#
+# Derived from the account's own finished renders this calendar month rather
+# than stored as a number somewhere, because a stored counter and a folder full
+# of videos disagree the first time anything goes wrong -- and the folder is
+# the one telling the truth.
+#
+# Display only. Nothing here blocks a render: a tool that refuses to work
+# because a number says so needs a billing system behind it to be honest, and
+# there is not one.
+# ---------------------------------------------------------------------------
+
+TIERS: dict[str, dict[str, Any]] = {
+    "free": {"label": "Free", "quota": 50},
+    "pro": {"label": "Pro", "quota": 500},
+    "studio": {"label": "Studio", "quota": 2000},
+}
+DEFAULT_TIER = "pro"
+
+# Files that are not finished work. Mirrors app.SCRATCH_PREFIXES; kept here so
+# this module does not import the app.
+_SCRATCH = ("source_", "muted_", "reframed_", "narration_", "music_", "preview_")
+
+
+def tier_of(user: Any) -> str:
+    """The tier on an account record, defaulting rather than failing."""
+    record = user if isinstance(user, dict) else {}
+    name = str(record.get("tier") or DEFAULT_TIER).strip().lower()
+    return name if name in TIERS else DEFAULT_TIER
+
+
+def renders_this_month(root: str, now: float | None = None) -> int:
+    """Finished renders in `root` whose mtime falls in the current month."""
+    import os
+    import time
+
+    stamp = time.localtime(now if now is not None else time.time())
+    year, month = stamp.tm_year, stamp.tm_mon
+
+    count = 0
+    if not os.path.isdir(root):
+        return 0
+    for entry in os.scandir(root):
+        name = entry.name.lower()
+        if not entry.is_file() or not name.endswith(".mp4"):
+            continue
+        if name.startswith(_SCRATCH) or name.endswith("_gemini.mp4"):
+            continue
+        try:
+            made = time.localtime(entry.stat().st_mtime)
+        except OSError:
+            continue
+        if (made.tm_year, made.tm_mon) == (year, month):
+            count += 1
+    return count
+
+
+def credit_status(root: str, user: Any = None, now: float | None = None) -> dict[str, Any]:
+    """{"tier", "tier_label", "quota", "used", "remaining"} for the status pill."""
+    tier = tier_of(user)
+    spec = TIERS[tier]
+    quota = int(spec["quota"])
+    used = renders_this_month(root, now)
+    return {
+        "tier": tier,
+        "tier_label": str(spec["label"]),
+        "quota": quota,
+        "used": used,
+        "remaining": max(0, quota - used),
+    }

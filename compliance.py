@@ -464,6 +464,23 @@ HOOK_SECONDS = 3.0
 # At roughly 2.75 words per second, three seconds of speech is about nine words.
 HOOK_WORDS = 9
 
+# An opening with none of the measured signals in it. Not a midpoint and not a
+# passing mark: it is what "states the topic and nothing more" is worth in a
+# feed where the scroll is decided in three seconds.
+HOOK_FLOOR = 2.0
+
+# A first sentence this long or shorter has finished speaking inside the first
+# three seconds at a normal narration pace.
+HOOK_SENTENCE_WORDS = 12
+
+# Above this the card reads as workable rather than broken. Distinct from
+# VIRAL_TARGET_SCORE, which is the bar for publishing.
+WORKABLE_SCORE = 6.5
+
+# Below this the monetization axis is not a weakness, it is a blocker: a
+# licence that is not cleared, or narration too thin to read as transformative.
+MONETIZATION_FLOOR = 6.0
+
 # Openings that state a subject instead of opening a loop. Every one of these
 # is a sentence the viewer has heard before, which is the problem.
 _WEAK_HOOK_OPENERS = (
@@ -567,35 +584,55 @@ def score_hook(script: str) -> dict[str, Any]:
     opening = " ".join(words[:HOOK_WORDS])
     low = opening.lower()
     notes: list[str] = []
-    score = 5.0
+
+    # Built from evidence rather than adjusted away from a neutral midpoint.
+    # The midpoint start was the bug: a hook with nothing measurable in it came
+    # back a 5, which reads as "average" when what it actually means is "this
+    # opening gives no one a reason to stay". An opening earns its score.
+    score = HOOK_FLOOR
+    diagnosis: list[str] = []
 
     weak = next((p for p in _WEAK_HOOK_OPENERS if low.startswith(p) or f" {p}" in f" {low}"), "")
     if weak:
-        score -= 2.5
+        score -= 2.0
         notes.append(f'Opens with "{weak}" -- that announces a topic instead of opening a loop.')
+        diagnosis.append("weak_opener")
 
     tokens = _concrete_tokens(opening)
     if tokens["numbers"] or tokens["units"]:
-        score += 1.5
+        score += 2.0
         notes.append("Leads with a specific figure, which is a reason to keep watching.")
+    else:
+        diagnosis.append("no_figure")
+
     if any(sig in low for sig in _STRONG_HOOK_SIGNALS):
-        score += 1.5
+        score += 2.2
         notes.append("Opens on a contradiction or a stake rather than a subject.")
+    else:
+        diagnosis.append("no_stake")
+
     if "?" in opening:
-        score += 0.5
+        score += 0.8
         notes.append("Poses a question in the first breath.")
+    if tokens["propers"]:
+        score += 0.6
+        notes.append("Names something specific in the opening line.")
 
     # A hook that takes twenty words to arrive has already lost the scroll.
     first_sentence = re.split(r"(?<=[.!?])\s", str(script).strip())[0]
-    if len(_words(first_sentence)) > 18:
+    opening_words = len(_words(first_sentence))
+    if opening_words <= HOOK_SENTENCE_WORDS:
+        score += 1.8
+        notes.append(f"The first sentence lands in {opening_words} words, inside the "
+                     "three seconds the scroll is decided in.")
+    elif opening_words > 18:
         score -= 1.0
-        notes.append(f"The first sentence runs {len(_words(first_sentence))} words -- "
+        notes.append(f"The first sentence runs {opening_words} words -- "
                      "it lands after the scroll decision is made.")
+        diagnosis.append("slow_open")
 
-    if not notes:
-        notes.append("Neither strong nor weak: it states the topic clearly and nothing more.")
-
-    return {"score": max(1.0, min(10.0, score)), "opening": opening, "notes": notes}
+    return {"score": max(1.0, min(10.0, score)), "opening": opening, "notes": notes,
+            "diagnosis": diagnosis, "opening_words": opening_words}
 
 
 def score_density(script: str) -> dict[str, Any]:
@@ -694,6 +731,95 @@ def score_monetization(entry: dict[str, Any], script: str = "") -> dict[str, Any
     return {"score": max(1.0, min(10.0, score)), "notes": notes}
 
 
+# What each axis being the weakest actually means, in the words the verdict
+# uses. Kept beside the verdict so the two cannot drift apart.
+_AXIS_FAULTS = {
+    "hook": "the first three seconds do not open a loop",
+    "density": "the script has too little in it",
+    "monetization": "it will not survive monetization review",
+}
+
+
+def weakest_axis(card: dict[str, Any]) -> str:
+    """The axis dragging the card down, by name."""
+    return min(_AXIS_FAULTS, key=lambda axis: float(
+        (card.get(axis) or {}).get("score", 10.0)))
+
+
+def verdict_for(overall: float, card: dict[str, Any]) -> str:
+    """
+    One line on what the number means.
+
+    Shared by the offline card and the model-led one so a score of 7.4 never
+    reads as "workable" on one path and "not ready" on the other.
+    """
+    axis = weakest_axis(card)
+    fault = _AXIS_FAULTS[axis]
+
+    if overall >= 8.5:
+        return "Strong on all three axes."
+    if overall >= VIRAL_TARGET_SCORE:
+        return "Good enough to publish."
+    if overall >= WORKABLE_SCORE:
+        return f"Workable, but {fault}."
+    return f"Not ready: {fault}."
+
+
+def retention_tip(hook: dict[str, Any], density: dict[str, Any],
+                  money: dict[str, Any]) -> str:
+    """
+    One sentence naming the single change that buys the most retention.
+
+    Derived from the same measurements the axes are scored on, so it can point
+    at the actual phrase or the actual missing figure rather than saying "add
+    more detail". Ordered by what costs the most viewers: the first three
+    seconds outrank everything, because nothing later in the video recovers a
+    scroll that already happened.
+    """
+    marks = set(hook.get("diagnosis") or ())
+    opening = str(hook.get("opening") or "").strip()
+
+    if "weak_opener" in marks:
+        return (f'Delete the throat-clearing from "{opening[:48]}" and open on the '
+                f'hardest fact in the script -- the viewer decides before you '
+                f'finish announcing the topic.')
+
+    if "slow_open" in marks:
+        return (f'Your first sentence runs {hook.get("opening_words", 0)} words; cut it '
+                f'to twelve or fewer so the hook finishes speaking before the three '
+                f'second scroll decision.')
+
+    if "no_figure" in marks and "no_stake" in marks:
+        return ("Put a number, a date or a named thing in the first nine words -- the "
+                "opening currently states a subject and gives no reason to stay for "
+                "the second sentence.")
+
+    if "no_stake" in marks:
+        return ("Reframe the opening as a contradiction of what the viewer already "
+                "believes rather than a statement of the topic, so the first three "
+                "seconds open a loop instead of closing one.")
+
+    filler = list(density.get("filler_hits") or ())
+    if filler:
+        shown = ", ".join(f'"{p}"' for p in filler[:2])
+        return (f"Cut {shown} and spend the seconds on a checkable figure instead; "
+                f"filler in the first third is where the retention curve bends.")
+
+    covered = float(density.get("covered") or 0.0)
+    if covered < 0.6:
+        return (f"Only {covered * 100:.0f}% of your sentences carry something checkable "
+                f"-- give the two emptiest sentences a figure each, or cut them and "
+                f"reach the payoff sooner.")
+
+    if float(money.get("score") or 0.0) < 6.0:
+        return ("Fix the monetization flag before retention: a video that cannot be "
+                "monetized does not benefit from a better hook.")
+
+    return (f'Hold "{opening[:40]}" as the opening and cut any sentence before the '
+            f'first figure -- the hook is working, so the only thing left to buy is '
+            f'getting to the payoff faster.')
+
+
 def viral_scorecard(script: str, entry: dict[str, Any] | None = None) -> dict[str, Any]:
     """
     The full 1-10 scorecard.
@@ -712,23 +838,18 @@ def viral_scorecard(script: str, entry: dict[str, Any] | None = None) -> dict[st
 
     overall = round(hook["score"] * 0.45 + density["score"] * 0.35 + money["score"] * 0.20, 1)
 
-    # Name the axis that is actually dragging, rather than blaming the hook for
-    # a licensing problem.
-    weakest = min(
-        (("hook", hook["score"], "the first three seconds do not open a loop"),
-         ("density", density["score"], "the script has too little in it"),
-         ("monetization", money["score"], "it will not survive monetization review")),
-        key=lambda item: item[1],
-    )
+    # A monetization failure is categorical, not a weighted contribution. A
+    # researched script over uncleared footage used to average out to exactly
+    # 8.0 and report "good enough to publish" -- of something that cannot be
+    # monetized at all. The ceiling is derived from the failing axis rather
+    # than being a fixed number, so the card still moves as the problem is
+    # fixed instead of parking on one value.
+    if money["score"] < MONETIZATION_FLOOR:
+        overall = round(min(overall, money["score"] + 2.0), 1)
 
-    if overall >= 8.5:
-        verdict = "Strong on all three axes."
-    elif overall >= VIRAL_TARGET_SCORE:
-        verdict = "Good enough to publish."
-    elif overall >= 6.0:
-        verdict = f"Workable, but {weakest[2]}."
-    else:
-        verdict = f"Not ready: {weakest[2]}."
+    weakest = weakest_axis({"hook": hook, "density": density, "monetization": money})
+    verdict = verdict_for(overall, {"hook": hook, "density": density,
+                                    "monetization": money})
 
     return {
         "overall": overall,
@@ -736,7 +857,8 @@ def viral_scorecard(script: str, entry: dict[str, Any] | None = None) -> dict[st
         "density": density,
         "monetization": money,
         "verdict": verdict,
-        "weakest": weakest[0],
+        "weakest": weakest,
+        "retention_tip": retention_tip(hook, density, money),
         "needs_rewrite": overall < VIRAL_TARGET_SCORE,
         "source": "heuristic",
     }

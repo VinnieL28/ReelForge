@@ -132,12 +132,12 @@ class TestNavigation:
 
     def test_the_groups_are_named_as_specified(self):
         headings = [heading for heading, _ in app.NAV_GROUPS if heading]
-        assert headings == ["Creation Engines", "Tools & Library"]
+        assert headings == ["Creation Engines", "Tools & Strategy"]
 
     def test_nothing_that_renders_is_filed_under_tools(self):
         from test_modes import NON_PRODUCTION_MODES
 
-        tools = dict((h, g) for h, g in app.NAV_GROUPS)["Tools & Library"]
+        tools = dict((h, g) for h, g in app.NAV_GROUPS)["Tools & Strategy"]
         for mode in tools:
             assert mode in NON_PRODUCTION_MODES, f"{mode} renders but is filed as a tool"
 
@@ -346,8 +346,17 @@ def test_the_app_lands_on_the_dashboard_and_the_cards_route(tmp_path, monkeypatc
     opens = [button for button in at.button if (button.key or "").startswith("open_")]
     assert len(opens) == len(dv.ENGINES), "the engine grid is not fully drawn"
 
-    # Exactly one purge button: a second KPI bar would collide on its key.
-    assert sum(1 for b in at.button if (b.key or "") == "purge_scratch") == 1
+    # Developer telemetry is not on the page a customer lands on.
+    assert not [b for b in at.button if (b.key or "") == "purge_scratch"], (
+        "the scratch purge is still on the consumer dashboard")
+
+    # ...but it is still reachable, in Admin, where it belongs.
+    at.session_state["app_mode"] = "admin"
+    at.run()
+    assert [b for b in at.button if (b.key or "") == "purge_scratch"], (
+        "the scratch purge did not move to Admin, it just disappeared")
+    at.session_state["app_mode"] = "dashboard"
+    at.run()
 
     at.button(key="open_atmosphere").click().run()
     assert at.session_state["app_mode"] == "atmosphere", "the card did not route"

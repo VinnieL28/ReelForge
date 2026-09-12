@@ -64,14 +64,33 @@ DURATION_TARGETS: dict[str, dict[str, Any]] = {
     },
     # TikTok's Creator Rewards programme only counts videos over one minute, so
     # nothing shorter than this can earn there however well it performs.
+    #
+    # The floor is 62 seconds rather than 60 on purpose. TTS pacing lands
+    # within a few percent of the word budget, not on it, so a script written
+    # to exactly 60 seconds renders somewhere either side of the bar and about
+    # half of those earn nothing. Two seconds of margin costs nothing and makes
+    # the eligibility deterministic.
     "rewards": {
-        "label": "70–90s · TikTok Rewards eligible (over 1 min)",
+        "label": "62–75s · TikTok Rewards eligible (over 1 min)",
+        "low": 62, "high": 75,
+        "body": ("8-11 vivid sentences that build a full story arc: set the scene, "
+                 "raise the stakes, deliver a turn, then land the payoff"),
+    },
+    "long": {
+        "label": "70–90s · Extended story",
         "low": 70, "high": 90,
         "body": ("9-12 vivid sentences that build a full story arc: set the scene, "
                  "raise the stakes, deliver a turn, then land the payoff"),
     },
 }
-DEFAULT_TARGET = "standard"
+
+# Monetization-eligible by default. Every other band renders something TikTok
+# Creator Rewards will not pay for, which is a strange thing for the default to
+# do on a tool whose whole purpose is monetized output.
+DEFAULT_TARGET = "rewards"
+
+# The band that clears the payout threshold, named so the UI can mark it.
+REWARDS_TARGET = "rewards"
 
 
 def build_prompt(target: str = DEFAULT_TARGET) -> str:
@@ -833,6 +852,10 @@ def fallback_publish_meta(concept: str, title: str, payoff: str) -> dict[str, An
 # both failure modes visible.
 # ---------------------------------------------------------------------------
 
+# How far a model's read of the writing can pull down the monetization axis.
+# Bounded because the axis is mostly licence facts the model cannot see.
+MONETIZATION_MAX_PENALTY = 2.0
+
 VIRAL_PROMPT = """You grade short-form video scripts for a channel that has to survive
 YouTube's reused-content review and TikTok's originality rules. You are hard to
 impress. Return ONE JSON object and nothing else.
@@ -842,36 +865,49 @@ SCRIPT:
 
 CONTEXT: the finished video runs {duration:.0f} seconds.
 
-Score three axes from 1 to 10. Use the whole range -- most scripts are a 4 or a 5.
+Score three axes from 1 to 10. Use the whole range in BOTH directions: a script
+that does the job well is an 8, and refusing to award one is as wrong as
+handing them out. Do not cluster your answers in the middle.
 
 1. hook (first 3 seconds, roughly the first 9 words)
-   10 = opens a loop the viewer has to close: a number that sounds wrong, a
-        flat contradiction of something they believe, a stake.
-   5  = states the topic clearly. Accurate, and scrollable.
-   1  = "In this video I want to talk about..."
+   9-10 = a number that sounds wrong, or a flat contradiction of something the
+          viewer believes, landing in the first six words.
+   7-8  = opens on a stake, a named specific or a hard figure. The viewer has a
+          reason to stay even if it is not startling. A direct instruction
+          against the viewer's assumption ("Stop buying the X") is an 8.
+   4-6  = states the topic clearly. Accurate, and scrollable.
+   1-3  = "In this video I want to talk about...", or pure throat-clearing.
 
 2. density (is the script load-bearing?)
-   10 = almost every sentence carries a figure, a name, a mechanism or a
-        consequence that could be checked and could be wrong.
-   5  = a real point, thinly supported.
-   1  = confident phrasing around nothing. "This costs more than you think",
-        "the secret is consistency", "let that sink in". Score these 1-2 even
-        when they read smoothly -- especially then.
+   9-10 = almost every sentence carries a figure, a name, a mechanism or a
+          consequence that could be checked and could be wrong.
+   7-8  = a real argument with most claims supported by something specific.
+   4-6  = a real point, thinly supported.
+   1-3  = confident phrasing around nothing. "This costs more than you think",
+          "the secret is consistency", "let that sink in". Score these 1-3 even
+          when they read smoothly -- especially then.
 
-3. monetization (does it survive review?)
-   10 = the commentary is clearly the product; the footage illustrates it.
-   5  = original narration, but it mostly describes what is on screen.
-   1  = reaction noises over someone else's video, or a template with the
-        nouns swapped.
+3. monetization (does the SCRIPT read as transformative?)
+   Judge the writing only. You cannot see the footage licence and must not
+   guess at it -- that is checked separately and your score is combined with it.
+   9-10 = the commentary is clearly the product; footage would only illustrate it.
+   7-8  = a genuine argument of its own, in its own words.
+   4-6  = original narration that mostly describes what would be on screen.
+   1-3  = reaction noises over someone else's video, or a template with the
+          nouns swapped.
 
 Also return:
   "fixes": 2-4 specific, actionable notes. Name the exact phrase to cut or the
            exact kind of fact that is missing. Never "add more detail".
+  "retention_tip": ONE sentence naming the single change that buys the most
+           retention in the first three seconds. Quote the exact words to cut
+           or the exact figure to lead with. It must be executable without
+           re-reading the script. Never "make it punchier".
   "rewritten_hook": one replacement opening line of 9 words or fewer.
 
 JSON shape:
 {{"hook": 0, "density": 0, "monetization": 0,
-  "fixes": ["..."], "rewritten_hook": "..."}}"""
+  "fixes": ["..."], "retention_tip": "...", "rewritten_hook": "..."}}"""
 
 
 REWRITE_PROMPT = """Rewrite this short-form script for retention. Return ONLY the rewritten
@@ -918,6 +954,7 @@ def parse_scorecard_response(raw: str) -> dict[str, Any]:
         "density": _axis("density"),
         "monetization": _axis("monetization"),
         "fixes": [str(f).strip() for f in fixes if str(f).strip()][:4],
+        "retention_tip": str(parsed.get("retention_tip") or "").strip(),
         "rewritten_hook": str(parsed.get("rewritten_hook") or "").strip(),
     }
 
@@ -963,24 +1000,75 @@ def score_virality(
             if not ai or not ai["hook"]:
                 continue
 
-            # Blend, do not replace. The heuristic catches filler the model
-            # talks itself past; the model catches emptiness the heuristic's
-            # token count reads as substance.
+            # The model leads on judgement; the heuristic caps on evidence.
+            #
+            # Averaging the two was the wrong shape. The heuristic has no
+            # opinion about whether a sentence says anything, so its answer for
+            # an unremarkable script sits near the middle of the range -- and
+            # averaging dragged every real verdict back toward that middle,
+            # which is where the flat mid-fives came from. So:
+            #
+            #   hook, density  -- the model decides, because telling a specific
+            #       claim from a confident-sounding empty one is exactly what a
+            #       regex cannot do. The heuristic still caps it: where it has
+            #       counted filler phrases or a canned opener, the model cannot
+            #       score more than two points above that hard evidence.
+            #   monetization   -- the lower of the two, always. The heuristic
+            #       reads the actual licence off the ledger entry, which the
+            #       model never sees, so it can only be right in ways the model
+            #       cannot be.
             merged = dict(base)
+
+            # "Hard" means counted, not merely absent. A missing figure in the
+            # opening is something the model may legitimately read differently;
+            # a filler phrase or a canned opener is a string that is either in
+            # the script or is not.
+            marks = set(base["hook"].get("diagnosis") or ())
+            hard_evidence = bool(base["density"].get("filler_hits")) or bool(
+                marks & {"weak_opener", "slow_open"})
+
             for axis in ("hook", "density", "monetization"):
-                blended = round((base[axis]["score"] + ai[axis]) / 2.0, 1)
+                heuristic = float(base[axis]["score"])
+                model_score = float(ai[axis])
+
+                if axis == "monetization":
+                    # The heuristic owns this axis: it reads the real licence,
+                    # duration and disclosure state off the ledger entry, none
+                    # of which the model is shown. The model contributes one
+                    # thing it can genuinely see -- whether the writing reads as
+                    # transformative -- as a bounded penalty, never as the
+                    # score. Letting it lead here had it marking cleared,
+                    # disclosed, CC0 footage down to a 3 on nothing.
+                    penalty = 0.0
+                    if model_score < 5.0:
+                        penalty = min(MONETIZATION_MAX_PENALTY, 5.0 - model_score)
+                    final = heuristic - penalty
+                elif hard_evidence:
+                    final = min(model_score, heuristic + 2.0)
+                else:
+                    final = model_score
+
                 merged[axis] = dict(base[axis])
-                merged[axis]["score"] = blended
-                merged[axis]["model_score"] = ai[axis]
+                merged[axis]["score"] = round(final, 1)
+                merged[axis]["model_score"] = model_score
+                merged[axis]["heuristic_score"] = heuristic
 
             overall = round(merged["hook"]["score"] * 0.45
                             + merged["density"]["score"] * 0.35
                             + merged["monetization"]["score"] * 0.20, 1)
+
+            # The same categorical gate the offline card applies: a licence
+            # that is not cleared is not a weakness to be averaged away.
+            if merged["monetization"]["score"] < compliance.MONETIZATION_FLOOR:
+                overall = round(min(overall, merged["monetization"]["score"] + 2.0), 1)
+
             merged["overall"] = overall
             merged["needs_rewrite"] = overall < compliance.VIRAL_TARGET_SCORE
             merged["fixes"] = ai["fixes"]
+            merged["retention_tip"] = ai["retention_tip"] or base.get("retention_tip", "")
             merged["rewritten_hook"] = ai["rewritten_hook"]
-            merged["source"] = f"heuristic + {model}"
+            merged["verdict"] = compliance.verdict_for(overall, merged)
+            merged["source"] = f"{model} + evidence caps"
             merged["model"] = model
             return merged
         except Exception as exc:

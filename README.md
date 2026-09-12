@@ -24,13 +24,32 @@ holding anything back), and a card saying what the engine is for and roughly
 how long a render takes. Then the work, and nothing after it — the creation
 pages end at their own render button.
 
-Sign in and you land on **🏠 Dashboard** rather than inside an engine. It holds
-the welcome banner and live status badges, the three-step production path
-(discover, synthesize, publish), a card per engine with its format and its one
-use case, an API connectivity panel, the last three renders, and the platform
-monetization rules folded into an accordion. The sidebar groups the rest:
-**Creation Engines** for the seven that make something, **Tools & Library** for
-Niche Scout, the Exports Library and Admin.
+Sign in and you land on **🏠 Dashboard**, which is a consumer page rather than
+a control panel. It shows the name, the tagline, a credits pill — and then
+**✨ Magic Studio**: one box, four styles, one button.
+
+Type *"Range Rover vs Porsche Cayenne"*, press **Generate Full Video
+(1-Click)**, and the whole pipeline runs — script, narration, visuals, kinetic
+captions, encode — behind one progress bar that names the stage it is on
+(*Writing Hook → Synthesizing Voice → Animating → Finalizing Render*). The
+finished video appears in a player with **Download MP4** and **Direct Upload**
+under it.
+
+The style pill follows what you type: an "8-hour rain" prompt selects the
+long-form engine, a matchup selects the duel, an abstract subject like "why
+consistency beats intensity" selects the vector engine rather than sending it
+hunting for stock footage of an idea. You can always override it.
+
+Below that the dashboard keeps the three-step production path, a card per
+engine, the last three renders and the monetization rules. What it no longer
+keeps is developer telemetry: encoder presets, storage totals, the scratch
+purge and the API connectivity panel all live in **Admin** now. They answer
+"is this deployment healthy", which is not a question the person making a
+video is asking.
+
+The sidebar groups the rest: **Creation Engines** for the seven that make
+something, **Tools & Strategy** for Niche Scout, the Exports Library and
+Admin.
 
 Everything you have made lives in **📁 Exports Library**, a mode of its own:
 a grid of every render in `exports/<username>/` with its duration, size, date
@@ -39,6 +58,34 @@ reveal-in-folder and delete on each card. It used to be a four-item strip
 pinned under every creation page, which meant every workflow ended in a row of
 unrelated thumbnails and a video player that stayed open across mode switches.
 It is a destination now, not a footer.
+
+---
+
+## Magic Studio
+
+One prompt, one style, one finished file. The four styles map onto the engines
+that can work from a sentence alone:
+
+| Style | Engine | What it needs from you |
+|---|---|---|
+| 📐 Minimalist Vector | Minimalist Motion | A concept. Everything else is drawn from code. |
+| ⚔️ Versus Duel | Versus Duel | Two things, or one and it finds the rival. |
+| 🎙️ Faceless Commentary | the batch pipeline | A topic. It finds licensed footage for it. |
+| 🌙 8-Hour Atmosphere | Atmosphere Studio | A soundscape, and optionally a length. |
+
+`magic_studio.py` is the planner, not a renderer: it turns the sentence into
+the concrete inputs an engine takes — a scene concept, a matchup with three
+numeric rounds, a bed and a texture and a duration — and `app.py` then calls
+the same pipeline the manual mode calls. Forking the render paths to get a
+one-click flow would have meant two of them to keep in sync, and the second
+would be the one without tests.
+
+Two things it refuses to guess. A matchup is only split on an explicit
+`vs`/`versus`; anything else goes to the model, because splitting a sentence
+down the wrong word builds a duel between two halves of a phrase. And a duel
+round with a non-numeric score is dropped rather than coerced — the format
+rests on the figures being checkable, and a confident wrong horsepower number
+is what the comments will be about.
 
 ---
 
@@ -464,6 +511,7 @@ git check-ignore -v .env users.json exports    # all three should print a rule
 
 ```
 app.py            Streamlit UI, login gate, the command centre, all six studios
+magic_studio.py   the 1-click planner: prompt to engine inputs, stage weights
 dashboard_view.py the landing page catalogue: engine cards, the production
                   path, connectivity probes, platform compliance rules
 auth.py           password hashing, roles, user store, login rate limiting
