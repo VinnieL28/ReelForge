@@ -348,3 +348,65 @@ class TestIsolation:
         engine. The import in the test above is the test's, not the module's."""
         source = open(ne.__file__, encoding="utf-8").read()
         assert "narrative_engine" not in source
+
+
+# ---------------------------------------------------------------------------
+# Relevance: measured and shown, never used to delete data
+# ---------------------------------------------------------------------------
+
+class TestTopicalRelevance:
+    """
+    These numbers exist because the first live run with a real API key put a
+    1.9M-subscriber Tamil news channel into an "ancient mysteries" sample on
+    one viral true-crime upload.
+
+    They are reported, not enforced. Every filter built on them was worse than
+    the problem: filtering on title vocabulary dropped Kurzgesagt and Dr. Becky
+    from "deep space astronomy" and Daily Stoic from "stoic philosophy",
+    because established channels do not repeat the niche words in every title
+    and small SEO-driven ones do. Stoicism then measured 44/100 -- wide open --
+    against 63 with those channels present.
+    """
+
+    QUERY = "ancient mysteries and lost cities documentary"
+
+    def test_it_singularizes_so_the_obvious_matches_land(self):
+        """"mysteries" must match "mystery" or the reading rejects exactly the
+        channels it is meant to recognise."""
+        terms = ne._recon_terms("Ancient Mysteries of Lost Cities")
+        assert "mystery" in terms and "city" in terms and "ancient" in terms
+
+    def test_generic_words_are_not_evidence(self):
+        """"Documentary" appears in a third of the titles on YouTube. Matching
+        on it would re-admit everything."""
+        assert ne._recon_terms("Documentary Video Channel") == set()
+
+    def test_short_words_are_ignored(self):
+        assert ne._recon_terms("the of and a to") == set()
+
+    def test_an_on_topic_channel_scores_high(self):
+        titles = ["Ancient Mysteries Nobody Has Solved",
+                  "The Lost City of Z", "Hidden Megaliths Explained",
+                  "My holiday vlog"]
+        assert ne.topical_share(titles, self.QUERY) >= 0.5
+
+    def test_an_off_topic_channel_scores_zero(self):
+        titles = ["BREAKING Chennai Train Case Solved",
+                  "DAY 3 NEPAL FLOODS Update",
+                  "Cricket highlights today"]
+        assert ne.topical_share(titles, self.QUERY) == 0.0
+
+    def test_nothing_to_judge_reads_as_zero_not_as_a_pass(self):
+        assert ne.topical_share([], self.QUERY) == 0.0
+        assert ne.topical_share(["Ancient Mysteries"], "") == 0.0
+
+    def test_recon_reports_relevance_without_removing_anyone(self):
+        """The sample is whatever YouTube ranked. Deleting from it is how a
+        niche's actual leader disappears and the niche reads as open."""
+        import inspect
+
+        source = inspect.getsource(ne.competitor_recon)
+        assert "loose_match" in source, "relevance is not reported at all"
+        # The returned channel list must be the full inspected set.
+        assert 'return {"channels": out,' in source, (
+            "competitor_recon returns a filtered subset -- see the class docstring")

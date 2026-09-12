@@ -34,7 +34,7 @@ import re
 import statistics
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 ProgressFn = Callable[[str], None]
 
@@ -45,6 +45,40 @@ RECON_WINDOW_DAYS = 90
 # call here costs 1. One recon is therefore ~110 units, and a project can run
 # roughly 90 of them a day before the quota resets at midnight Pacific.
 SEARCH_COST_UNITS = 100
+
+# Two relevance readings, reported on every channel and used to filter none of
+# them. Both were built as a filter first; the measurements are what survived.
+#
+# The problem was real: searching "ancient mysteries and lost cities
+# documentary" put a 1.9M-subscriber Tamil news channel in the sample on one
+# viral true-crime upload, and its 309k median drove leader concentration to
+# 17x. But every version of the filter was worse than the problem.
+#
+# Filtering on title vocabulary dropped Kurzgesagt and Dr. Becky from "deep
+# space astronomy" and Daily Stoic and Ryan Holiday from "stoic philosophy" --
+# established channels do not keyword-stuff titles, small SEO-driven ones do,
+# so the filter systematically removed the incumbents and kept the challengers.
+# Stoicism then read 44/100, wide open, which is the most expensive wrong
+# answer this tool can give. Adding search-appearance corroboration recovered
+# Daily Stoic and brought that back to 63, but still lost Dr. Becky.
+#
+# Measured against no filter at all, the surviving version moved the score by
+# one point on the case that motivated it, having been capable of a nineteen
+# point error in the other direction. So nothing is dropped. Both numbers ride
+# along on each channel, the UI shows them, and a reader can see for themselves
+# that the 1.9M-subscriber outlier matched once and writes about something
+# else -- which silently deleting it would never have told them.
+RECON_TOPICAL_MIN = 0.15
+
+# Words too generic to be evidence of anything. "Documentary" is in a third of
+# the titles on YouTube and matching on it would re-admit exactly what this
+# filter exists to exclude.
+_RECON_STOPWORDS = frozenset({
+    "documentary", "documentaries", "video", "videos", "channel", "youtube",
+    "best", "top", "new", "full", "episode", "part", "official", "shorts",
+    "compilation", "explained", "story", "stories", "facts", "about", "with",
+    "from", "that", "this", "they", "what", "when", "where", "which", "your",
+})
 
 
 class NicheError(RuntimeError):
@@ -277,6 +311,42 @@ def _parse_time(stamp: str) -> datetime | None:
         return None
 
 
+def _recon_terms(text: str) -> set[str]:
+    """
+    Content words from a title or a query, lightly singularized.
+
+    "mysteries" and "mystery", "cities" and "city" have to match or the filter
+    rejects the very channels it is meant to keep. A full stemmer is more than
+    this needs: dropping a plural suffix covers the cases that actually occur
+    in video titles.
+    """
+    terms: set[str] = set()
+    for raw in re.findall(r"[a-z]+", str(text or "").lower()):
+        if len(raw) < 4 or raw in _RECON_STOPWORDS:
+            continue
+        if raw.endswith("ies") and len(raw) > 4:
+            raw = raw[:-3] + "y"
+        elif raw.endswith("es") and len(raw) > 4:
+            raw = raw[:-2]
+        elif raw.endswith("s") and len(raw) > 4:
+            raw = raw[:-1]
+        terms.add(raw)
+    return terms
+
+
+def topical_share(titles: Sequence[str], query: str) -> float:
+    """
+    The fraction of a channel's recent titles that share vocabulary with the
+    niche. 0.0 when there is nothing to judge, which reads as off-topic.
+    """
+    wanted = _recon_terms(query)
+    rows = [t for t in titles if str(t).strip()]
+    if not wanted or not rows:
+        return 0.0
+    hits = sum(1 for title in rows if _recon_terms(title) & wanted)
+    return hits / len(rows)
+
+
 def competitor_recon(niche: str, channels: int = 6,
                      window_days: int = RECON_WINDOW_DAYS,
                      progress: ProgressFn | None = None) -> dict[str, Any]:
@@ -316,7 +386,8 @@ def competitor_recon(niche: str, channels: int = 6,
         return {"channels": [], "query": query, "window_days": window_days,
                 "quota_units": units}
 
-    ranked = sorted(appearances, key=lambda cid: -appearances[cid])[:channels]
+    wanted = max(2, int(channels))
+    ranked = sorted(appearances, key=lambda cid: -appearances[cid])[:wanted]
 
     if progress:
         progress(f"Reading {len(ranked)} channels...")
@@ -383,12 +454,21 @@ def competitor_recon(niche: str, channels: int = 6,
             # this channel past the people who already follow it.
             "view_to_sub": (median_views / subs) if subs > 0 else 0.0,
             "top_videos": sorted(recent, key=lambda v: -v["views"])[:3],
+            "topical_share": round(topical_share([v["title"] for v in recent], query), 3),
+            "search_hits": appearances.get(str(channel.get("id") or ""), 0),
             "url": f"https://www.youtube.com/channel/{channel.get('id')}",
         })
 
     out.sort(key=lambda c: -c["median_views"])
+
+    # Flagged, not filtered. A channel that ranked once and writes about
+    # something else is worth marking so the reader can discount it; deleting
+    # it is how a niche's actual leader disappears and the niche reads open.
+    loose = [c["name"] for c in out
+             if c["search_hits"] < 2 and c["topical_share"] < RECON_TOPICAL_MIN]
+
     return {"channels": out, "query": query, "window_days": window_days,
-            "quota_units": units}
+            "quota_units": units, "loose_match": loose}
 
 
 def saturation_from_recon(recon: dict[str, Any]) -> dict[str, Any]:

@@ -6397,6 +6397,16 @@ def render_scout_recon(state: dict[str, Any]) -> None:
         st.caption(f"{len(channels)} channels · {recon.get('quota_units', 0)} quota units "
                    f"spent of the 10,000/day default")
 
+        loose = list(recon.get("loose_match") or ())
+        if loose:
+            st.caption(
+                f"⚠️ {', '.join(loose[:3])} ranked once for this query and "
+                f"{'write' if len(loose) > 1 else 'writes'} mostly about something "
+                f"else. Shown rather than dropped — but discount "
+                f"{'them' if len(loose) > 1 else 'it'} when reading the saturation "
+                f"score, because a large off-niche channel inflates the leader "
+                f"concentration signal.")
+
         for channel in channels:
             with st.container(border=True):
                 subs = ("hidden" if channel["hidden_subs"]
@@ -6407,7 +6417,15 @@ def render_scout_recon(state: dict[str, Any]) -> None:
                     + badge(f"median {channel['median_views']:,} views", "violet")
                     + badge(f"{channel['view_to_sub']:.1f}× subs", "green"
                             if channel["view_to_sub"] >= 1 else "")
-                    + badge(f"{channel['videos_in_window']} uploads", ""),
+                    + badge(f"{channel['videos_in_window']} uploads", "")
+                    # Flagged rather than filtered. A big general-interest
+                    # channel that ranked once on one video would otherwise sit
+                    # here looking like a competitor and drag the leader
+                    # concentration signal with it.
+                    + (badge("loose match", "amber")
+                       if (channel.get("search_hits", 0) < 2
+                           and channel.get("topical_share", 0)
+                           < niche_engine.RECON_TOPICAL_MIN) else ""),
                     unsafe_allow_html=True)
                 for video in channel["top_videos"]:
                     st.markdown(
