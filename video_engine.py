@@ -69,6 +69,14 @@ ASPECT_RATIOS = {
 # lower cq is bigger, higher is smaller and softer.
 # ---------------------------------------------------------------------------
 
+# Every ffmpeg invocation gets a ceiling. A finishing pass that wedges -- a
+# malformed subtitle file, a codec negotiation that never returns -- otherwise
+# blocks its caller forever, and when the caller is a Streamlit script run that
+# is a browser tab that never comes back and a user who cannot tell a hang from
+# a slow render. Five minutes is far above the measured worst case for these
+# passes (a 5-minute 1080x1920 burn-in runs about 40s on the CPU path).
+FFMPEG_TIMEOUT = 300
+
 GPU_CODEC = "h264_nvenc"
 GPU_PRESET = "p5"
 GPU_CQ = "25"
@@ -1477,7 +1485,8 @@ def apply_finishing_pass(
             os.path.abspath(output_path),
         ]
 
-        proc = subprocess.run(command, cwd=work, capture_output=True, text=True)
+        proc = subprocess.run(command, cwd=work, capture_output=True, text=True,
+                              timeout=FFMPEG_TIMEOUT)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -1525,7 +1534,8 @@ def burn_ass_subtitles(
     ]
 
     try:
-        proc = subprocess.run(command, cwd=work, capture_output=True, text=True)
+        proc = subprocess.run(command, cwd=work, capture_output=True, text=True,
+                              timeout=FFMPEG_TIMEOUT)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

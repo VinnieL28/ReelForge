@@ -54,11 +54,25 @@ SUPERSAMPLE = 2                       # draw at 2x, box-filter down: free AA
 #
 # Geometry is deliberately *not* clamped. A staircase reaching the floor is the
 # picture; a sentence hidden behind a caption is a bug.
-SAFE_BOTTOM = 200
+# The action rail on Shorts and TikTok -- like, comment, share, sound -- plus
+# the caption and the progress scrubber. Measured against the taller of the
+# two: 220px of a 1920 frame is 11.5%, which clears the rail on a 20:9 phone
+# rather than only on a 16:9 one.
+SAFE_BOTTOM = 220
 SAFE_Y: float = CANVAS[1] - SAFE_BOTTOM
 
 # Type stops 30px higher again, which is the room the progress hairline needs.
 TEXT_SAFE_Y: float = SAFE_Y - 30.0
+
+# How far ink actually falls below a centred text anchor, as a fraction of the
+# nominal size. The clamps used 0.62, which is roughly a baseline-to-descender
+# figure and not what these anchors measure: text is drawn centred, so the ink
+# reaches about a line-height's half plus the descender. Measured on the
+# rendered frames, the payoff line at size 52 put ink 36px below the clamped
+# block bottom against the 32px the old figure reserved, and six of those
+# pixels landed inside the action rail. 0.85 leaves margin at every size the
+# templates use.
+_INK_BELOW_ANCHOR = 0.85
 
 BLACK: tuple[int, int, int] = (0, 0, 0)
 WHITE: tuple[int, int, int] = (255, 255, 255)
@@ -372,7 +386,7 @@ class Frame:
         0.62 of the point size is the descender-inclusive half-height for a
         vertically centred line, which is the anchor every caller here uses.
         """
-        return min(float(y), TEXT_SAFE_Y - size * 0.62)
+        return min(float(y), TEXT_SAFE_Y - size * _INK_BELOW_ANCHOR)
 
     def text(self, body: str, centre: tuple[float, float], size: int = 56,
              colour: tuple[int, int, int] = WHITE, weight: str = "bold",
@@ -422,7 +436,8 @@ class Frame:
         top = centre[1] - step * (len(lines) - 1) / 2
         # Clamp the block, not each line: lifting only the last line would
         # close the leading and the paragraph would read as a typo.
-        overflow = (top + step * (len(lines) - 1) + size * 0.62) - TEXT_SAFE_Y
+        overflow = (top + step * (len(lines) - 1)
+                    + size * _INK_BELOW_ANCHOR) - TEXT_SAFE_Y
         if overflow > 0:
             top -= overflow
         for i, line in enumerate(lines):
@@ -670,13 +685,17 @@ def draw_footer(frame: Frame, spec: dict[str, Any], t: float, duration: float) -
     start = max(0.0, duration - 4.2)
     alpha = fade(t, start, attack=0.8)
     if alpha > 0.01:
-        # Asks for the old y and lets the clamp bottom-align it inside the safe
-        # area, which lands 30px above where it used to sit. Measured across all
-        # fifteen templates: a deliberate move to 1560 collided with each
-        # template's own axis labels (28% mean ink behind the text), while
-        # bottom-aligning leaves 3.8%.
-        frame.wrapped(line, (frame.w / 2, 1720), size=52, colour=mix(WHITE, alpha),
-                      weight="bold", max_width=900, leading=1.18)
+        # Anchored to the safe line rather than to a fixed y. It used to ask
+        # for a literal y and let the clamp bottom-align it, which worked while
+        # SAFE_BOTTOM happened to be 200: raising the margin to 220 moved the
+        # safe line up and left that literal below it, so the payoff bled six
+        # pixels into the action rail. Measured across all fourteen
+        # templates, bottom-aligning here leaves 3.8% ink behind the text --
+        # a deliberate move further up collided with each template's own axis
+        # labels at 28%.
+        frame.wrapped(line, (frame.w / 2, TEXT_SAFE_Y), size=52,
+                      colour=mix(WHITE, alpha), weight="bold",
+                      max_width=900, leading=1.18)
 
 
 # The hairline sits just inside the safe area, not at the foot of the frame,
@@ -2131,7 +2150,16 @@ TEMPLATE_ALIASES: dict[str, str] = {
 # "auto" is a UI value, not a template: it means "let the model choose".
 AUTO_TEMPLATE = "auto"
 DEFAULT_TEMPLATE = "split_path"
-MIN_DURATION, MAX_DURATION = 8.0, 60.0
+# The ceiling was 60.0, which is precisely the number TikTok Creator Rewards
+# pays nothing at or below -- so the cap was silently clipping every scene to
+# just short of monetizable.
+#
+# It is now well clear of the 62-75s target band rather than just above it. At
+# 80.0 a thesis that ran long landed on the ceiling exactly, and hitting this
+# cap is not harmless: the video is truncated to it and the last seconds of
+# narration are cut off mid-sentence. A ceiling should be a guard against a
+# runaway, not a value normal output lands on.
+MIN_DURATION, MAX_DURATION = 8.0, 95.0
 
 
 def resolve_template(name: Any) -> str:

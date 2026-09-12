@@ -72,6 +72,7 @@ from compliance import (
     AI_DISCLOSURE_LINE,
     PLATFORM_DISCLOSURE_STEPS,
     MONETIZATION_NOTES,
+    TIKTOK_REWARDS_MIN_SECONDS,
 )
 import auth
 import ambient_engine
@@ -1539,8 +1540,10 @@ def render_viral_scorecard(script: str, scope: str, entry: dict[str, Any] | None
         axes = st.columns(3)
         for col, (axis, label) in zip(axes, (
             ("hook", "Hook intrigue (0-3s)"),
-            ("density", "Information density"),
-            ("monetization", "Monetization safety"),
+            # The keys stay as they are -- they are written into every ledger
+            # entry -- but the labels say what the axes actually measure.
+            ("density", "Domain specificity"),
+            ("monetization", "Originality & reuse safety"),
         )):
             with col:
                 part = card[axis]
@@ -4311,6 +4314,14 @@ def run_batch_job(
     topic = str(job["topic"])
     target = ASPECT_RATIOS[str(settings.get("aspect") or next(iter(ASPECT_RATIOS)))]
 
+    # Resolved once, from settings when the caller supplied it. Batch Studio
+    # does not, and gets the signed-in user's folder exactly as before; the
+    # one-click flow does, because it runs on a worker thread where
+    # st.session_state -- and therefore user_exports() -- is unavailable and
+    # would quietly resolve to the wrong account's directory.
+    exports = str(settings.get("exports") or "") or user_exports()
+    os.makedirs(exports, exist_ok=True)
+
     # ---- 1. licensed footage ------------------------------------------
     stage("footage")
     hits = search_licensed_video(topic, limit=4)
@@ -4322,7 +4333,7 @@ def run_batch_job(
     if not LICENCES[licence_key].commercial:
         raise RuntimeError(f"Best match for '{topic}' is not cleared for commercial use.")
 
-    clip_path = download_licensed_clip(hit, user_exports())
+    clip_path = download_licensed_clip(hit, exports)
     job["licence"] = licence_key
 
     # ---- 2. script -----------------------------------------------------
@@ -4341,7 +4352,7 @@ def run_batch_job(
         script,
         provider=str(settings.get("tts_provider") or "gemini"),
         voice=str(settings.get("voice") or "Charon"),
-        output_path=os.path.join(user_exports(), f"narration_{int(time.time())}.wav"),
+        output_path=os.path.join(exports, f"narration_{int(time.time())}.wav"),
         style=str(settings.get("style") or "Punchy viral narrator, fast pace"),
     )
     speech = float(narration["duration"])
@@ -4352,7 +4363,7 @@ def run_batch_job(
     if settings.get("kinetic", True) and narration["words"]:
         ass_path = write_ass_file(
             list(narration["words"]),
-            os.path.join(user_exports(), f"captions_{int(time.time())}.ass"),
+            os.path.join(exports, f"captions_{int(time.time())}.ass"),
             size=target, position=str(settings.get("caption_position") or "bottom"),
             highlight=str(settings.get("highlight") or "yellow"),
         )
@@ -4361,11 +4372,11 @@ def run_batch_job(
     if settings.get("bgm", True):
         bgm_path = build_ducked_bgm(
             speech + 0.4, narration["path"],
-            os.path.join(user_exports(), f"bgm_{int(time.time())}.wav"),
+            os.path.join(exports, f"bgm_{int(time.time())}.wav"),
             volume=float(settings.get("bgm_volume") or BGM_DEFAULT_VOLUME),
         )
 
-    out_path = new_export_path("batch")
+    out_path = os.path.join(exports, f"batch_{int(time.time())}.mp4")
     result = render_commentary_video(
         source_video=clip_path,
         narration_path=str(narration["path"]),
@@ -4383,7 +4394,7 @@ def run_batch_job(
     )
 
     # ---- 5. provenance ---------------------------------------------------
-    entry = append_ledger(user_exports(), {
+    entry = append_ledger(exports, {
         "video_name": os.path.basename(out_path),
         "video_path": out_path,
         "duration": float(result["duration"]),
@@ -6618,87 +6629,95 @@ MAGIC_GEMINI_VOICE = "Charon"      # build_minimalist_video, run_batch_job
 MAGIC_EDGE_VOICE = DEFAULT_VOICE   # generate_slide_voiceovers, via _synthesize
 
 
-class MagicProgress:
+def magic_context() -> dict[str, Any]:
     """
-    One bar across four named stages, with the sequence always visible.
+    Everything a render needs, copied off session_state on this thread.
 
-    Distinct from StageProgress: that one measures a single engine's own
-    progress, this one spans several calls of different lengths, so it is
-    driven by the stage weights in magic_studio rather than by a fraction the
-    engine hands it.
+    The worker cannot read session_state -- there is no ScriptRunContext on it
+    -- so the snapshot has to be taken here, while we are still inside the
+    script run, and handed over as plain data.
     """
+    audio = dict(st.session_state.get("audio_settings") or {})
+    voice = dict(st.session_state.get("voice_settings") or {})
+    exports = user_exports()
+    os.makedirs(exports, exist_ok=True)
 
-    def __init__(self) -> None:
-        self.slot = st.empty()
-        self.caption = st.empty()
-        self.bar = self.slot.progress(0.0, text="Starting...")
-        self.started = time.time()
-        self.stage_key = "script"
-
-    def stage(self, key: str, within: float = 0.0, message: str = "") -> None:
-        self.stage_key = key
-        fraction = magic_studio.stage_fraction(key, within)
-        elapsed = time.time() - self.started
-
-        suffix = ""
-        if fraction > 0.08:
-            remaining = elapsed * (1.0 - fraction) / fraction
-            suffix = f"  \u00b7  ~{remaining:.0f}s left"
-        label = message or magic_studio.STAGE_LABELS.get(key, key)
-        try:
-            self.bar.progress(fraction, text=f"{label}{suffix}")
-            self.caption.markdown(magic_studio.stage_caption(key))
-        except Exception:
-            pass
-
-    def finish(self, message: str = "Done.") -> float:
-        elapsed = time.time() - self.started
-        try:
-            self.bar.progress(1.0, text=f"{message}  \u00b7  {elapsed:.0f}s total")
-            self.caption.empty()
-        except Exception:
-            pass
-        return elapsed
-
-    def empty(self) -> None:
-        for slot in (self.slot, self.caption):
-            try:
-                slot.empty()
-            except Exception:
-                pass
+    return {
+        "exports": exports,
+        "aspect": str(st.session_state.get("render_aspect") or next(iter(ASPECT_RATIOS))),
+        "fit": str(st.session_state.get("render_fit") or DEFAULT_FIT),
+        "transition": str(st.session_state.get("render_transition") or "crossfade"),
+        "transition_dur": float(st.session_state.get("render_transition_dur") or 0.5),
+        "fps": int(st.session_state.get("render_fps") or 24),
+        "watermark": str(st.session_state.get("render_watermark") or ""),
+        "target": str(st.session_state.get("magic_target") or DEFAULT_TARGET),
+        "music_style": str(audio.get("style") or "lofi"),
+        "music_volume": float(audio.get("volume", 0.8)),
+        "voice_volume": float(voice.get("volume", 1.0)),
+        "music_duck": float(voice.get("music_duck", 0.28)),
+        "sfx_enabled": bool(voice.get("sfx_enabled", True)),
+        "sfx_volume": float(voice.get("sfx_volume", 0.55)),
+        "rate_pct": int(voice.get("rate_pct", 12)),
+        "pitch_hz": int(voice.get("pitch_hz", 0)),
+    }
 
 
-def _magic_minimalist(prompt: str, bar: MagicProgress) -> dict[str, Any]:
-    """Vector animation: scene spec, narration, drawn frames, encode."""
+# Narration voices for the one-click flow, per provider. They are NOT
+# interchangeable: edge-tts takes Microsoft neural voice ids
+# ("en-US-ChristopherNeural") and Gemini TTS takes its own short names
+# ("Charon"). Handing one to the other fails with a 400 at request time --
+# after the script has been written and paid for, which is the worst moment for
+# it. Each runner below passes the constant that matches the provider its
+# engine actually uses.
+MAGIC_GEMINI_VOICE = "Charon"      # build_minimalist_video, run_batch_job
+MAGIC_EDGE_VOICE = DEFAULT_VOICE   # generate_slide_voiceovers
+
+# What a runner is handed: (prompt, context, report). `report` is
+# MagicJob.report -- a plain callable, safe to hold across threads.
+Report = Callable[..., None]
+
+
+def _magic_out(ctx: dict[str, Any], prefix: str) -> str:
+    return os.path.join(ctx["exports"], f"{prefix}_{int(time.time())}.mp4")
+
+
+def _magic_minimalist(prompt: str, ctx: dict[str, Any], report: Report) -> dict[str, Any]:
+    """
+    Vector animation: scene spec, narration, drawn frames, encode.
+
+    The engine this project leans on hardest. Every frame is computed and every
+    audio layer synthesized, so there is no third-party rights holder anywhere
+    in the output -- which is what makes it the one engine that cannot be
+    caught by a reused-content review.
+    """
     concept = magic_studio.scene_concept(prompt)
 
-    bar.stage("script", 0.2, "Writing Hook \u2014 designing the metaphor...")
+    report("script", 0.2, "Writing Hook \u2014 designing the metaphor...")
     spec = generate_scene_spec(concept)
-    bar.stage("script", 1.0)
+    report("script", 1.0)
 
-    out_path = os.path.join(user_exports(), f"minimalist_{int(time.time())}.mp4")
-    os.makedirs(user_exports(), exist_ok=True)
+    out_path = _magic_out(ctx, "minimalist")
 
     def on_step(step: int, total: int, message: str) -> None:
-        # The engine synthesizes narration first and then draws, so its own
-        # early steps are the voice stage and the rest is picture.
+        # The engine synthesizes narration first and then draws, so its early
+        # steps are the voice stage and the rest is picture.
         share = step / max(1, total)
         if share < 0.25:
-            bar.stage("voice", share / 0.25, f"Synthesizing Voice \u2014 {message}")
+            report("voice", share / 0.25, f"Synthesizing Voice \u2014 {message}")
         elif share < 0.75:
-            bar.stage("visual", (share - 0.25) / 0.5, f"Animating \u2014 {message}")
+            report("visual", (share - 0.25) / 0.5, f"Animating \u2014 {message}")
         else:
-            bar.stage("render", (share - 0.75) / 0.25, f"Finalizing Render \u2014 {message}")
+            report("render", (share - 0.75) / 0.25, f"Finalizing Render \u2014 {message}")
 
     result = build_minimalist_video(
         spec, out_path,
-        fps=int(st.session_state.get("render_fps", 30)),
+        fps=int(ctx["fps"]),
         bgm=True, bgm_volume=0.30, sfx=True, narrate=True,
         voice=MAGIC_GEMINI_VOICE,
         progress_callback=on_step,
     )
 
-    entry = append_ledger(user_exports(), {
+    entry = append_ledger(ctx["exports"], {
         "video_name": os.path.basename(out_path), "video_path": out_path,
         "duration": float(result["duration"]),
         "licence": "own", "licence_reference": "",
@@ -6715,109 +6734,139 @@ def _magic_minimalist(prompt: str, bar: MagicProgress) -> dict[str, Any]:
             "script": str(spec.get("thesis") or concept), "entry": entry}
 
 
-def _magic_duel(prompt: str, bar: MagicProgress) -> dict[str, Any]:
+def _magic_duel(prompt: str, ctx: dict[str, Any], report: Report) -> dict[str, Any]:
     """Comparison reel: matchup, photographs, stat rounds, encode."""
-    bar.stage("script", 0.2, "Writing Hook \u2014 building the matchup...")
+    report("script", 0.2, "Writing Hook \u2014 building the matchup...")
     brief = magic_studio.duel_brief(prompt)
-    bar.stage("script", 1.0)
+    report("script", 1.0)
 
     duel: dict[str, Any] = {"preset": "", "layout": "stacked",
                             "headline": brief["headline"], "cta": brief["cta"],
                             "rounds": brief["rounds"]}
 
-    bar.stage("visual", 0.1, "Animating \u2014 finding photographs...")
+    report("visual", 0.1, "Animating \u2014 finding photographs...")
     for index, side in enumerate(("a", "b")):
         item = dict(brief[side])
         try:
-            item["image"], item["credit"] = _cached_search(item["name"])
+            # Not the cached search: st.cache_data needs a script context.
+            item["image"], item["credit"] = fetch_photo(item["name"])
         except Exception as exc:
             item["image"] = fallback_backdrop()
             item["credit"] = f"Photo unavailable ({type(exc).__name__})"
         item["query"] = item["name"]
         duel[side] = item
-        bar.stage("visual", 0.1 + 0.3 * (index + 1))
+        report("visual", 0.1 + 0.3 * (index + 1))
 
     slides = build_duel_slides(duel)
 
-    bar.stage("voice", 0.3, "Synthesizing Voice \u2014 narrating the rounds...")
-    _synthesize(slides, MAGIC_EDGE_VOICE)
-
-    bar.stage("render", 0.05, "Finalizing Render \u2014 encoding...")
-    st.session_state.slides = slides
-    ok = run_render_pipeline(
-        slides, "duel",
-        str(st.session_state.get("render_aspect") or next(iter(ASPECT_RATIOS))),
-        str(st.session_state.get("render_fit") or DEFAULT_FIT),
-        str(st.session_state.get("render_transition") or "crossfade"),
-        float(st.session_state.get("render_transition_dur") or 0.5),
-        int(st.session_state.get("render_fps") or 24),
-        str(st.session_state.get("render_watermark") or ""),
+    report("voice", 0.3, "Synthesizing Voice \u2014 narrating the rounds...")
+    generate_slide_voiceovers(
+        slides, voice=MAGIC_EDGE_VOICE,
+        rate=f"{int(ctx['rate_pct']):+d}%", pitch=f"{int(ctx['pitch_hz']):+d}Hz",
     )
-    if not ok:
-        raise RuntimeError("The duel render did not complete.")
 
-    path = str(st.session_state.get("duel_video_path") or "")
+    # The same two engine calls run_render_pipeline makes, without the widgets
+    # it draws around them.
+    report("render", 0.02, "Finalizing Render \u2014 building the music bed...")
+    runtime = sum(float(s.get("duration") or 3.5) for s in slides)
+    stereo, rate = generate_synth_music(style=ctx["music_style"], duration=runtime + 2.0)
+    music_path = save_wav_to_file(
+        stereo, rate, os.path.join(ctx["exports"], f"music_{int(time.time())}.wav"))
+
+    out_path = _magic_out(ctx, "duel")
+
+    def on_step(step: int, total: int, message: str) -> None:
+        report("render", 0.05 + 0.95 * (step / max(1, total)),
+               f"Finalizing Render \u2014 {message}")
+
+    result = build_reel_video(
+        slides=slides,
+        aspect_ratio_name=ctx["aspect"],
+        fit_mode=ctx["fit"],
+        transition_type=ctx["transition"],
+        transition_dur=ctx["transition_dur"],
+        audio_path=music_path,
+        audio_volume=ctx["music_volume"],
+        watermark_text=ctx["watermark"],
+        fps=int(ctx["fps"]),
+        output_path=out_path,
+        progress_callback=on_step,
+        voiceover_volume=ctx["voice_volume"],
+        music_duck=ctx["music_duck"],
+        sfx_enabled=ctx["sfx_enabled"],
+        sfx_volume=ctx["sfx_volume"],
+    )
+
     script = " ".join(str(s.get("voiceover") or "") for s in slides).strip()
-    duration = sum(float(s.get("duration") or 0.0) for s in slides)
-    return {"path": path, "duration": duration, "script": script,
-            "entry": {"licence": "cc0", "duration": duration,
-                      "tts_provider": "gemini", "ai_disclosed": True}}
+    entry = append_ledger(ctx["exports"], {
+        "video_name": os.path.basename(out_path), "video_path": out_path,
+        "duration": float(result["duration"]),
+        "licence": DEFAULT_LICENCE, "licence_reference": "",
+        "source_title": duel["headline"],
+        "source_author": "", "source_url": "", "source_provider": "pexels",
+        "tts_provider": "edge", "voice": MAGIC_EDGE_VOICE,
+        "script_model": str(brief.get("model") or ""),
+        "ai_disclosed": True, "script": script, "magic_prompt": prompt,
+    })
+    return {"path": out_path, "duration": float(result["duration"]),
+            "script": script, "entry": entry}
 
 
-def _magic_commentary(prompt: str, bar: MagicProgress) -> dict[str, Any]:
-    """Licensed footage under an editorial script, captions burned in."""
+def _magic_commentary(prompt: str, ctx: dict[str, Any], report: Report) -> dict[str, Any]:
+    """
+    Licensed footage under an editorial script, captions burned in.
+
+    There is no commentary_engine.py: this pipeline is split between
+    gemini_engine (which watches the clip and writes), video_engine (which
+    reframes, loops, captions and encodes) and demo_data (which finds the
+    licensed footage). run_batch_job is the orchestration, and it is already
+    free of Streamlit by design because Batch Studio runs it unattended.
+    """
     stages = {"footage": ("script", 0.15), "script": ("script", 0.9),
               "voice": ("voice", 0.5), "render": ("render", 0.05)}
 
     def on_stage(name: str) -> None:
         key, within = stages.get(name, ("render", 0.5))
-        bar.stage(key, within)
+        report(key, within)
 
     job = _batch_job(prompt)
     settings = {
-        "aspect": str(st.session_state.get("render_aspect") or next(iter(ASPECT_RATIOS))),
-        "fit": str(st.session_state.get("render_fit") or DEFAULT_FIT),
-        "fps": int(st.session_state.get("render_fps") or 24),
-        "watermark": str(st.session_state.get("render_watermark") or ""),
-        "target": str(st.session_state.get("magic_target") or DEFAULT_TARGET),
-        "angle": "suspense",
-        "tts_provider": "gemini",
-        "voice": MAGIC_GEMINI_VOICE,
-        "kinetic": True,
-        "bgm": True,
-        "ai_disclosed": True,
+        "aspect": ctx["aspect"], "fit": ctx["fit"], "fps": int(ctx["fps"]),
+        "watermark": ctx["watermark"], "target": ctx["target"],
+        "angle": "suspense", "tts_provider": "gemini",
+        "voice": MAGIC_GEMINI_VOICE, "kinetic": True, "bgm": True,
+        "ai_disclosed": True, "exports": ctx["exports"],
     }
     job = run_batch_job(job, settings, on_stage=on_stage)
     return {"path": str(job["video_path"]), "duration": float(job["duration"]),
             "script": str(job["script"]),
-            "entry": find_entry(user_exports(), str(job["video_name"])) or {}}
+            "entry": find_entry(ctx["exports"], str(job["video_name"])) or {}}
 
 
-def _magic_atmosphere(prompt: str, bar: MagicProgress) -> dict[str, Any]:
+def _magic_atmosphere(prompt: str, ctx: dict[str, Any], report: Report) -> dict[str, Any]:
     """Long-form ambient: bed, texture, drifting canvas, stream-copy mux."""
     plan = magic_studio.atmosphere_plan(prompt)
-    workspace = user_exports()
-    os.makedirs(workspace, exist_ok=True)
+    workspace = ctx["exports"]
 
-    bar.stage("script", 1.0, "Writing Hook \u2014 choosing the soundscape...")
+    report("script", 1.0, "Writing Hook \u2014 choosing the soundscape...")
 
     canvas = {"rain_window": "rain_glass", "thunderstorm": "deep_dark",
               "fireplace": "ember", "stream": "mist",
               "brown_noise": "deep_dark"}.get(plan["bed"], ambient_engine.DEFAULT_CANVAS)
 
-    bar.stage("visual", 0.2, "Animating \u2014 painting the canvas...")
+    report("visual", 0.2, "Animating \u2014 painting the canvas...")
     still = ambient_engine.build_canvas_preset(canvas, workspace)
 
-    out_path = os.path.join(workspace, f"atmosphere_{int(time.time())}.mp4")
+    out_path = _magic_out(ctx, "atmosphere")
 
     def on_progress(message: str) -> None:
         low = message.lower()
         if "sound" in low or "audio" in low or "seed" in low:
-            bar.stage("voice", 0.5, f"Synthesizing Voice \u2014 {message}")
+            report("voice", 0.5, f"Synthesizing Voice \u2014 {message}")
         elif "visual" in low or "frame" in low:
-            bar.stage("visual", 0.7, f"Animating \u2014 {message}")
+            report("visual", 0.7, f"Animating \u2014 {message}")
         else:
-            bar.stage("render", 0.4, f"Finalizing Render \u2014 {message}")
+            report("render", 0.4, f"Finalizing Render \u2014 {message}")
 
     result = ambient_engine.render_atmosphere(
         bed=plan["bed"], texture=plan["texture"], visual_source=still,
@@ -6838,7 +6887,7 @@ def _magic_atmosphere(prompt: str, bar: MagicProgress) -> dict[str, Any]:
             "script": "", "entry": entry}
 
 
-_MAGIC_RUNNERS: dict[str, Callable[[str, Any], dict[str, Any]]] = {
+_MAGIC_RUNNERS: dict[str, Callable[..., dict[str, Any]]] = {
     "minimalist": _magic_minimalist,
     "duel": _magic_duel,
     "commentary": _magic_commentary,
@@ -6846,44 +6895,45 @@ _MAGIC_RUNNERS: dict[str, Callable[[str, Any], dict[str, Any]]] = {
 }
 
 
-def run_magic_job(prompt: str, style_key: str) -> dict[str, Any]:
+def start_magic_job(prompt: str, style_key: str,
+                    ctx: dict[str, Any]) -> magic_studio.MagicJob:
     """
-    The whole pipeline for one prompt. Returns the finished video, or raises.
+    Starts the render on a worker thread and returns immediately.
 
-    Failure is deliberately loud here. The manual modes can afford to leave a
-    half-finished state on screen for someone to correct; a one-click button
-    that silently produces nothing is indistinguishable from one that is
-    broken.
+    Daemon, so a render in flight never stops the server from shutting down.
+    Nothing inside `work` may call st.* -- see the note on MagicJob.
     """
+    job = magic_studio.MagicJob(prompt, style_key)
     runner = _MAGIC_RUNNERS[style_key]
-    bar = MagicProgress()
 
-    try:
-        result = runner(prompt, bar)
-    except Exception:
-        bar.empty()
-        raise
+    def work() -> None:
+        try:
+            result = runner(prompt, ctx, job.report)
+            path = str(result.get("path") or "")
+            if not path or not os.path.exists(path) or os.path.getsize(path) == 0:
+                raise FileNotFoundError(
+                    "The render finished but produced no file.")
+            with open(path, "rb") as handle:
+                data = handle.read()
+            job.finish({
+                "prompt": prompt, "style": style_key, "path": path,
+                "name": os.path.basename(path), "bytes": data,
+                "duration": float(result.get("duration") or 0.0),
+                "script": str(result.get("script") or ""),
+                "entry": result.get("entry") or {},
+            })
+        except Exception as exc:                              # noqa: BLE001
+            job.fail(exc)
 
-    path = str(result.get("path") or "")
-    if not path or not os.path.exists(path) or os.path.getsize(path) == 0:
-        bar.empty()
-        raise FileNotFoundError(
-            "The render finished but produced no file. Check the render log above.")
+    thread = threading.Thread(target=work, name=f"magic-{style_key}", daemon=True)
+    job.thread = thread
+    thread.start()
+    return job
 
-    bar.finish("Done.")
-    with open(path, "rb") as handle:
-        data = handle.read()
 
-    return {
-        "prompt": prompt,
-        "style": style_key,
-        "path": path,
-        "name": os.path.basename(path),
-        "bytes": data,
-        "duration": float(result.get("duration") or 0.0),
-        "script": str(result.get("script") or ""),
-        "entry": result.get("entry") or {},
-    }
+# How long a script run waits before drawing the progress again. Short enough
+# that the bar moves, long enough that the poll is not the load.
+MAGIC_POLL_SECONDS = 0.7
 
 
 def render_magic_studio(allowed: Sequence[str]) -> None:
@@ -6897,6 +6947,11 @@ def render_magic_studio(allowed: Sequence[str]) -> None:
                 '<div class="rf-magic-sub">Describe the video. Pick a style. '
                 'One button takes it from a sentence to a finished file.</div>'
                 '</div>', unsafe_allow_html=True)
+
+    job = st.session_state.get("magic_job")
+    if job is not None:
+        render_magic_progress(job, allowed)
+        return
 
     prompt = st.text_input(
         "What video do you want to create?",
@@ -6915,31 +6970,30 @@ def render_magic_studio(allowed: Sequence[str]) -> None:
             st.session_state["magic_style"] = detected
 
     keys = [s["key"] for s in styles]
-    chosen = st.session_state.get("magic_style")
-    if chosen not in keys:
-        chosen = keys[0]
 
-    labels = {s["key"]: f"{s['label']}" for s in styles}
-    picked = st.pills("Style", keys, default=chosen, key="magic_style",
+    # `magic_style` is the widget's own key, so seeding it in session state is
+    # how the auto-detect above sets the pill. Passing `default=` as well would
+    # be the widget-key trap from the other direction: Streamlit warns that a
+    # default was given for a key that session state already controls, and the
+    # default is ignored anyway. Seed it, then let the widget own it.
+    if st.session_state.get("magic_style") not in keys:
+        st.session_state["magic_style"] = keys[0]
+    chosen = st.session_state["magic_style"]
+
+    labels = {s["key"]: s["label"] for s in styles}
+    picked = st.pills("Style", keys, key="magic_style",
                       format_func=lambda k: labels[k], label_visibility="collapsed")
     picked = picked or chosen
 
     st.caption(magic_studio.style(picked)["sub"] + " \u2014 "
                + magic_studio.style(picked)["blurb"])
 
-    running = bool(st.session_state.get("magic_running"))
     if st.button("\u2728 Generate Full Video (1-Click)", key="magic_go",
-                 type="primary", width="stretch",
-                 disabled=running or not prompt.strip()):
-        st.session_state["magic_running"] = True
+                 type="primary", width="stretch", disabled=not prompt.strip()):
         st.session_state.pop("magic_result", None)
         st.session_state.pop("magic_error", None)
-        try:
-            st.session_state["magic_result"] = run_magic_job(prompt.strip(), picked)
-        except Exception as exc:
-            st.session_state["magic_error"] = f"{type(exc).__name__}: {exc}"
-        finally:
-            st.session_state["magic_running"] = False
+        st.session_state["magic_job"] = start_magic_job(
+            prompt.strip(), picked, magic_context())
         st.rerun()
 
     error = st.session_state.get("magic_error")
@@ -6951,28 +7005,87 @@ def render_magic_studio(allowed: Sequence[str]) -> None:
         render_magic_result(result, allowed)
 
 
+def render_magic_progress(job: Any, allowed: Sequence[str]) -> None:
+    """
+    Draws where the render has got to, then schedules the next look.
+
+    This function returns in milliseconds. That is the whole point: the render
+    is on another thread, so the script run that draws this is short and the
+    browser stays responsive for the whole job.
+    """
+    state = job.snapshot()
+
+    if state["done"]:
+        st.session_state.pop("magic_job", None)
+        if state["error"]:
+            st.session_state["magic_error"] = state["error"]
+        else:
+            st.session_state["magic_result"] = state["result"]
+            notify_complete(
+                "Render finished",
+                f"{state['result']['name']} \u2014 "
+                f"{state['result']['duration']:.0f}s in {state['elapsed']:.0f}s")
+        st.rerun()
+        return
+
+    with st.container(border=True):
+        st.markdown(f"**{magic_studio.style(job.style)['label']}** \u00b7 {job.prompt}")
+        suffix = f"  \u00b7  ~{state['eta']:.0f}s left" if state["eta"] else ""
+        st.progress(state["fraction"], text=f"{state['message']}{suffix}")
+        st.caption(state["caption"])
+        st.caption(f"{state['elapsed']:.0f}s elapsed \u00b7 rendering in the "
+                   f"background \u2014 this page stays responsive, and you can "
+                   f"leave it open.")
+
+        if st.button("Cancel", key="magic_cancel", width="stretch"):
+            # The thread is a daemon and ffmpeg has its own timeout, so
+            # abandoning it is safe; there is no way to interrupt a render
+            # mid-encode without leaving a part-written file behind.
+            st.session_state.pop("magic_job", None)
+            st.session_state["magic_error"] = "Cancelled. The render was abandoned."
+            st.rerun()
+
+    time.sleep(MAGIC_POLL_SECONDS)
+    st.rerun()
+
+
 def render_magic_result(result: dict[str, Any], allowed: Sequence[str]) -> None:
-    """The finished video, and the two things anyone wants to do with it."""
+    """The finished video, and the things anyone wants to do with it."""
     with st.container(border=True):
         st.markdown(f"#### \u2705 {result['name']}")
         st.video(result["bytes"])
 
         chip = dashboard_view.duration_chip(result["duration"])
+        earns = result["duration"] > TIKTOK_REWARDS_MIN_SECONDS
         st.markdown(
             badge(magic_studio.style(result["style"])["label"], "violet")
             + (badge(chip, "cyan") if chip else "")
-            + badge(_human_bytes(len(result["bytes"])), ""),
+            + badge(_human_bytes(len(result["bytes"])), "")
+            + badge("TikTok Rewards eligible" if earns
+                    else f"under {TIKTOK_REWARDS_MIN_SECONDS:.0f}s \u2014 no TikTok payout",
+                    "green" if earns else "amber"),
             unsafe_allow_html=True,
         )
 
-        download, upload = st.columns(2)
+        download, reveal, upload = st.columns(3)
         with download:
             st.download_button("\U0001f4e5 Download MP4", data=result["bytes"],
                                file_name=result["name"], mime="video/mp4",
                                width="stretch", key="magic_download")
+        with reveal:
+            if st.button("\U0001f4c2 Open in Explorer", key="magic_reveal",
+                         width="stretch",
+                         help="Opens the folder on the machine running Streamlit, "
+                              "which is the server \u2014 not necessarily the "
+                              "device you are reading this on."):
+                problem = reveal_in_file_manager(result["path"])
+                if problem:
+                    st.error(f"Could not open the folder: {problem}")
+                else:
+                    st.toast("Opened on the server's desktop.", icon="\U0001f4c2")
         with upload:
             can_publish = "atmosphere" in allowed
-            if st.button("\U0001f680 Direct Upload to YouTube/TikTok",
+            if st.button("\U0001f680 Upload to YouTube/TikTok",
                          key="magic_upload", width="stretch", disabled=not can_publish,
                          help="Opens the publisher with this file selected."
                               if can_publish else
@@ -6981,9 +7094,10 @@ def render_magic_result(result: dict[str, Any], allowed: Sequence[str]) -> None:
                 st.session_state["publish_target"] = result["path"]
                 go_to_mode("atmosphere")
 
+        st.caption(f"`{result['path']}`")
+
         if result.get("script"):
             render_viral_scorecard(result["script"], "magic", result.get("entry") or {})
-
 
 
 def render_dashboard(modes: Sequence[str]) -> None:

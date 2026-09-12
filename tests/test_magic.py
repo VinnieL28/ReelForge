@@ -571,3 +571,210 @@ def test_loading_a_preset_does_not_inherit_the_last_matchup(tmp_path, monkeypatc
         "the previous matchup's slides survived the preset switch")
     for key in ("duel_video_path", "duel_video_bytes"):
         assert key not in at.session_state, f"{key} survived the preset switch"
+
+
+# ---------------------------------------------------------------------------
+# Minimalist Motion: the engine this project leans on hardest
+# ---------------------------------------------------------------------------
+
+class TestCaptionSafeArea:
+    """
+    Captions must clear the action rail -- like, comment, share, sound -- on
+    both Shorts and TikTok, or the payoff line is read with a thumb over it.
+
+    The margin is enforced by a clamp inside the text drawing itself rather
+    than by each template remembering to stay above a line: fourteen templates
+    each doing their own arithmetic is fourteen chances to get it wrong.
+    """
+
+    def test_the_margin_is_deep_enough_for_a_tall_phone(self):
+        import minimalist_engine as me
+
+        assert me.SAFE_BOTTOM >= 220, (
+            f"{me.SAFE_BOTTOM}px does not clear the rail on a 20:9 screen")
+
+    def test_the_safe_line_moves_with_the_margin(self):
+        """A hardcoded y that does not track SAFE_BOTTOM is how the payoff
+        ended up six pixels inside the rail when the margin was raised."""
+        import minimalist_engine as me
+
+        assert me.SAFE_Y == me.CANVAS[1] - me.SAFE_BOTTOM
+        assert me.TEXT_SAFE_Y < me.SAFE_Y
+
+    def test_the_payoff_is_not_anchored_to_a_fixed_y(self):
+        import inspect
+
+        import minimalist_engine as me
+
+        source = inspect.getsource(me.draw_footer)
+        assert "TEXT_SAFE_Y" in source, "the payoff is not anchored to the safe line"
+        assert "1720" not in source, "the payoff is back on a hardcoded y"
+
+    @pytest.mark.parametrize("size", [36, 44, 52, 64, 72])
+    def test_a_clamped_line_never_paints_into_the_rail(self, size):
+        """The clamp reserves size * _INK_BELOW_ANCHOR below the anchor. That
+        figure was 0.62, a baseline-to-descender ratio, which is not what a
+        centred anchor needs: measured ink ran 36px below a 52px line against
+        the 32px reserved, and six of those landed in the rail."""
+        import numpy as np
+
+        import minimalist_engine as me
+
+        frame = me.Frame()
+        # Ask for a line below the safe area and let the clamp pull it up.
+        frame.text("QUIETLY COMPOUNDING, ypqjg", (540, 1900), size, me.WHITE, "bold")
+        array = np.asarray(frame.finish())
+        below = array[int(me.SAFE_Y):, :, :]
+        assert int((below.max(axis=2) > 40).sum()) == 0, (
+            f"{size}px text painted into the action rail")
+
+    @pytest.mark.parametrize("metaphor", [
+        "staircase_progress", "compounding_jar", "balance_scale", "split_path",
+        "gravity_funnel", "domino_chain", "comparison_split", "steep_staircase",
+        "delusion_mirror", "chain_anchor", "growth_consistency",
+        "sisyphus_boulder", "discipline_iceberg", "two_doors",
+    ])
+    def test_every_metaphor_draws_without_error(self, metaphor):
+        """All fourteen, across the whole timeline. A template that raises only
+        at the impact frame passes any test that renders one frame."""
+        import numpy as np
+
+        import minimalist_engine as me
+
+        spec = me.normalise_spec(me.fallback_scene_spec("a test", metaphor, 8.0))
+        for t in (0.5, 2.0, 4.0, 6.0, 7.5):
+            array = np.asarray(me.make_scene_frame(spec, t, 8.0))
+            assert array.shape == (1920, 1080, 3)
+            assert array.dtype.name == "uint8"
+
+    @pytest.mark.parametrize("metaphor", [
+        "compounding_jar", "balance_scale", "split_path", "domino_chain",
+        "growth_consistency",
+    ])
+    def test_template_geometry_only_grazes_the_boundary(self, metaphor):
+        """
+        Five templates put line-work within a few pixels of the safe line.
+        That is antialiasing on a stroke rather than a caption, and it leaves
+        the buttons 217 of their 220 pixels -- but it is pinned here so a
+        redesign that walks real geometry into the rail is caught.
+        """
+        import numpy as np
+
+        import minimalist_engine as me
+
+        spec = me.normalise_spec(me.fallback_scene_spec("a test", metaphor, 8.0))
+        deepest = int(me.SAFE_Y)
+        for t in (0.5, 2.0, 4.0, 6.0, 7.5):
+            array = np.asarray(me.make_scene_frame(spec, t, 8.0))
+            ys, _ = np.nonzero(array[int(me.SAFE_Y):, :, :].max(axis=2) > 40)
+            if len(ys):
+                deepest = max(deepest, int(me.SAFE_Y) + int(ys.max()))
+        assert deepest - int(me.SAFE_Y) <= 8, (
+            f"{metaphor} reaches {deepest - int(me.SAFE_Y)}px into the action rail")
+
+
+class TestMonetizableLength:
+
+    def test_scene_scripts_target_a_payable_runtime(self):
+        """TikTok Creator Rewards counts nothing at or under 60 seconds. The
+        band was 15-25s, so every vector render earned exactly zero there."""
+        import gemini_engine
+
+        assert gemini_engine.SCENE_MIN_SECONDS > compliance.TIKTOK_REWARDS_MIN_SECONDS
+        assert gemini_engine.SCENE_MIN_SECONDS >= 62
+        assert gemini_engine.SCENE_MAX_SECONDS <= 75
+
+    def test_the_word_budget_fills_that_runtime(self):
+        import gemini_engine as ge
+
+        # The budget must land inside the band at the rate this engine really
+        # speaks -- measured at 1.875 words/second by rendering one, not
+        # estimated. 150 words came back at 80.0s and was clipped.
+        rate = ge.SCENE_WORDS_PER_SECOND
+        assert ge.SCENE_MIN_WORDS / rate >= ge.SCENE_MIN_SECONDS - 1, (
+            "the minimum budget speaks for less than the minimum runtime")
+        assert ge.SCENE_MAX_WORDS / rate <= ge.SCENE_MAX_SECONDS, (
+            f"{ge.SCENE_MAX_WORDS} words runs {ge.SCENE_MAX_WORDS / rate:.0f}s, "
+            f"past the {ge.SCENE_MAX_SECONDS:.0f}s band")
+
+    def test_the_prompt_actually_asks_for_it(self):
+        import gemini_engine as ge
+
+        prompt = ge.build_scene_prompt("a test concept", "auto", 70.0)
+        assert f"{ge.SCENE_MIN_WORDS}-{ge.SCENE_MAX_WORDS} words" in prompt
+        assert "62" in prompt and "75" in prompt
+
+    def test_the_render_ceiling_clears_the_target_band(self):
+        """MAX_DURATION was 60.0 -- precisely the number that earns nothing --
+        so the cap silently clipped every scene to just short of payable."""
+        import gemini_engine as ge
+        import minimalist_engine as me
+
+        assert me.MAX_DURATION >= ge.SCENE_MAX_SECONDS
+
+
+class TestNoBlockingRenders:
+
+    def test_every_ffmpeg_call_has_a_timeout(self):
+        """A wedged ffmpeg inside a Streamlit script run is a browser tab that
+        never comes back, and it looks identical to a slow render."""
+        import glob
+        import re
+
+        untimed = []
+        for path in sorted(glob.glob("*.py")):
+            source = open(path, encoding="utf-8").read()
+            for match in re.finditer(
+                    r"subprocess\.(run|check_output)\((?:[^()]|\([^()]*\))*\)",
+                    source, re.DOTALL):
+                if "timeout=" not in match.group(0):
+                    line = source[:match.start()].count("\n") + 1
+                    untimed.append(f"{path}:{line}")
+        assert not untimed, f"subprocess calls with no timeout: {untimed}"
+
+    def test_the_one_click_render_runs_off_the_script_thread(self):
+        import inspect
+
+        import app
+
+        source = inspect.getsource(app.start_magic_job)
+        assert "threading.Thread" in source
+        assert "daemon=True" in source
+
+    def test_no_runner_touches_streamlit(self):
+        """There is no ScriptRunContext on the worker thread. An st.* call
+        there is at best a logged warning and at worst a wrong answer:
+        session_state would resolve to a different account's export folder."""
+        import inspect
+
+        import app
+
+        for runner in (app._magic_minimalist, app._magic_duel,
+                       app._magic_commentary, app._magic_atmosphere):
+            source = inspect.getsource(runner)
+            assert "session_state" not in source, (
+                f"{runner.__name__} reads session_state off-thread")
+            assert "user_exports()" not in source, (
+                f"{runner.__name__} resolves the export folder off-thread")
+            assert "st.rerun" not in source and "st.markdown" not in source, (
+                f"{runner.__name__} draws Streamlit from the worker thread")
+
+    def test_the_context_is_captured_on_the_main_thread(self):
+        import inspect
+
+        import app
+
+        source = inspect.getsource(app.magic_context)
+        assert "user_exports()" in source and "session_state" in source
+
+    def test_a_dead_worker_does_not_poll_forever(self):
+        """A thread killed without reporting would otherwise leave the page
+        refreshing every 0.7s for the rest of the session."""
+        import threading
+
+        job = ms.MagicJob("test", "minimalist")
+        job.thread = threading.Thread(target=lambda: None)
+        job.thread.start()
+        job.thread.join()
+        state = job.snapshot()
+        assert state["done"] and state["error"]

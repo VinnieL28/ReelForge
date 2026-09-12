@@ -811,7 +811,7 @@ def retention_tip(hook: dict[str, Any], density: dict[str, Any],
                 f"-- give the two emptiest sentences a figure each, or cut them and "
                 f"reach the payoff sooner.")
 
-    if float(money.get("score") or 0.0) < 6.0:
+    if float(money.get("score") or 0.0) < MONETIZATION_FLOOR:
         return ("Fix the monetization flag before retention: a video that cannot be "
                 "monetized does not benefit from a better hook.")
 

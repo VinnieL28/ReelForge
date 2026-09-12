@@ -601,7 +601,25 @@ SCENE_METAPHORS: dict[str, dict[str, str]] = {
 SCENE_TEMPLATE_KEYS = tuple(METAPHOR_TYPES) + ("custom", "auto")
 
 # Shorts retention: long enough to say something, short enough to loop.
-SCENE_MIN_SECONDS, SCENE_MAX_SECONDS = 15.0, 25.0
+# Long enough to earn. TikTok Creator Rewards counts nothing under 60
+# seconds, so a 15-25s scene -- which is what this asked for until now -- was a
+# beautiful video that could not be monetized on the platform this engine
+# exists to serve. 62 rather than 60 for the same reason the commentary band
+# uses it: narration lands within a few percent of a word budget rather than on
+# it, and a target of exactly 60 puts half the renders under the bar.
+SCENE_MIN_SECONDS, SCENE_MAX_SECONDS = 62.0, 75.0
+
+# The spoken budget that fills it. Calibrated by rendering, not estimated: a
+# 150-word thesis came back at 80.0s -- which is 1.875 words/second, well under
+# the 2.4 the commentary bands assume, because this engine's narration is
+# deliberately unhurried and pauses on the beats. 150 words therefore overran
+# the band and hit the render ceiling, where the tail of the narration is
+# clipped to fit.
+#
+# 62s / 1.875 = 116 words, 75s / 1.875 = 141. The band below sits inside that
+# with margin at both ends.
+SCENE_WORDS_PER_SECOND = 1.875
+SCENE_MIN_WORDS, SCENE_MAX_WORDS = 120, 140
 
 
 def build_scene_prompt(concept: str, template: str = "auto",
@@ -664,7 +682,11 @@ def build_scene_prompt(concept: str, template: str = "auto",
         '  "title": 2-5 words, uppercase, the hook that stops the scroll\n'
         '  "subtitle": one short line under the title, sentence case\n'
         '  "payoff": the closing line, 3-8 words, the idea at its hardest\n'
-        '  "thesis": one spoken sentence, 18-32 words, what a narrator reads\n'
+        f'  "thesis": the full narration, {SCENE_MIN_WORDS}-{SCENE_MAX_WORDS} words. '
+        'Not a single sentence -- 8 to 12 of them, building one argument: state '
+        'the counter-intuitive claim, give the mechanism, give a concrete '
+        'consequence, then turn. It is read aloud over the animation and its '
+        'length sets the length of the video, so write the whole thing.\n'
         f'  "duration": seconds, between {SCENE_MIN_SECONDS:.0f} and {SCENE_MAX_SECONDS:.0f}\n'
         '  "animation_phases": {"draw_end": seconds the geometry finishes '
         'drawing itself, "impact": seconds the object clears the obstacle and '

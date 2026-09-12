@@ -392,3 +392,92 @@ def duel_brief(prompt: str,
         f"Could not build a matchup for {text!r}"
         + (f": {type(last).__name__}: {last}" if last else ".")
     )
+
+
+# ---------------------------------------------------------------------------
+# Running a render off the Streamlit thread
+#
+# A Streamlit script run is a request. Rendering inside one holds that request
+# open for the length of the render -- minutes, now that Minimalist scenes are
+# written to a monetizable 62-75 seconds -- and a browser does not wait
+# minutes. The tab stops responding, the websocket drops, and what the person
+# sees is indistinguishable from a crash.
+#
+# So the work happens on a worker thread and the script run polls this object.
+# Each run then lasts a fraction of a second: draw the current stage, schedule
+# another run, return.
+#
+# The worker must never touch st.session_state or call any st.* function.
+# There is no ScriptRunContext on that thread, so those calls are at best
+# no-ops that log a warning and at worst raise. Everything the render needs is
+# copied into a plain dict on the main thread and handed over; everything it
+# produces comes back through here.
+# ---------------------------------------------------------------------------
+
+class MagicJob:
+    """Thread-safe progress and result for one one-click render."""
+
+    def __init__(self, prompt: str, style_key: str) -> None:
+        import threading
+        import time
+
+        self.prompt = str(prompt)
+        self.style = str(style_key)
+        self.started = time.time()
+        self.thread: Any = None
+        self._lock = threading.Lock()
+        self._state: dict[str, Any] = {
+            "stage": STAGES[0][0],
+            "within": 0.0,
+            "message": "Starting...",
+            "done": False,
+            "error": "",
+            "result": None,
+        }
+
+    # -- called from the worker ---------------------------------------------
+
+    def report(self, stage: str, within: float = 0.0, message: str = "") -> None:
+        with self._lock:
+            self._state["stage"] = stage
+            self._state["within"] = max(0.0, min(1.0, float(within)))
+            self._state["message"] = message or STAGE_LABELS.get(stage, stage)
+
+    def finish(self, result: dict[str, Any]) -> None:
+        with self._lock:
+            self._state["result"] = result
+            self._state["done"] = True
+            self._state["within"] = 1.0
+
+    def fail(self, exc: BaseException) -> None:
+        with self._lock:
+            self._state["error"] = f"{type(exc).__name__}: {exc}"
+            self._state["done"] = True
+
+    # -- called from the script run -----------------------------------------
+
+    def snapshot(self) -> dict[str, Any]:
+        import time
+
+        with self._lock:
+            state = dict(self._state)
+        state["elapsed"] = time.time() - self.started
+        state["fraction"] = (1.0 if state["done"] and not state["error"]
+                             else stage_fraction(state["stage"], state["within"]))
+        state["caption"] = stage_caption(state["stage"])
+
+        # An ETA is only meaningful once there is enough of the job behind it
+        # to extrapolate from. Before that it swings by minutes between frames.
+        eta = 0.0
+        if state["fraction"] > 0.08 and not state["done"]:
+            eta = state["elapsed"] * (1.0 - state["fraction"]) / state["fraction"]
+        state["eta"] = eta
+
+        # A worker that died without reporting -- an OS-level kill, an
+        # unhandled exit -- would otherwise leave the page polling forever.
+        thread = self.thread
+        if (not state["done"] and thread is not None and not thread.is_alive()):
+            state["done"] = True
+            state["error"] = state["error"] or (
+                "The render thread stopped without reporting a result.")
+        return state
