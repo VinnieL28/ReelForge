@@ -52,6 +52,7 @@ class TestSubtitles:
         ("duel", "split-screen"),
         ("atmosphere", "multi-hour ambient"),
         ("library", "reveal in explorer"),
+        ("dashboard", "every engine"),
     ])
     def test_the_wording_matches_what_the_mode_does(self, mode, phrase):
         assert phrase in app.MODE_SUBTITLES[mode].lower()
@@ -61,7 +62,7 @@ class TestHeaderLayout:
 
     def test_the_container_has_top_breathing_room(self):
         rule = _rule(".block-container")
-        assert "padding-top: 3rem !important" in rule, rule
+        assert "padding-top: 2.5rem !important" in rule, rule
 
     def test_the_logotype_line_box_fits_its_glyphs(self):
         """line-height 1.1 on a background-clip:text fill is what clipped the

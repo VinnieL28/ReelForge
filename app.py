@@ -75,6 +75,7 @@ from compliance import (
 )
 import auth
 import ambient_engine
+import dashboard_view
 import niche_engine
 import publisher
 import reel_engine
@@ -186,7 +187,7 @@ html, body, .stApp, [class*="css"] {
 }
 
 #MainMenu, footer, header [data-testid="stStatusWidget"] { visibility: hidden; }
-.block-container { padding-top: 3rem !important; padding-bottom: 3rem; max-width: 1500px; }
+.block-container { padding-top: 2.5rem !important; padding-bottom: 3rem; max-width: 1500px; }
 
 h1, h2, h3, h4, h5 { font-family: 'Inter', sans-serif; color: var(--text-hi); letter-spacing: -0.022em; }
 h1 { font-weight: 800; }
@@ -477,6 +478,91 @@ p, span, label, li { color: var(--text-mid); }
 .rf-axis.green .rf-axis-bar i { background: linear-gradient(90deg, #10B981, #34D399); }
 .rf-axis.amber .rf-axis-bar i { background: linear-gradient(90deg, #F59E0B, var(--amber)); }
 .rf-axis.red   .rf-axis-bar i { background: linear-gradient(90deg, #DC2626, #F87171); }
+/* ---------- Dashboard landing ---------- */
+.rf-hero {
+    border: 1px solid var(--edge); border-radius: 18px; padding: 22px 26px;
+    background:
+        radial-gradient(720px 240px at 6% -40%, rgba(139, 92, 246, 0.20), transparent 70%),
+        radial-gradient(620px 220px at 96% 140%, rgba(34, 211, 238, 0.13), transparent 68%),
+        rgba(255, 255, 255, 0.028);
+    backdrop-filter: blur(14px); margin-bottom: 18px;
+}
+.rf-hero-title {
+    font-size: 1.42rem; font-weight: 800; color: var(--text-hi);
+    letter-spacing: -0.028em; line-height: 1.3;
+}
+.rf-hero-lede {
+    font-size: 0.90rem; color: var(--text-mid); margin-top: 6px;
+    line-height: 1.55; max-width: 860px;
+}
+.rf-hero-badges { margin-top: 13px; }
+
+/* Stepper */
+.rf-step {
+    border: 1px solid var(--edge); border-radius: 14px; padding: 15px 17px 13px 17px;
+    background: rgba(255, 255, 255, 0.028); transition: border-color 140ms ease;
+    /* Streamlit columns do not stretch their children, so the three cards are
+       squared off against the tallest -- step two, which carries the two lane
+       chip rows. Without it the cards end at three different heights and the
+       buttons under them stagger. */
+    min-height: 236px;
+}
+.rf-step:hover { border-color: var(--edge-hi); }
+.rf-step-n {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 25px; height: 25px; border-radius: 8px; font-size: 0.80rem; font-weight: 800;
+    color: #0B0C11; background: linear-gradient(135deg, var(--violet), var(--indigo));
+    margin-bottom: 9px;
+}
+.rf-step-t {
+    font-size: 0.99rem; font-weight: 720; color: var(--text-hi);
+    letter-spacing: -0.018em; margin-bottom: 5px;
+}
+.rf-step-b { font-size: 0.805rem; line-height: 1.52; color: var(--text-mid); }
+.rf-step-lane {
+    font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.085em;
+    color: var(--text-low); font-weight: 700; margin: 11px 0 5px 0;
+}
+
+/* Engine grid */
+.rf-engine {
+    border: 1px solid var(--edge); border-radius: 14px; padding: 15px 16px 11px 16px;
+    background: rgba(255, 255, 255, 0.028); position: relative; overflow: hidden;
+    transition: border-color 140ms ease, transform 140ms ease;
+}
+.rf-engine:hover { border-color: var(--edge-hi); transform: translateY(-1px); }
+.rf-engine-head { display: flex; align-items: center; gap: 9px; margin-bottom: 9px; }
+.rf-engine-icon {
+    font-size: 1.16rem; line-height: 1; width: 32px; height: 32px; flex: 0 0 32px;
+    border-radius: 10px; background: rgba(255, 255, 255, 0.05);
+    border: 1px solid var(--edge); display: flex; align-items: center;
+    justify-content: center;
+}
+.rf-engine-name {
+    font-size: 0.93rem; font-weight: 720; color: var(--text-hi); letter-spacing: -0.018em;
+}
+.rf-engine-use {
+    font-size: 0.785rem; line-height: 1.52; color: var(--text-mid); margin-top: 9px;
+    min-height: 4.56em;
+}
+
+/* Connectivity panel */
+.rf-api {
+    border: 1px solid var(--edge); border-radius: 12px; padding: 11px 13px;
+    background: rgba(255, 255, 255, 0.028); margin-bottom: 7px;
+}
+.rf-api-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.rf-api-name {
+    font-size: 0.80rem; font-weight: 700; color: var(--text-hi); letter-spacing: -0.01em;
+}
+.rf-api-detail { font-size: 0.70rem; line-height: 1.45; color: var(--text-low); margin-top: 6px; }
+
+/* Sidebar navigation: full-width rows rather than centred pills, so the
+   grouped menu reads as a list. */
+[data-testid="stSidebar"] .stButton > button {
+    justify-content: flex-start; text-align: left; font-size: 0.815rem;
+    padding: 8px 12px; font-weight: 600;
+}
 </style>
 """
 
@@ -6393,7 +6479,187 @@ def render_niche_scout() -> None:
                         unsafe_allow_html=True)
                     _scout_topic_actions(topic, band, f"{index}_{slot}", allowed)
 
+# ---------------------------------------------------------------------------
+# Dashboard
+#
+# The landing view. Everything on it is either a live reading or a way into a
+# mode -- there is no content here that is only decoration, because a home
+# screen you scroll past is a home screen that costs a click on every visit.
+#
+# The KPI bar is deliberately NOT redrawn here: render_command_center() is
+# already painted above every page by main(), and a second copy would collide
+# on the purge button's widget key.
+# ---------------------------------------------------------------------------
+
+def render_dashboard(modes: Sequence[str]) -> None:
+    allowed = list(modes)
+
+    hw_head, hw_detail = hardware_label()
+    stats = workspace_stats()
+    ledger = summarise_ledger(stats["root"])
+
+    # Same wording as the KPI badge directly above it. Two different words for
+    # one state on a single screen reads as two different states.
+    gate_strict = bool(ledger["total"]) and ledger["blocked"] > 0
+    gate_word = "Strict" if gate_strict else "Active"
+
+    accel = hw_head.startswith("NVENC")
+    hardware_badge = (badge("\u26a1 Hardware Accelerated (NVENC Active)", "green") if accel
+                      else badge(f"\u2699\ufe0f CPU Encoding ({hw_detail})", "amber"))
+
+    st.markdown(
+        '<div class="rf-hero">'
+        '<div class="rf-hero-title">Welcome to ReelForge Studio &mdash; Autonomous '
+        'Faceless Video Automation &amp; Monetization Engine</div>'
+        '<div class="rf-hero-lede">Nine views behind one render pipeline: research a '
+        'niche, script it against real facts, synthesize the picture and the sound, '
+        'and clear the monetization gate before anything leaves the machine. Nothing '
+        'here needs a camera, and nothing it draws or synthesizes belongs to anyone '
+        'else.</div>'
+        f'<div class="rf-hero-badges">{hardware_badge}'
+        + badge(f"\U0001f6e1\ufe0f Monetization Gate: {gate_word}",
+                "amber" if gate_strict else "green")
+        + badge(f"{stats['renders']} renders on disk", "violet")
+        + '</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    # ---- the three-step path ----------------------------------------------
+    section("The production path")
+    for column, step in zip(st.columns(3), dashboard_view.STEPS):
+        with column:
+            lanes = ""
+            for lane_label, lane_modes in step["lanes"]:
+                chips = "".join(
+                    badge(MODE_LABELS[m].split(" ", 1)[-1], "cyan")
+                    for m in lane_modes if m in allowed
+                )
+                if chips:
+                    lanes += f'<div class="rf-step-lane">{lane_label}</div>{chips}'
+
+            st.markdown(
+                f'<div class="rf-step"><div class="rf-step-n">{step["number"]}</div>'
+                f'<div class="rf-step-t">{step["title"]}</div>'
+                f'<div class="rf-step-b">{step["blurb"]}</div>{lanes}</div>',
+                unsafe_allow_html=True,
+            )
+            for target in step["targets"]:
+                if target not in allowed:
+                    continue
+                if st.button(f"{MODE_LABELS[target]} \u2192",
+                             key=f"step_{step['number']}_{target}", width="stretch"):
+                    go_to_mode(target)
+
+    divider()
+
+    # ---- the engine grid ---------------------------------------------------
+    section("Studio engines")
+    cards = dashboard_view.engines_for(allowed)
+    for row_start in range(0, len(cards), 4):
+        row = cards[row_start:row_start + 4]
+        # Always four columns, even on a short final row: three cards stretched
+        # across the full width read as a different, larger tier of thing.
+        columns = st.columns(4)
+        for column, card in zip(columns, row):
+            with column:
+                st.markdown(
+                    f'<div class="rf-engine"><div class="rf-engine-head">'
+                    f'<div class="rf-engine-icon">{card["icon"]}</div>'
+                    f'<div class="rf-engine-name">{card["name"]}</div></div>'
+                    + badge(card["format"], "violet")
+                    + f'<div class="rf-engine-use">{card["use"]}</div></div>',
+                    unsafe_allow_html=True,
+                )
+                if st.button("Open Engine \u2192", key=f"open_{card['mode']}",
+                             width="stretch"):
+                    go_to_mode(card["mode"])
+
+    divider()
+
+    # ---- connectivity ------------------------------------------------------
+    section("API connectivity")
+    rows = dashboard_view.api_status()
+    for column, row in zip(st.columns(len(rows)), rows):
+        with column:
+            st.markdown(
+                f'<div class="rf-api"><div class="rf-api-head">'
+                f'<div class="rf-api-name">{row["name"]}</div>'
+                + badge(row["state"], row["tone"])
+                + f'</div><div class="rf-api-detail">{row["detail"]}</div></div>',
+                unsafe_allow_html=True,
+            )
+
+    divider()
+    render_dashboard_activity(allowed)
+    divider()
+    render_monetization_tips()
+
+
+def render_dashboard_activity(allowed: Sequence[str]) -> None:
+    """The three most recent renders, with a runtime chip and a download."""
+    section("Recent activity")
+    recent = list_exports()[:3]
+
+    if not recent:
+        st.caption("Nothing rendered yet. Start at step one and the last three "
+                   "finished videos will appear here.")
+        return
+
+    for column, item in zip(st.columns(3), recent):
+        with column:
+            details = export_details(item["path"], item["mtime"], item["bytes"])
+            if details["thumb"] is not None:
+                st.image(details["thumb"], width="stretch")
+            else:
+                st.markdown('<div class="rf-thumb-blank">\u25b6</div>',
+                            unsafe_allow_html=True)
+
+            chip = dashboard_view.duration_chip(details["duration"])
+            ratio = aspect_tag(details["width"], details["height"])
+            st.markdown(
+                badge(item["kind"], "violet")
+                + (badge(chip, "cyan") if chip else "")
+                + (badge(ratio, "") if ratio else ""),
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f'<div class="rf-export-name" title="{item["name"]}">{item["name"]}</div>'
+                f'<div class="rf-export-meta">{_human_bytes(item["bytes"])} \u00b7 '
+                f'{time.strftime("%d %b %Y, %H:%M", time.localtime(item["mtime"]))}</div>',
+                unsafe_allow_html=True,
+            )
+
+            if item["bytes"] <= DOWNLOAD_LIMIT_BYTES:
+                with open(item["path"], "rb") as handle:
+                    st.download_button("\u2b07 Download", data=handle.read(),
+                                       file_name=item["name"], mime="video/mp4",
+                                       width="stretch", key=f"dash_dl_{item['name']}")
+            else:
+                st.button("\u2b07 Download", key=f"dash_dl_{item['name']}",
+                          width="stretch", disabled=True,
+                          help=f"{_human_bytes(item['bytes'])} is too large to push "
+                               f"through the browser \u2014 copy it from disk instead.")
+
+    if "library" in allowed:
+        if st.button("\U0001f4c1 Open the Exports Library \u2192", key="dash_to_library"):
+            go_to_mode("library")
+
+
+def render_monetization_tips() -> None:
+    """Platform compliance, folded away until someone wants it."""
+    with st.expander("\U0001f4b0 Platform monetization rules "
+                     "\u2014 read before you publish"):
+        for group in dashboard_view.platform_rules():
+            st.markdown(f"**{group['platform']}**")
+            if group["threshold"]:
+                st.caption(group["threshold"])
+            for rule in group["rules"]:
+                st.markdown(f"- {rule}")
+            st.markdown("")
+
+
 MODE_SUBTITLES: dict[str, str] = {
+    "dashboard": "Your command centre: live system health, the three-step production path, and a way into every engine.",
     "commentary": "Drop a raw clip, let Gemini analyze the visual beats, and publish "
                   "high-retention editorial commentary.",
     "minimalist": "Generate original, code-driven 2D vector psychology and finance "
@@ -6416,6 +6682,7 @@ MODE_SUBTITLES: dict[str, str] = {
 }
 
 MODE_LABELS: dict[str, str] = {
+    "dashboard": "\U0001f3e0 Dashboard",
     "commentary": "🎙️ Commentary Machine",
     "minimalist": "◼️ Minimalist Motion",
     "narrative": "📖 Narrative Studio",
@@ -6427,6 +6694,52 @@ MODE_LABELS: dict[str, str] = {
     "library": "📁 Exports Library",
     "admin": "🛠️ Admin",
 }
+
+
+# The landing view when nothing else has been chosen -- on first sign-in, and
+# on a browser refresh that drops the session.
+DEFAULT_MODE = "dashboard"
+
+# The sidebar, grouped. Dashboard sits alone at the top; the engines that make
+# something are separated from the ones that do not. A test asserts this covers
+# every registered mode exactly once, so a new mode cannot be added without
+# being given a home in the menu.
+NAV_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("", ("dashboard",)),
+    ("Creation Engines", ("commentary", "minimalist", "narrative", "batch",
+                          "reel", "duel", "atmosphere")),
+    ("Tools & Library", ("scout", "library", "admin")),
+)
+
+
+def go_to_mode(mode: str) -> None:
+    """
+    Switches the active view and reruns.
+
+    `app_mode` is plain session state rather than a widget key, which is what
+    makes this safe to call from a dashboard card: a widget whose key already
+    exists in session state ignores any value written to it, so a pills-backed
+    menu would have gone on showing the old mode selected while the page
+    rendered the new one. Buttons carry no value to fight with.
+    """
+    st.session_state["app_mode"] = mode
+    st.rerun()
+
+
+def render_mode_nav(modes: Sequence[str], active: str) -> None:
+    """The grouped sidebar menu. Highlights the mode currently on screen."""
+    for heading, group in NAV_GROUPS:
+        visible = [mode for mode in group if mode in modes]
+        if not visible:
+            continue
+        if heading:
+            section(heading)
+        for mode in visible:
+            if st.button(MODE_LABELS.get(mode, mode), key=f"nav_{mode}",
+                         width="stretch",
+                         type="primary" if mode == active else "secondary",
+                         help=MODE_SUBTITLES.get(mode, "")):
+                go_to_mode(mode)
 
 
 def main() -> None:
@@ -6446,9 +6759,13 @@ def main() -> None:
     # session state *before* the rerun that follows a click, so by the time this
     # line runs "app_mode" already holds the newly picked mode -- there is no
     # need for a placeholder, and no one-rerun lag.
-    active = str(st.session_state.get("app_mode") or modes[0])
-    if active not in modes:
-        active = modes[0]
+    requested = str(st.session_state.get("app_mode") or DEFAULT_MODE)
+    active = requested if requested in modes else (
+        DEFAULT_MODE if DEFAULT_MODE in modes else modes[0])
+    # Written back so the nav highlight, the header subtitle and the routed
+    # page below can never disagree about which mode is on screen.
+    st.session_state["app_mode"] = active
+    denied = requested if requested != active else ""
 
     st.markdown(
         '<div class="rf-brand"><div class="rf-logo">🎬</div>'
@@ -6466,10 +6783,8 @@ def main() -> None:
         st.markdown('<div class="rf-section">Production Mode</div>', unsafe_allow_html=True)
         # The menu is built from the role, so a creator is never offered an
         # engine they cannot open.
-        mode = pick(
-            "Mode", modes, modes[0], "app_mode",
-            format_func=lambda m: MODE_LABELS.get(str(m), str(m)),
-        )
+        render_mode_nav(modes, active)
+        mode = active
 
         divider()
         st.markdown('<div class="rf-section">Format</div>', unsafe_allow_html=True)
@@ -6515,10 +6830,15 @@ def main() -> None:
 
     # The sidebar already filtered the menu; this catches a stale `app_mode`
     # left in session state from a previous account on the same browser.
-    if mode not in modes:
-        st.error(f"Your role does not have access to that view. Showing {MODE_LABELS[modes[0]]}.",
-                 icon="🚫")
-        mode = modes[0]
+    if denied:
+        st.error(f"Your role does not have access to that view. "
+                 f"Showing {MODE_LABELS[mode]}.", icon="🚫")
+
+    # The landing page. No render card and no guidance banner: it is a way in
+    # to the engines, not one of them.
+    if mode == "dashboard":
+        render_dashboard(modes)
+        return
 
     if mode == "admin":
         render_admin_studio()

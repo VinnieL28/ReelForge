@@ -6,6 +6,7 @@ refuses to call something publish-ready when it is not.
 
 | Engine | What it does |
 |---|---|
+| 🏠 Dashboard | The landing view: system health, the three-step production path, and a way into every engine |
 | 🎙️ Commentary Machine | Gemini watches a clip and writes the commentary; TTS narrates it; kinetic captions burn in |
 | 📖 Narrative Studio | Episodic storytelling: Gemini writes the script and casts the world, then a storyboard becomes Ken Burns shots cut to the voice |
 | ◼️ Minimalist Motion | Draws a 1080×1920 vector animation from code — 15 metaphor templates, no footage, no stock, no model-generated imagery |
@@ -22,6 +23,14 @@ encoder this machine will actually use, and whether the compliance gate is
 holding anything back), and a card saying what the engine is for and roughly
 how long a render takes. Then the work, and nothing after it — the creation
 pages end at their own render button.
+
+Sign in and you land on **🏠 Dashboard** rather than inside an engine. It holds
+the welcome banner and live status badges, the three-step production path
+(discover, synthesize, publish), a card per engine with its format and its one
+use case, an API connectivity panel, the last three renders, and the platform
+monetization rules folded into an accordion. The sidebar groups the rest:
+**Creation Engines** for the seven that make something, **Tools & Library** for
+Niche Scout, the Exports Library and Admin.
 
 Everything you have made lives in **📁 Exports Library**, a mode of its own:
 a grid of every render in `exports/<username>/` with its duration, size, date
@@ -358,8 +367,8 @@ again. Only `app.py` itself is hot.
 
 | Role | Engines | Can also |
 |---|---|---|
-| `admin` | all seven, plus Niche Scout, the Exports Library and the Admin panel | manage users, set API keys, see every workspace |
-| `creator` (`member`) | Commentary Machine, Minimalist Motion, Narrative Studio, Niche Scout, and their own Exports Library | nothing else — own files only |
+| `admin` | the Dashboard and all seven engines, plus Niche Scout, the Exports Library and the Admin panel | manage users, set API keys, see every workspace |
+| `creator` (`member`) | the Dashboard, Commentary Machine, Minimalist Motion, Narrative Studio, Niche Scout, and their own Exports Library | nothing else — own files only |
 
 Users live in `users.json` (gitignored) or in environment variables. Passwords
 are stored as **PBKDF2-HMAC-SHA256**, salted per user, 240,000 iterations.
@@ -455,6 +464,8 @@ git check-ignore -v .env users.json exports    # all three should print a rule
 
 ```
 app.py            Streamlit UI, login gate, the command centre, all six studios
+dashboard_view.py the landing page catalogue: engine cards, the production
+                  path, connectivity probes, platform compliance rules
 auth.py           password hashing, roles, user store, login rate limiting
 paths.py          project-relative paths and cross-platform font resolution
 narrative_engine.py  the episodic pipeline (Narrative Studio)
