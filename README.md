@@ -104,6 +104,40 @@ is what the comments will be about.
 
 ---
 
+## Performance
+
+Everything else in this app is a prediction. The scorecard says a hook should
+hold, the CPM band says a niche should pay, the saturation score says a market
+has room — and none of it was ever contradicted, because nothing measured the
+result.
+
+The Dashboard now reads the channel's own numbers back and joins them to the
+render that produced them, using the video id the publisher writes into the
+ledger on upload. Views, average view percentage, subscribers gained, likes and
+comments, per video, over the last 28 days.
+
+Then the part that matters: it grades the scorecard. For every published video
+it compares the hook score that script was given against the retention that
+video actually got, and reports the correlation — including when that
+correlation is **inverted**, which is the single most useful thing this app
+could tell you. Below five published videos it says so and reports nothing,
+because a correlation over three uploads is noise with a decimal point on it.
+
+Two honest limits:
+
+**Impressions and click-through rate are not shown**, because YouTube does not
+serve them through the Analytics API — they exist in Studio only. The request
+tries for them anyway and falls back to the metrics that are served, naming
+what was refused rather than printing a silent zero. If Google exposes them
+later this starts working with no change.
+
+**A channel authorized before this existed cannot read reports.** Its token
+predates the read-only analytics scope. The app detects exactly that and asks
+for a reconnect instead of surfacing a 403 that never mentions the word
+"scope". Uploads are unaffected either way.
+
+---
+
 ## The Viral Scorecard
 
 Every mode scores its script 1-10 on the preview step, on three axes, before
@@ -539,6 +573,7 @@ duel_engine.py    the Versus Duel: split panels, stat cards, the winner reveal
 ambient_engine.py the Atmosphere soundscape synthesizer and visual canvas
 niche_engine.py   Niche Scout: CPM bands, measured saturation, competitor recon
 publisher.py      YouTube Data API v3: OAuth, resumable upload, SEO metadata
+analytics_engine.py  reads performance back and grades the scorecard against it
 reel_engine.py    domain detection, the fact bank, fact-carrying scripts
 video_engine.py   reframing, looping, captions, encoding, the Gemini pre-flight
 audio_engine.py   TTS, synthesized music beds, SFX, ducking

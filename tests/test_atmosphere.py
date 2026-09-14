@@ -392,10 +392,35 @@ class TestPublisherCredentials:
         assert status == {"client_secrets": False, "token": False, "connected": False,
                           "channel": "", "channel_id": "", "error": ""}
 
-    def test_the_scope_is_upload_only(self):
-        """The full youtube scope would also grant read/write over comments,
-        playlists and the channel. This only ever inserts a video."""
-        assert pub.SCOPES == ["https://www.googleapis.com/auth/youtube.upload"]
+    def test_the_scopes_stay_least_privilege(self):
+        """
+        The full `youtube` scope would grant read/write over comments,
+        playlists and the channel itself. This app inserts a video and reads
+        its own numbers back, and should never hold more than that.
+
+        Asserted as a property rather than an exact list: the list grew once
+        already, when performance data was added, and an equality check turns
+        a deliberate least-privilege review into a chore that gets rubber
+        stamped.
+        """
+        assert "https://www.googleapis.com/auth/youtube.upload" in pub.SCOPES
+
+        for scope in pub.SCOPES:
+            assert scope.startswith("https://www.googleapis.com/auth/"), scope
+            # The bare channel scope, and anything granting writes beyond the
+            # upload itself.
+            assert scope != "https://www.googleapis.com/auth/youtube", (
+                "the full channel scope grants write access to everything")
+            assert "force-ssl" not in scope, (
+                "force-ssl grants comment and playlist writes")
+            assert "partner" not in scope, scope
+
+        # Everything that is not the upload must be read-only.
+        for scope in pub.SCOPES:
+            if scope.endswith("youtube.upload"):
+                continue
+            assert scope.endswith(".readonly"), (
+                f"{scope} is not read-only and is not the upload scope")
 
 
 class TestPublisherMetadata:

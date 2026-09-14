@@ -41,7 +41,18 @@ ProgressFn = Callable[[float, str], None]
 # Upload scope only. youtube.force-ssl or the full youtube scope would also
 # grant read/write over comments, playlists and the channel itself; this
 # module only ever inserts a video, so it asks for only that.
-SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+# Upload, plus read-only performance data. The analytics scope is what lets
+# the app find out whether anything it made actually worked; without it every
+# number in the product is a prediction nothing ever contradicts.
+#
+# Adding a scope does not invalidate a stored token, but it does mean a channel
+# authorized before this existed carries one that cannot read reports.
+# analytics_engine.missing_scopes() detects exactly that and asks for a
+# reconnect, rather than letting a 403 surface with no mention of the word.
+SCOPES = [
+    "https://www.googleapis.com/auth/youtube.upload",
+    "https://www.googleapis.com/auth/yt-analytics.readonly",
+]
 
 SECRETS_DIR = os.path.join(PROJECT_ROOT, ".secrets")
 TOKEN_PATH = os.path.join(SECRETS_DIR, "youtube_token.json")

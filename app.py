@@ -65,6 +65,9 @@ from compliance import (
     normalise_licence,
     append_ledger,
     find_entry,
+    score_hook,
+    load_ledger,
+    update_entry,
     publish_readiness,
     build_publish_pack,
     attribution_line,
@@ -74,6 +77,7 @@ from compliance import (
     MONETIZATION_NOTES,
     TIKTOK_REWARDS_MIN_SECONDS,
 )
+import analytics_engine
 import auth
 import ambient_engine
 import gemini_engine
@@ -6218,6 +6222,24 @@ def render_atmosphere_publisher() -> None:
             tracker.finish("Uploaded.")
             line.empty()
             state["uploaded"] = uploaded
+
+            # The link between a render and the video it became. Without it the
+            # ledger knows what was made and the channel knows what was
+            # watched, and nothing joins the two -- which is why performance
+            # could never be fed back into the scorecard.
+            try:
+                update_entry(user_exports(), os.path.basename(path), {
+                    "youtube_video_id": str(uploaded.get("video_id") or ""),
+                    "youtube_url": str(uploaded.get("url") or ""),
+                    "youtube_title": title,
+                    "youtube_privacy": str(uploaded.get("privacy") or ""),
+                    "published_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                })
+            except Exception as exc:                          # noqa: BLE001
+                # Never fail a successful upload over bookkeeping.
+                st.caption(f"Uploaded, but the ledger link could not be "
+                           f"written ({type(exc).__name__}).")
+
             notify_complete("Upload complete", f"{title[:60]} is on YouTube")
             st.rerun()
 
@@ -7193,9 +7215,140 @@ def render_dashboard(modes: Sequence[str]) -> None:
                     go_to_mode(card["mode"])
 
     divider()
+    render_performance(allowed)
     render_dashboard_activity(allowed)
     divider()
     render_monetization_tips()
+
+
+# ---------------------------------------------------------------------------
+# Performance
+#
+# Everything else in this app is a prediction. The scorecard says a hook should
+# hold, the CPM band says a niche should pay, the saturation score says a market
+# has room -- and none of it was ever contradicted, because nothing measured the
+# result. This is the only panel that reads reality back.
+# ---------------------------------------------------------------------------
+
+def _hook_scores_for(joined: Sequence[dict[str, Any]]) -> dict[str, float]:
+    """
+    The hook score each published script was given, recomputed offline.
+
+    Deliberately the heuristic rather than the model: this is grading the
+    scorecard, and re-scoring through an API on every page load would be both
+    slow and non-deterministic -- the thing being graded would move between
+    runs.
+    """
+    scores: dict[str, float] = {}
+    for item in joined:
+        script = str(item.get("script") or "").strip()
+        if len(script.split()) >= 6:
+            scores[item["video_id"]] = float(score_hook(script)["score"])
+    return scores
+
+
+def render_performance(allowed: Sequence[str]) -> None:
+    """How the published videos actually did, and whether the score saw it."""
+    entries = load_ledger(user_exports())
+    published = analytics_engine.published_entries(entries)
+
+    if not published:
+        return
+
+    section("Performance")
+
+    lacking = analytics_engine.missing_scopes()
+    if lacking:
+        st.info(
+            "This channel was authorized before performance data was added, so "
+            "its token cannot read reports yet. Reconnect it in Atmosphere "
+            "Studio to grant the extra read-only permission — your uploads are "
+            "untouched.", icon="\U0001f501")
+        return
+
+    state = st.session_state.get("performance")
+    if not state:
+        if st.button(f"\U0001f4ca Read performance for {len(published)} published "
+                     f"video(s)", key="perf_load", width="stretch"):
+            with st.spinner("Reading the channel's numbers..."):
+                try:
+                    report = analytics_engine.video_report(
+                        [str(e.get("youtube_video_id")) for e in published])
+                    st.session_state["performance"] = {
+                        "report": report,
+                        "joined": analytics_engine.join_performance(entries, report),
+                    }
+                except analytics_engine.AnalyticsError as exc:
+                    st.error(str(exc), icon="\U0001f6ab")
+                    return
+            st.rerun()
+        st.caption(f"{len(published)} upload(s) are linked to a render and can be "
+                   f"measured. Costs one API call.")
+        return
+
+    report = state["report"]
+    joined = state["joined"]
+
+    if not joined:
+        st.caption("The channel reported nothing for these videos yet. YouTube "
+                   "takes a day or two to populate analytics for a new upload.")
+        return
+
+    summary = analytics_engine.summarise(joined)
+    cols = st.columns(4)
+    for col, (label, value, detail) in zip(cols, (
+        ("Views", f"{summary['views']:,}", f"across {summary['videos']} videos"),
+        ("Median watched", f"{summary['median_view_percent']:.0f}%",
+         "of each video's length"),
+        ("Subscribers", f"+{summary['subscribers']:,}",
+         f"in {report['days']} days"),
+        ("Best", f"{summary['best']['views']:,}",
+         summary["best"]["title"][:28] or "—"),
+    )):
+        with col:
+            st.markdown(
+                f'<div class="rf-metric"><div class="k">{label}</div>'
+                f'<div class="v">{value}</div><div class="d">{detail}</div></div>',
+                unsafe_allow_html=True)
+
+    if report["unavailable"]:
+        st.caption(
+            f"Not shown: {', '.join(report['unavailable'])}. YouTube does not "
+            f"serve these through the Analytics API — they exist in Studio "
+            f"only. Everything above is measured, not estimated.")
+
+    # ---- the part that grades the scorecard -------------------------------
+    verdict = analytics_engine.score_vs_retention(joined, _hook_scores_for(joined))
+    if verdict["measured"]:
+        tone = "green" if verdict["r"] >= 0.5 else (
+            "amber" if verdict["r"] > -0.2 else "red")
+        st.markdown(
+            f'<div class="rf-tip"><b>Hook score vs measured retention '
+            f'(r = {verdict["r"]:+.2f}, {verdict["videos"]} videos):</b> '
+            f'{verdict["verdict"]}</div>', unsafe_allow_html=True)
+    else:
+        st.caption(f"\U0001f4cf {verdict['verdict']}")
+
+    divider()
+    for item in joined[:6]:
+        with st.container(border=True):
+            st.markdown(
+                f"**[{item['title'][:60]}]({item['url']})**  "
+                + badge(f"{item['views']:,} views", "violet")
+                + badge(f"{item['average_view_percent']:.0f}% watched",
+                        "green" if item["average_view_percent"] >= 50 else "amber")
+                + badge(f"+{item['subscribers_gained']} subs", "cyan")
+                + (badge(f"{item['ctr'] * 100:.1f}% CTR", "")
+                   if item["ctr"] else ""),
+                unsafe_allow_html=True)
+            st.caption(
+                f"{item['average_view_seconds']:.0f}s of {item['duration']:.0f}s "
+                f"\u00b7 {item['likes']} likes \u00b7 {item['comments']} comments")
+
+    if st.button("\u21ba Refresh", key="perf_refresh"):
+        st.session_state.pop("performance", None)
+        st.rerun()
+
 
 
 def render_dashboard_activity(allowed: Sequence[str]) -> None:

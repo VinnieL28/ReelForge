@@ -236,6 +236,37 @@ def append_ledger(exports_dir: str, entry: dict[str, Any]) -> dict[str, Any]:
     return entry
 
 
+def update_entry(exports_dir: str, video_name: str,
+                 fields: dict[str, Any]) -> dict[str, Any] | None:
+    """
+    Merges `fields` into the ledger entry for `video_name`.
+
+    Exists so a publish can record which YouTube video a render became. Without
+    that link the ledger knows what was made and the channel knows what was
+    watched, and nothing joins the two -- which is the whole reason performance
+    data could never be fed back into the scorecard.
+
+    Returns the updated entry, or None when the file is not in the ledger.
+    """
+    entries = load_ledger(exports_dir)
+    target = str(video_name or "")
+    updated: dict[str, Any] | None = None
+
+    for entry in entries:
+        if str(entry.get("video_name") or "") == target:
+            entry.update(fields)
+            updated = entry
+            break
+
+    if updated is None:
+        return None
+
+    os.makedirs(exports_dir, exist_ok=True)
+    with open(ledger_path(exports_dir), "w", encoding="utf-8") as handle:
+        json.dump(entries, handle, indent=2, ensure_ascii=False)
+    return updated
+
+
 def find_entry(exports_dir: str, video_name: str) -> dict[str, Any] | None:
     """Finds the newest ledger entry for a rendered file."""
     for entry in reversed(load_ledger(exports_dir)):
