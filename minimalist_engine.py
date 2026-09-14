@@ -2232,7 +2232,136 @@ def normalise_spec(raw: dict[str, Any] | None) -> dict[str, Any]:
         "labels": raw.get("labels") if isinstance(raw.get("labels"), dict) else {},
         "publish": raw.get("publish") if isinstance(raw.get("publish"), dict) else {},
     }
+
+    # A scene may be told in several acts, each with its own metaphor. One
+    # metaphor holds attention for about twenty seconds; the runtime is now
+    # over a minute, and stretching a single piece of geometry across it gives
+    # a visual event roughly every twenty-three seconds. Measured on the first
+    # 68-second render: the picture changed by 0.3% per second and 19 of 68
+    # seconds were completely still.
+    #
+    # Acts are normalised recursively but carry no duration of their own until
+    # the narration is synthesized -- see allocate_acts.
+    acts = raw.get("acts")
+    if isinstance(acts, list):
+        built = [normalise_act(act) for act in acts if isinstance(act, dict)]
+        if len(built) >= 2:
+            spec["acts"] = built
+
     return spec
+
+
+def _positive(value: Any) -> float:
+    """A non-negative float, or 0.0 for anything unusable."""
+    try:
+        number = float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return number if number > 0 else 0.0
+
+
+def normalise_act(raw: dict[str, Any]) -> dict[str, Any]:
+    """
+    One act of a multi-act scene.
+
+    Deliberately not a full spec: an act has no duration, because its share of
+    the runtime is decided by how much of the narration it carries. Its beat is
+    stored as a fraction and turned into seconds at allocation time.
+    """
+    template = resolve_template(raw.get("template") or raw.get("metaphor_type"))
+    preset = TEMPLATES[template]
+
+    try:
+        fraction = float(raw.get("climax_fraction") or preset["climax"])
+    except (TypeError, ValueError):
+        fraction = float(preset["climax"])
+
+    return {
+        "template": template,
+        "title": str(raw.get("title") or preset["title"] or "").strip(),
+        "subtitle": str(raw.get("subtitle") or preset["subtitle"] or "").strip(),
+        "payoff": "",                      # the closing line belongs to the whole
+        "thesis": str(raw.get("thesis") or "").strip(),
+        "labels": raw.get("labels") if isinstance(raw.get("labels"), dict) else {},
+        "elements": raw.get("elements") if isinstance(raw.get("elements"), list) else [],
+        "ambient": max(0.0, min(1.5, float(raw.get("ambient", 1.0) or 0.0))),
+        "climax_fraction": max(0.15, min(0.9, fraction)),
+        "concept": str(raw.get("concept") or "").strip(),
+        # Filled by allocate_acts -- and carried through if it already ran.
+        #
+        # This has to be idempotent. render_animation normalises the spec a
+        # second time, after build_minimalist_video has allocated the act
+        # timings, and zeroing them here silently collapsed every act to
+        # start=0 seconds=0. act_at then fell past all of them to the last one
+        # and drew its end state for the whole video: three acts planned, one
+        # frozen frame rendered.
+        "seconds": _positive(raw.get("seconds")),
+        "start": max(0.0, _positive(raw.get("start"))),
+        "climax": _positive(raw.get("climax")),
+        "draw_end": _positive(raw.get("draw_end")),
+    }
+
+
+# The shortest an act can run and still register as its own idea rather than a
+# flicker. Below this the cut reads as a glitch.
+MIN_ACT_SECONDS = 8.0
+
+
+def allocate_acts(spec: dict[str, Any], duration: float) -> list[dict[str, Any]]:
+    """
+    Gives each act its share of the runtime, proportional to the words it
+    carries.
+
+    Proportional to narration rather than equal thirds: an act whose thesis is
+    two sentences should not hold the screen as long as one with five, or the
+    picture and the voice drift apart over the course of the video.
+    """
+    acts = [dict(act) for act in (spec.get("acts") or [])]
+    if not acts:
+        return []
+
+    weights = [max(1, len(str(act.get("thesis") or "").split())) for act in acts]
+    total_weight = float(sum(weights))
+
+    # Floor first, then share what is left over by weight, so a short act still
+    # gets long enough to read.
+    floor = min(MIN_ACT_SECONDS, duration / len(acts))
+    spare = max(0.0, duration - floor * len(acts))
+
+    start = 0.0
+    for act, weight in zip(acts, weights):
+        seconds = floor + spare * (weight / total_weight)
+        act["seconds"] = seconds
+        act["start"] = start
+        act["climax"] = max(0.5, min(seconds - 0.4,
+                                     seconds * float(act["climax_fraction"])))
+        act["draw_end"] = 0.0
+        start += seconds
+
+    # Absorb rounding into the last act so the acts sum to exactly `duration`.
+    acts[-1]["seconds"] = max(0.1, duration - acts[-1]["start"])
+    return acts
+
+
+def act_at(spec: dict[str, Any], t: float,
+           duration: float) -> tuple[dict[str, Any], float, float]:
+    """
+    (act, time within that act, that act's length) for the moment `t`.
+
+    Falls back to the spec itself when there are no acts, which is what keeps
+    every single-metaphor caller -- the presets, the offline fallback, every
+    existing test -- working unchanged.
+    """
+    acts = spec.get("acts") or []
+    if not acts:
+        return spec, t, duration
+
+    for act in acts:
+        if t < act["start"] + act["seconds"]:
+            return act, max(0.0, t - act["start"]), max(0.1, act["seconds"])
+
+    last = acts[-1]
+    return last, max(0.0, t - last["start"]), max(0.1, last["seconds"])
 
 
 # A watchable default for the custom template when no model supplied geometry.
@@ -2292,11 +2421,24 @@ ProgressFn = Callable[[int, int, str], None]
 
 
 def make_scene_frame(spec: dict[str, Any], t: float, duration: float) -> np.ndarray:
-    """One finished RGB frame at time `t`. Public so tests can inspect a frame."""
+    """
+    One finished RGB frame at time `t`. Public so tests can inspect a frame.
+
+    With acts, the geometry and the title come from whichever act `t` falls in
+    -- each gets its own local clock, so every act draws itself from the start
+    rather than joining halfway through someone else's animation.
+
+    Two things stay on the whole video's clock. The progress hairline is
+    retention furniture and must promise the real remaining time, not the act's.
+    And the payoff is the closing line of the argument, so it belongs to the
+    end of the video rather than to the end of every act.
+    """
     frame = Frame(reuse=True)
-    scene: SceneFn = TEMPLATES[str(spec["template"])]["fn"]
-    scene(frame, t, spec, duration)
-    draw_titles(frame, spec, t)
+    act, local_t, act_seconds = act_at(spec, t, duration)
+
+    scene: SceneFn = TEMPLATES[str(act["template"])]["fn"]
+    scene(frame, local_t, act, act_seconds)
+    draw_titles(frame, act, local_t)
     draw_footer(frame, spec, t, duration)
     draw_progress(frame, t, duration)
     return frame.finish()
@@ -2506,7 +2648,19 @@ def build_minimalist_video(
     # --- 1. narration decides the runtime ---------------------------------
     narration_path = ""
     narration_trimmed = 0.0
+
+    # With acts, the narration is the acts read end to end. It is synthesized
+    # as one take rather than three: three takes joined leave an audible seam
+    # at each boundary, and the whole point of allocating act time by word
+    # count is that one continuous voice stays glued to the picture.
     thesis = str(spec.get("thesis") or "").strip()
+    if spec.get("acts"):
+        spoken_parts = [str(act.get("thesis") or "").strip()
+                        for act in spec["acts"]]
+        joined = " ".join(part for part in spoken_parts if part)
+        if joined:
+            thesis = joined
+            spec["thesis"] = joined
 
     if narrate and thesis:
         stage("Stage 1/5 - Narration: synthesizing the thesis...")
@@ -2533,6 +2687,10 @@ def build_minimalist_video(
         stage("Stage 1/5 - Narration: skipped (silent cut).")
 
     climax = float(spec["climax"])
+
+    # The runtime is final now, so the acts can be given their share of it.
+    if spec.get("acts"):
+        spec["acts"] = allocate_acts(spec, duration)
 
     # --- 2. bed ------------------------------------------------------------
     tracks: list[Any] = []

@@ -783,6 +783,177 @@ def parse_scene_response(raw: str) -> dict[str, Any]:
     return {}
 
 
+
+# ---------------------------------------------------------------------------
+# Three-act scene plans
+#
+# One metaphor holds a viewer for about twenty seconds. The runtime is over a
+# minute, so a single piece of geometry stretched across it gives a visual
+# event roughly every twenty-three seconds -- measured on the first 68-second
+# render, the picture changed by 0.3% per second and 19 of its 68 seconds were
+# completely still.
+#
+# So the model plans three acts, each with its own metaphor, and each carrying
+# its own slice of the narration. The engine gives every act its share of the
+# runtime by word count and cuts between them.
+# ---------------------------------------------------------------------------
+
+SCENE_PLAN_PROMPT = """You design shorts for a faceless minimalist animation channel:
+white vector lines on pure black, no faces, no stock footage, no photography.
+The tone is calm, certain and a little cold. Never use emoji, hashtags or
+exclamation marks.
+
+CONCEPT: {concept}
+
+Plan the video as THREE ACTS. Each act gets its own metaphor, because one piece
+of geometry on screen for a whole minute is the thing that loses the viewer.
+The three acts are one argument in three moves:
+
+  Act 1 -- the claim. State the counter-intuitive thing, with the hardest fact
+           you have, in the first nine words.
+  Act 2 -- the mechanism. WHY it is true. This is where the specifics live.
+  Act 3 -- the turn. What the viewer should do differently, and the cost of not.
+
+Choose each act's metaphor from this catalogue by which geometry actually
+argues that act. Do not use the same one twice:
+{catalogue}
+
+THE RULE THAT MATTERS MOST -- every act's narration must carry something
+checkable. A figure, a date, a named researcher, a named study, a measured
+effect, a unit. Writing that could survive having its subject swapped is
+writing that says nothing:
+
+  BAD:  "Delay is borrowing against tomorrow. You accumulate a silent
+         psychological debt and quiet shame."
+  GOOD: "Procrastination is not a time-management problem. Fuschia Sirois
+         found it tracks mood repair -- people delay to escape a feeling, not
+         a task, and the delay costs them roughly a fifth of the working day."
+
+If you do not know a real figure, use a real mechanism or a named effect
+instead. Never invent a statistic, a study or a person. A concrete mechanism
+beats a fabricated number every time.
+
+The three theses are read aloud as one continuous narration and their combined
+length sets the length of the video, so together they must total
+{words_low}-{words_high} words. Split them roughly evenly.
+
+Return ONE JSON object and nothing else:
+
+{{"acts": [
+   {{"template": "<catalogue key>",
+     "title": "2-5 words, uppercase, this act's idea",
+     "subtitle": "one short line under the title",
+     "labels": {{}},
+     "thesis": "this act's narration"}},
+   ... exactly 3 ...
+ ],
+ "payoff": "the closing line of the whole video, 3-8 words",
+ "publish": {{"title": "...", "description": "...", "hashtags": ["..."]}}}}
+
+"labels" are the words stamped onto that act's geometry -- one or two words
+each, uppercase, 16 characters at most. Which slots exist depends on the
+metaphor; use the ones that suit it and leave the rest out:
+{label_slots}"""
+
+
+def build_scene_plan_prompt(concept: str) -> str:
+    """The three-act prompt, with the metaphor catalogue spliced in."""
+    catalogue = "\n".join(
+        f'    "{key}": {spec["suits"]}' for key, spec in SCENE_METAPHORS.items())
+    slots = "\n".join(
+        f'    {key:<18} {sorted(spec["labels"])}'
+        for key, spec in SCENE_METAPHORS.items() if spec.get("labels"))
+
+    return SCENE_PLAN_PROMPT.format(
+        concept=str(concept).strip(),
+        catalogue=catalogue,
+        label_slots=slots or "    (none)",
+        words_low=SCENE_MIN_WORDS,
+        words_high=SCENE_MAX_WORDS,
+    )
+
+
+def parse_scene_plan(raw: str) -> dict[str, Any]:
+    """
+    Validates a three-act plan into something normalise_spec can take.
+
+    Returns {} rather than a partial plan when there are fewer than two usable
+    acts: one act is what this was built to replace, so falling back to the
+    single-metaphor path is the honest outcome.
+    """
+    parsed = parse_scene_response(raw)
+    if not isinstance(parsed, dict):
+        return {}
+
+    acts: list[dict[str, Any]] = []
+    for entry in (parsed.get("acts") or [])[:3]:
+        if not isinstance(entry, dict):
+            continue
+        thesis = str(entry.get("thesis") or "").strip()
+        if not thesis:
+            continue
+        template = str(entry.get("template") or entry.get("metaphor_type")
+                       or "").strip().lower()
+        acts.append({
+            "template": template if template in SCENE_TEMPLATE_KEYS else "",
+            "title": str(entry.get("title") or "").strip()[:40],
+            "subtitle": str(entry.get("subtitle") or "").strip()[:90],
+            "labels": entry.get("labels") if isinstance(entry.get("labels"), dict) else {},
+            "thesis": thesis,
+        })
+
+    if len(acts) < 2:
+        return {}
+
+    # The same metaphor twice in a row defeats the point of acts, so a repeat
+    # is replaced with the next unused one from the catalogue.
+    seen: set[str] = set()
+    spare = [key for key in SCENE_TEMPLATE_KEYS if key != "auto"]
+    for act in acts:
+        if not act["template"] or act["template"] in seen:
+            act["template"] = next(
+                (key for key in spare if key not in seen), act["template"] or spare[0])
+        seen.add(act["template"])
+
+    return {
+        "acts": acts,
+        "payoff": str(parsed.get("payoff") or "").strip()[:60],
+        "thesis": " ".join(act["thesis"] for act in acts),
+        "publish": parsed.get("publish") if isinstance(parsed.get("publish"), dict) else {},
+        "source": "gemini-plan",
+    }
+
+
+def generate_scene_plan(concept: str,
+                        progress: ProgressFn | None = None) -> dict[str, Any]:
+    """
+    A three-act plan for a concept.
+
+    Raises GeminiError when no model returns a usable plan; the caller falls
+    back to the single-metaphor path, which still renders a video.
+    """
+    client = get_client()
+    prompt = build_scene_plan_prompt(concept)
+    last: Exception | None = None
+
+    for model in MODEL_CANDIDATES:
+        try:
+            if progress:
+                progress(f"Asking {model} for a three-act plan...")
+            response = generate_with_retry(client, model, prompt, progress=progress)
+            plan = parse_scene_plan(getattr(response, "text", "") or "")
+            if plan:
+                plan["concept"] = str(concept).strip()
+                plan["model"] = model
+                return plan
+        except Exception as exc:                              # noqa: BLE001
+            last = exc
+
+    raise GeminiError(
+        f"No model returned a usable three-act plan for {concept!r}"
+        + (f": {type(last).__name__}: {last}" if last else "."))
+
+
 def generate_scene_spec(
     concept: str,
     template: str = "auto",

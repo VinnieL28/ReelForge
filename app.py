@@ -6715,8 +6715,14 @@ def _magic_minimalist(prompt: str, ctx: dict[str, Any], report: Report) -> dict[
     """
     concept = magic_studio.scene_concept(prompt)
 
-    report("script", 0.2, "Writing Hook \u2014 designing the metaphor...")
-    spec = generate_scene_spec(concept)
+    report("script", 0.2, "Writing Hook \u2014 planning three acts...")
+    try:
+        spec = gemini_engine.generate_scene_plan(concept)
+    except Exception:
+        # One metaphor still renders a video. A failed plan is a worse video,
+        # not a failed render.
+        report("script", 0.5, "Writing Hook \u2014 planning one scene...")
+        spec = generate_scene_spec(concept)
     report("script", 1.0)
 
     out_path = _magic_out(ctx, "minimalist")
@@ -7014,16 +7020,24 @@ def render_magic_studio(allowed: Sequence[str]) -> None:
     )
 
     st.markdown(
-        badge(f"\U0001f512 Locked to {low}\u2013{high}s", "green")
+        badge(f"\U0001f512 Always over {TIKTOK_REWARDS_MIN_SECONDS:.0f}s", "green")
         + badge("TikTok Rewards eligible", "green")
+        + badge("3 acts \u00b7 3 metaphors", "cyan")
         + badge("100% procedural \u00b7 zero copyright risk", "violet"),
         unsafe_allow_html=True,
     )
+    # This used to say "locked to 62-70s". It is not locked: the script is
+    # written to a word budget and the narration decides the runtime, which
+    # measured 66.3s on one render and 76.0s on another because a script dense
+    # with figures is read more slowly. What IS guaranteed is the floor, and
+    # the floor is the part that decides whether the video earns anything.
     st.caption(
-        f"Runtime is fixed at {low}\u2013{high} seconds. Creator Rewards counts "
-        f"nothing at or under {TIKTOK_REWARDS_MIN_SECONDS:.0f}s, so the script is "
-        f"written to a word budget that clears it rather than trimmed to fit "
-        f"afterwards \u2014 trimming is what cuts a narration off mid-sentence.")
+        f"Targets {low}\u2013{high} seconds and never comes in under "
+        f"{TIKTOK_REWARDS_MIN_SECONDS:.0f}s, which is where Creator Rewards "
+        f"starts paying. The script is written to a word budget that clears the "
+        f"floor rather than trimmed to fit afterwards \u2014 trimming is what "
+        f"cuts a narration off mid-sentence. Told in three acts with a different "
+        f"metaphor each, because one piece of geometry cannot hold a minute.")
 
     if st.button("\u2728 Render Monetized Short (1-Click)", key="magic_go",
                  type="primary", width="stretch", disabled=not prompt.strip()):
