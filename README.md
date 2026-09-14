@@ -47,9 +47,12 @@ purge and the API connectivity panel all live in **Admin** now. They answer
 "is this deployment healthy", which is not a question the person making a
 video is asking.
 
-The sidebar groups the rest: **Creation Engines** for the seven that make
-something, **Tools & Strategy** for Niche Scout, the Exports Library and
-Admin.
+The sidebar is down to three routes — **🏠 Studio Dashboard**, **📁 Exports
+Library**, **⚙️ Admin Settings** — with everything else folded into a
+**📦 Archived Labs (Experimental)** drawer. Archiving is a menu decision and
+nothing more: every mode in the drawer still routes, still renders and is still
+covered by the same tests. Minimalist Motion's manual page and Niche Scout lead
+that drawer rather than sitting among the experiments, because neither is one.
 
 Everything you have made lives in **📁 Exports Library**, a mode of its own:
 a grid of every render in `exports/<username>/` with its duration, size, date
@@ -63,15 +66,22 @@ It is a destination now, not a footer.
 
 ## Magic Studio
 
-One prompt, one style, one finished file. The four styles map onto the engines
-that can work from a sentence alone:
+Type a topic, press one button, get a monetizable short. The strip offers one
+engine — **Minimalist Vector** — with four quick topics to start from and a
+runtime locked to **62–70 seconds**.
 
-| Style | Engine | What it needs from you |
-|---|---|---|
-| 📐 Minimalist Vector | Minimalist Motion | A concept. Everything else is drawn from code. |
-| ⚔️ Versus Duel | Versus Duel | Two things, or one and it finds the rival. |
-| 🎙️ Faceless Commentary | the batch pipeline | A topic. It finds licensed footage for it. |
-| 🌙 8-Hour Atmosphere | Atmosphere Studio | A soundscape, and optionally a length. |
+The lock is the point. TikTok Creator Rewards counts nothing at or under 60
+seconds, so the script is written to a word budget that clears it rather than
+trimmed to fit afterwards; trimming is what cuts a narration off mid-sentence.
+The budget was calibrated by rendering rather than estimated — this engine
+speaks at 1.875 words/second, not the ~2.4 the commentary bands assume — so
+118–130 words lands at 63–69s.
+
+It offered four styles until recently. It offers one now, because only one of
+them produces something a reused-content review cannot touch: every frame
+computed, every audio layer synthesized, no third-party rights holder anywhere
+in the file. The other runners still exist and are still tested; their modes
+moved to the archive drawer.
 
 `magic_studio.py` is the planner, not a renderer: it turns the sentence into
 the concrete inputs an engine takes — a scene concept, a matchup with three
@@ -79,6 +89,11 @@ numeric rounds, a bed and a texture and a duration — and `app.py` then calls
 the same pipeline the manual mode calls. Forking the render paths to get a
 one-click flow would have meant two of them to keep in sync, and the second
 would be the one without tests.
+
+The render runs on a worker thread and the page polls it. A Streamlit script
+run is a request, and rendering inside one holds that request open for minutes;
+a browser does not wait minutes. Measured: the call that starts a render
+returns in 2ms, and a poll costs 0.12ms.
 
 Two things it refuses to guess. A matchup is only split on an explicit
 `vs`/`versus`; anything else goes to the model, because splitting a sentence

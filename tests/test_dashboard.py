@@ -125,21 +125,44 @@ class TestNavigation:
         assert set(listed) == set(ALL_MODES), (
             f"menu and registry disagree: {set(listed) ^ set(ALL_MODES)}")
 
-    def test_dashboard_is_first_and_alone(self):
+    def test_only_three_routes_are_exposed(self):
+        """Everything else is a click further away, in the drawer."""
         heading, group = app.NAV_GROUPS[0]
-        assert group == ("dashboard",)
-        assert heading == "", "the landing view sits above the group headings"
+        assert heading == "", "the exposed routes sit above any heading"
+        assert group == ("dashboard", "library", "admin")
+        assert app.PRIMARY_MODES[0] == "dashboard", "the landing view leads"
 
-    def test_the_groups_are_named_as_specified(self):
+    def test_the_drawer_is_named_as_specified(self):
         headings = [heading for heading, _ in app.NAV_GROUPS if heading]
-        assert headings == ["Creation Engines", "Tools & Strategy"]
+        assert headings == [app.ARCHIVE_LABEL]
+        assert "Archived Labs" in app.ARCHIVE_LABEL
 
-    def test_nothing_that_renders_is_filed_under_tools(self):
+    def test_the_six_experimental_engines_are_archived(self):
+        assert set(app.ARCHIVED_MODES) == {
+            "commentary", "narrative", "batch", "reel", "duel", "atmosphere"}
+
+    def test_the_primary_engine_is_not_filed_as_an_experiment(self):
+        """Minimalist Motion is what the Dashboard renders. Listing it among
+        the experiments would be a lie told by a heading."""
+        assert "minimalist" in app.ARCHIVED_LEAD
+        assert "minimalist" not in app.ARCHIVED_MODES
+
+    def test_archiving_does_not_unregister_anything(self):
+        """The drawer is a menu decision. Every archived mode still routes and
+        still renders -- test_modes proves the rendering."""
+        from test_modes import ALL_MODES
+
+        for mode in app.ARCHIVED_MODES + app.ARCHIVED_LEAD:
+            assert mode in ALL_MODES
+            assert mode in app.MODE_LABELS
+
+    def test_the_exposed_routes_make_nothing_themselves(self):
+        """The three that stay in the main list are a landing page, a gallery
+        and a settings screen. Rendering happens on the Dashboard."""
         from test_modes import NON_PRODUCTION_MODES
 
-        tools = dict((h, g) for h, g in app.NAV_GROUPS)["Tools & Strategy"]
-        for mode in tools:
-            assert mode in NON_PRODUCTION_MODES, f"{mode} renders but is filed as a tool"
+        for mode in app.PRIMARY_MODES:
+            assert mode in NON_PRODUCTION_MODES, f"{mode} renders but is exposed"
 
     def test_every_role_can_reach_the_default_landing_view(self):
         for role in ("admin", "creator"):

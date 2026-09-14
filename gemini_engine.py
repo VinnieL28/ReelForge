@@ -607,7 +607,7 @@ SCENE_TEMPLATE_KEYS = tuple(METAPHOR_TYPES) + ("custom", "auto")
 # exists to serve. 62 rather than 60 for the same reason the commentary band
 # uses it: narration lands within a few percent of a word budget rather than on
 # it, and a target of exactly 60 puts half the renders under the bar.
-SCENE_MIN_SECONDS, SCENE_MAX_SECONDS = 62.0, 75.0
+SCENE_MIN_SECONDS, SCENE_MAX_SECONDS = 62.0, 70.0
 
 # The spoken budget that fills it. Calibrated by rendering, not estimated: a
 # 150-word thesis came back at 80.0s -- which is 1.875 words/second, well under
@@ -616,10 +616,12 @@ SCENE_MIN_SECONDS, SCENE_MAX_SECONDS = 62.0, 75.0
 # the band and hit the render ceiling, where the tail of the narration is
 # clipped to fit.
 #
-# 62s / 1.875 = 116 words, 75s / 1.875 = 141. The band below sits inside that
-# with margin at both ends.
+# 62s / 1.875 = 116 words, 70s / 1.875 = 131. The band below sits inside that
+# with a word of margin at each end -- deliberately tight, because the point of
+# the band is that every render clears the Creator Rewards floor without
+# drifting far enough past it to bore anyone.
 SCENE_WORDS_PER_SECOND = 1.875
-SCENE_MIN_WORDS, SCENE_MAX_WORDS = 120, 140
+SCENE_MIN_WORDS, SCENE_MAX_WORDS = 118, 130
 
 
 def build_scene_prompt(concept: str, template: str = "auto",

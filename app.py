@@ -76,6 +76,7 @@ from compliance import (
 )
 import auth
 import ambient_engine
+import gemini_engine
 import dashboard_view
 import magic_studio
 import niche_engine
@@ -6937,15 +6938,31 @@ MAGIC_POLL_SECONDS = 0.7
 
 
 def render_magic_studio(allowed: Sequence[str]) -> None:
-    """The hero: a box, four styles, and one button."""
-    styles = [s for s in magic_studio.STYLES if s["mode"] in allowed]
-    if not styles:
+    """
+    One engine, four starting points, one button.
+
+    This used to offer four styles behind a style picker. It offers one now,
+    because only one of them produces something a reused-content review cannot
+    touch: every frame computed, every audio layer synthesized, no third-party
+    rights holder anywhere in the file. The other runners are still here and
+    still tested -- their modes moved to the archive drawer -- but a landing
+    page that asks which engine you want is a landing page that has not decided
+    what the product is.
+    """
+    if magic_studio.PRIMARY_STYLE not in allowed:
         return
 
+    style = magic_studio.style(magic_studio.PRIMARY_STYLE)
+    low = int(gemini_engine.SCENE_MIN_SECONDS)
+    high = int(gemini_engine.SCENE_MAX_SECONDS)
+
     st.markdown('<div class="rf-magic">'
-                '<div class="rf-magic-title">\u2728 Magic Studio</div>'
-                '<div class="rf-magic-sub">Describe the video. Pick a style. '
-                'One button takes it from a sentence to a finished file.</div>'
+                f'<div class="rf-magic-title">\u2728 Magic Studio \u00b7 '
+                f'{style["label"]}</div>'
+                '<div class="rf-magic-sub">Type a topic and press one button. '
+                'Every frame is drawn from code and every audio layer is '
+                'synthesized, so there is nothing in the file to license and '
+                'nothing to claim.</div>'
                 '</div>', unsafe_allow_html=True)
 
     job = st.session_state.get("magic_job")
@@ -6953,47 +6970,45 @@ def render_magic_studio(allowed: Sequence[str]) -> None:
         render_magic_progress(job, allowed)
         return
 
+    # Quick topics. Buttons rather than a pills widget on purpose: these set
+    # the contents of another widget, and a selection widget would then hold a
+    # second, competing piece of state for the same choice.
+    st.caption("Start from one of these, or write your own:")
+    for column, topic in zip(st.columns(len(magic_studio.QUICK_TOPICS)),
+                             magic_studio.QUICK_TOPICS):
+        with column:
+            if st.button(topic, key=f"magic_topic_{topic[:18]}", width="stretch"):
+                # Written before the text input is drawn on the next run, which
+                # is the only order in which a widget accepts a new value for a
+                # key it already owns.
+                st.session_state["magic_prompt"] = topic
+                st.rerun()
+
     prompt = st.text_input(
-        "What video do you want to create?",
+        "Your topic",
         key="magic_prompt",
         placeholder=magic_studio.PLACEHOLDER,
         label_visibility="collapsed",
     )
 
-    # The pill follows what was typed until someone chooses for themselves; a
-    # prompt that says "8-hour rain" should not need a second click to land on
-    # the long-form engine.
-    detected = magic_studio.detect_style(prompt)
-    if prompt and st.session_state.get("_magic_seen") != prompt:
-        st.session_state["_magic_seen"] = prompt
-        if detected in [s["key"] for s in styles]:
-            st.session_state["magic_style"] = detected
+    st.markdown(
+        badge(f"\U0001f512 Locked to {low}\u2013{high}s", "green")
+        + badge("TikTok Rewards eligible", "green")
+        + badge("100% procedural \u00b7 zero copyright risk", "violet"),
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        f"Runtime is fixed at {low}\u2013{high} seconds. Creator Rewards counts "
+        f"nothing at or under {TIKTOK_REWARDS_MIN_SECONDS:.0f}s, so the script is "
+        f"written to a word budget that clears it rather than trimmed to fit "
+        f"afterwards \u2014 trimming is what cuts a narration off mid-sentence.")
 
-    keys = [s["key"] for s in styles]
-
-    # `magic_style` is the widget's own key, so seeding it in session state is
-    # how the auto-detect above sets the pill. Passing `default=` as well would
-    # be the widget-key trap from the other direction: Streamlit warns that a
-    # default was given for a key that session state already controls, and the
-    # default is ignored anyway. Seed it, then let the widget own it.
-    if st.session_state.get("magic_style") not in keys:
-        st.session_state["magic_style"] = keys[0]
-    chosen = st.session_state["magic_style"]
-
-    labels = {s["key"]: s["label"] for s in styles}
-    picked = st.pills("Style", keys, key="magic_style",
-                      format_func=lambda k: labels[k], label_visibility="collapsed")
-    picked = picked or chosen
-
-    st.caption(magic_studio.style(picked)["sub"] + " \u2014 "
-               + magic_studio.style(picked)["blurb"])
-
-    if st.button("\u2728 Generate Full Video (1-Click)", key="magic_go",
+    if st.button("\u2728 Render Monetized Short (1-Click)", key="magic_go",
                  type="primary", width="stretch", disabled=not prompt.strip()):
         st.session_state.pop("magic_result", None)
         st.session_state.pop("magic_error", None)
         st.session_state["magic_job"] = start_magic_job(
-            prompt.strip(), picked, magic_context())
+            prompt.strip(), magic_studio.PRIMARY_STYLE, magic_context())
         st.rerun()
 
     error = st.session_state.get("magic_error")
@@ -7270,7 +7285,7 @@ MODE_SUBTITLES: dict[str, str] = {
 }
 
 MODE_LABELS: dict[str, str] = {
-    "dashboard": "\U0001f3e0 Dashboard",
+    "dashboard": "\U0001f3e0 Studio Dashboard",
     "commentary": "🎙️ Commentary Machine",
     "minimalist": "◼️ Minimalist Motion",
     "narrative": "📖 Narrative Studio",
@@ -7280,7 +7295,7 @@ MODE_LABELS: dict[str, str] = {
     "atmosphere": "🌙 Atmosphere Studio",
     "scout": "🎯 Niche Scout",
     "library": "📁 Exports Library",
-    "admin": "🛠️ Admin",
+    "admin": "⚙️ Admin Settings",
 }
 
 
@@ -7288,15 +7303,32 @@ MODE_LABELS: dict[str, str] = {
 # on a browser refresh that drops the session.
 DEFAULT_MODE = "dashboard"
 
-# The sidebar, grouped. Dashboard sits alone at the top; the engines that make
-# something are separated from the ones that do not. A test asserts this covers
-# every registered mode exactly once, so a new mode cannot be added without
-# being given a home in the menu.
+# The sidebar. Three routes are exposed and everything else is folded away,
+# because the app has one job now -- a monetizable vector short -- and the
+# Dashboard does that job itself.
+#
+# Archiving is a menu decision and nothing more. Every mode below still routes,
+# still renders and is still tested; the accordion changes where you click to
+# reach it, not whether it works.
+PRIMARY_MODES: tuple[str, ...] = ("dashboard", "library", "admin")
+
+# Minimalist Motion's manual page leads the drawer rather than sitting among
+# the experiments: it is the engine the Dashboard drives, and filing the
+# primary engine under "Experimental" would be a lie told by a heading. Niche
+# Scout is there for the opposite reason -- it is not an experiment either, but
+# it is not one of the three exposed routes, so this is where it lands.
+ARCHIVED_LEAD: tuple[str, ...] = ("minimalist", "scout")
+
+ARCHIVED_MODES: tuple[str, ...] = ("commentary", "narrative", "batch", "reel",
+                                   "duel", "atmosphere")
+
+ARCHIVE_LABEL = "📦 Archived Labs (Experimental)"
+
+# Every registered mode, in menu order. A test asserts this covers the registry
+# exactly once, so a new mode cannot be added without being given a home.
 NAV_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("", ("dashboard",)),
-    ("Creation Engines", ("commentary", "minimalist", "narrative", "batch",
-                          "reel", "duel", "atmosphere")),
-    ("Tools & Strategy", ("scout", "library", "admin")),
+    ("", PRIMARY_MODES),
+    (ARCHIVE_LABEL, ARCHIVED_LEAD + ARCHIVED_MODES),
 )
 
 
@@ -7314,20 +7346,38 @@ def go_to_mode(mode: str) -> None:
     st.rerun()
 
 
+def _nav_button(mode: str, active: str) -> None:
+    if st.button(MODE_LABELS.get(mode, mode), key=f"nav_{mode}", width="stretch",
+                 type="primary" if mode == active else "secondary",
+                 help=MODE_SUBTITLES.get(mode, "")):
+        go_to_mode(mode)
+
+
 def render_mode_nav(modes: Sequence[str], active: str) -> None:
-    """The grouped sidebar menu. Highlights the mode currently on screen."""
-    for heading, group in NAV_GROUPS:
-        visible = [mode for mode in group if mode in modes]
-        if not visible:
-            continue
-        if heading:
-            section(heading)
-        for mode in visible:
-            if st.button(MODE_LABELS.get(mode, mode), key=f"nav_{mode}",
-                         width="stretch",
-                         type="primary" if mode == active else "secondary",
-                         help=MODE_SUBTITLES.get(mode, "")):
-                go_to_mode(mode)
+    """Three routes, then a drawer holding everything else."""
+    for mode in PRIMARY_MODES:
+        if mode in modes:
+            _nav_button(mode, active)
+
+    drawer = [m for m in ARCHIVED_LEAD + ARCHIVED_MODES if m in modes]
+    if not drawer:
+        return
+
+    divider()
+    # Open when you are standing in one of them, so the highlighted mode is
+    # never hidden behind a collapsed heading.
+    with st.expander(ARCHIVE_LABEL, expanded=active in drawer):
+        lead = [m for m in ARCHIVED_LEAD if m in modes]
+        if lead:
+            st.caption("The vector engine the Dashboard drives, and the niche "
+                       "research that feeds it. Not experiments \u2014 they are "
+                       "here because the main list is down to three routes.")
+            for mode in lead:
+                _nav_button(mode, active)
+            divider()
+        for mode in ARCHIVED_MODES:
+            if mode in modes:
+                _nav_button(mode, active)
 
 
 def main() -> None:

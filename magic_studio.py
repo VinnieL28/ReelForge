@@ -68,8 +68,23 @@ STYLES: tuple[dict[str, str], ...] = (
 STYLE_KEYS: tuple[str, ...] = tuple(style["key"] for style in STYLES)
 DEFAULT_STYLE = "minimalist"
 
-PLACEHOLDER = ("What video do you want to create? (e.g., 'Why Rome fell in 60s', "
-               "'Range Rover vs Porsche Cayenne', '8-hour rain on window')")
+PLACEHOLDER = "Enter your psychology, finance, or discipline topic..."
+
+# The engine the Dashboard drives. The other runners still exist and are still
+# tested -- their modes live in the archive drawer -- but the one-click strip
+# offers this one alone, because it is the only engine whose output cannot be
+# caught by a reused-content review.
+PRIMARY_STYLE = "minimalist"
+
+# Four openings that are known to suit the vector metaphors: each one is an
+# abstract claim with a mechanism behind it, which is what the geometry can
+# actually argue. A concrete news topic would have nothing to draw.
+QUICK_TOPICS: tuple[str, ...] = (
+    "The Paradox of Choice",
+    "Why Smart People Fail",
+    "The Cost of Procrastination",
+    "Dopamine Detox",
+)
 
 
 def style(key: str) -> dict[str, str]:
@@ -225,6 +240,12 @@ _MINIMALIST_HINTS: tuple[str, ...] = (
     "motivation", "procrastinat", "focus", "burnout", "patience", "stoic",
     "psychology", "self-improvement", "overthink", "comfort zone",
     "delayed gratification", "beats intensity", "saving", "investing early",
+    # Behavioural subjects that open with "why" or "how" and would otherwise be
+    # caught by the question test below and sent looking for stock footage of
+    # an idea. "Why Smart People Fail" is a metaphor, not an event.
+    "smart people", "fail", "failure", "success", "willpower", "regret",
+    "paradox", "choice", "dopamine", "detox", "attention", "distraction",
+    "perfectionism", "impatience", "envy", "ego", "fear of",
 )
 
 

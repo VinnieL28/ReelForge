@@ -32,7 +32,8 @@ from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
 import vector_rig as rig
 from paths import resolve_font
-from video_engine import _SCRATCH_RENDERS, purge_scratch_renders, video_encoder
+from video_engine import (_SCRATCH_RENDERS, purge_scratch_renders,
+                          video_encoder, write_clip)
 
 # ---------------------------------------------------------------------------
 # Look
@@ -2341,16 +2342,33 @@ def render_animation(
         open_clips.append(clip)
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    enc = video_encoder()
     if progress_callback:
         progress_callback(total, total, "Encoding MP4...")
 
-    clip.write_videofile(
-        output_path, fps=fps, codec=enc["codec"],
-        audio=bool(audio_path and os.path.exists(audio_path)),
-        audio_codec="aac" if audio_path else None,
-        preset=enc["preset"], ffmpeg_params=list(enc["ffmpeg_params"]),
+    # Through the shared writer rather than straight to write_videofile. Two
+    # things come with it, and this engine needs both more than any other
+    # because it is the one people render most:
+    #
+    #   * A CPU retry. video_encoder() probes NVENC with a single 256x256
+    #     frame, which proves very little: the driver can still give up on a
+    #     1080x1920 stream when another process holds the encoder session, and
+    #     consumer cards cap concurrent sessions. That failure lands at the end
+    #     of a render that is now over a minute long, and throwing it away is
+    #     the worst possible moment to find out.
+    #   * Forced yuv420p. libx264 picks yuv444p for some inputs and the file
+    #     then plays as a green screen on iOS -- which, for a TikTok-first
+    #     engine, is the whole audience.
+    write_clip(
+        clip, output_path, fps=fps,
+        with_audio=bool(audio_path and os.path.exists(audio_path)),
+        progress_callback=(
+            (lambda message: progress_callback(total, total, message))
+            if progress_callback else None),
     )
+
+    # Re-read after the write: a fallback poisons the probe, so asking now is
+    # what actually happened rather than what was planned.
+    enc = video_encoder()
 
     for item in open_clips:
         try:

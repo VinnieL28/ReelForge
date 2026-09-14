@@ -144,10 +144,24 @@ class TestStyles:
         for entry in ms.STYLES:
             assert ms.detect_style(entry["example"]) == entry["key"], entry["key"]
 
-    def test_the_placeholder_carries_all_three_examples(self):
-        for phrase in ("Why Rome fell", "Range Rover vs Porsche Cayenne",
-                       "8-hour rain on window"):
-            assert phrase in ms.PLACEHOLDER
+    def test_the_placeholder_names_the_subjects_the_engine_can_draw(self):
+        """The strip is one engine now. The prompt has to ask for the kind of
+        topic its geometry can actually argue -- an abstract claim with a
+        mechanism, not a news event there would be nothing to draw for."""
+        low = ms.PLACEHOLDER.lower()
+        assert "psychology" in low and "finance" in low and "discipline" in low
+
+    def test_the_quick_topics_suit_the_vector_metaphors(self):
+        assert ms.QUICK_TOPICS == (
+            "The Paradox of Choice", "Why Smart People Fail",
+            "The Cost of Procrastination", "Dopamine Detox")
+        # Each has to route to the engine it is a shortcut for.
+        for topic in ms.QUICK_TOPICS:
+            assert ms.detect_style(topic) == ms.PRIMARY_STYLE, topic
+
+    def test_the_primary_style_is_the_claim_proof_one(self):
+        assert ms.PRIMARY_STYLE == "minimalist"
+        assert ms.style(ms.PRIMARY_STYLE)["mode"] == "minimalist"
 
     def test_an_unknown_style_key_does_not_explode(self):
         assert ms.style("nope")["key"] in ms.STYLE_KEYS
@@ -682,7 +696,9 @@ class TestMonetizableLength:
 
         assert gemini_engine.SCENE_MIN_SECONDS > compliance.TIKTOK_REWARDS_MIN_SECONDS
         assert gemini_engine.SCENE_MIN_SECONDS >= 62
-        assert gemini_engine.SCENE_MAX_SECONDS <= 75
+        # Locked to a narrow band: long enough to be paid for, short enough
+        # that nobody scrolls before the payoff.
+        assert gemini_engine.SCENE_MAX_SECONDS <= 70
 
     def test_the_word_budget_fills_that_runtime(self):
         import gemini_engine as ge
@@ -702,7 +718,8 @@ class TestMonetizableLength:
 
         prompt = ge.build_scene_prompt("a test concept", "auto", 70.0)
         assert f"{ge.SCENE_MIN_WORDS}-{ge.SCENE_MAX_WORDS} words" in prompt
-        assert "62" in prompt and "75" in prompt
+        assert f"{ge.SCENE_MIN_SECONDS:.0f}" in prompt
+        assert f"{ge.SCENE_MAX_SECONDS:.0f}" in prompt
 
     def test_the_render_ceiling_clears_the_target_band(self):
         """MAX_DURATION was 60.0 -- precisely the number that earns nothing --
@@ -778,3 +795,48 @@ class TestNoBlockingRenders:
         job.thread.join()
         state = job.snapshot()
         assert state["done"] and state["error"]
+
+
+class TestPrimaryEngineEncoding:
+    """
+    Minimalist Motion is the engine the Dashboard renders, so its encode path
+    is the one that has to survive a bad night on the GPU.
+    """
+
+    def test_it_goes_through_the_shared_writer(self):
+        """A direct write_videofile gets NVENC but no retry: when the driver
+        gives up on a 1080x1920 stream -- another process holding the session,
+        or a consumer card's concurrent-session cap -- the failure lands at the
+        end of a render that now runs over a minute, and is thrown away."""
+        import inspect
+
+        import minimalist_engine as me
+
+        source = inspect.getsource(me.render_animation)
+        assert "write_clip(" in source, "the encode bypasses the shared writer"
+        assert "clip.write_videofile" not in source, (
+            "the encode calls write_videofile directly, so there is no CPU retry")
+
+    def test_the_writer_forces_a_pixel_format_every_phone_decodes(self):
+        """libx264 picks yuv444p for some inputs and the file then plays as a
+        green screen on iOS -- which for a TikTok-first engine is the audience."""
+        import inspect
+
+        import video_engine
+
+        source = inspect.getsource(video_engine.write_clip)
+        assert source.count("yuv420p") >= 2, "only one path forces yuv420p"
+
+    def test_the_result_reports_the_encoder_that_actually_ran(self):
+        """A fallback poisons the probe, so the flag has to be read after the
+        write rather than before it."""
+        import inspect
+
+        import minimalist_engine as me
+
+        source = inspect.getsource(me.render_animation)
+        write_at = source.index("write_clip(")
+        probe_at = source.rindex("video_encoder()")
+        assert probe_at > write_at, (
+            "the gpu flag is read before the encode, so a CPU fallback is "
+            "reported as a GPU render")
