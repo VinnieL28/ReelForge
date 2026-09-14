@@ -65,6 +65,16 @@ SAFE_Y: float = CANVAS[1] - SAFE_BOTTOM
 # Type stops 30px higher again, which is the room the progress hairline needs.
 TEXT_SAFE_Y: float = SAFE_Y - 30.0
 
+# Side gutter. A label that touches the edge reads as a rendering fault even
+# when every glyph is present.
+SIDE_MARGIN: float = 34.0
+
+# Ink runs wider than advance width: a bold glyph overhangs its own box and
+# antialiasing adds a little more. Measured across every size and weight the
+# templates use, the worst case was 7.1% -- so a clamp that trusts textlength
+# alone still lets the last letter cross the gutter.
+_INK_OVER_ADVANCE: float = 1.08
+
 # How far ink actually falls below a centred text anchor, as a fraction of the
 # nominal size. The clamps used 0.62, which is roughly a baseline-to-descender
 # figure and not what these anchors measure: text is drawn centred, so the ink
@@ -389,6 +399,25 @@ class Frame:
         """
         return min(float(y), TEXT_SAFE_Y - size * _INK_BELOW_ANCHOR)
 
+    def safe_x(self, x: float, width: float) -> float:
+        """
+        Pulls a centred line back inside the frame.
+
+        There was a vertical clamp and no horizontal one, so a label anchored
+        near the edge simply ran off the canvas: the balance scale's right pan
+        sits at x=895 and "PAIN BALANCE" is ~400px wide, which put its last
+        letter past 1080 and rendered "PAIN BALANC". Nothing raised -- the
+        glyph was drawn, just outside the picture.
+
+        A line wider than the frame is centred instead. It will still overflow,
+        but symmetrically, which reads as a design choice rather than a defect.
+        """
+        half = width / 2.0
+        low, high = SIDE_MARGIN + half, self.w - SIDE_MARGIN - half
+        if low > high:
+            return self.w / 2.0
+        return max(low, min(high, float(x)))
+
     def text(self, body: str, centre: tuple[float, float], size: int = 56,
              colour: tuple[int, int, int] = WHITE, weight: str = "bold",
              anchor: str = "mm", tracking: float = 0.0, clamp_safe: bool = True) -> None:
@@ -400,14 +429,19 @@ class Frame:
         y = self.safe_y(centre[1], size) if clamp_safe else centre[1]
 
         if tracking <= 0:
-            self.draw.text((centre[0] * s, y * s), body, font=font,
+            width = float(self.draw.textlength(body, font=font))
+            x = (self.safe_x(centre[0], width * _INK_OVER_ADVANCE / s)
+                 if clamp_safe else centre[0])
+            self.draw.text((x * s, y * s), body, font=font,
                            fill=colour, anchor=anchor)
             return
 
         gap = tracking * s
         widths = [self.draw.textlength(ch, font=font) for ch in body]
         total = sum(widths) + gap * (len(body) - 1)
-        x = centre[0] * s - total / 2
+        centre_x = (self.safe_x(centre[0], total * _INK_OVER_ADVANCE / s)
+                    if clamp_safe else centre[0])
+        x = centre_x * s - total / 2
         for ch, w in zip(body, widths):
             self.draw.text((x, y * s), ch, font=font, fill=colour, anchor="lm")
             x += w + gap

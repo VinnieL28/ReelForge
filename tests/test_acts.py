@@ -292,3 +292,60 @@ class TestPlanPromptDemandsFacts:
         prompt = ge.build_scene_plan_prompt("x")
         assert "THREE ACTS" in prompt
         assert "same one twice" in prompt
+
+
+class TestLabelsStayInFrame:
+    """
+    A label anchored near the edge used to run off the canvas. The balance
+    scale's right pan sits at x=895 and "PAIN BALANCE" is about 400px wide, so
+    its last letter was drawn past 1080 and the video read "PAIN BALANC".
+    Nothing raised: the glyph was drawn, just outside the picture.
+    """
+
+    @pytest.mark.parametrize("body,x,size", [
+        ("PAIN BALANCE", 895, 44),
+        ("REWARD SPIKE", 185, 40),
+        ("50 YEARS", 1000, 40),
+        ("COMFORT NOW", 60, 40),
+        ("DOWNREGULATION", 900, 44),
+    ])
+    def test_a_label_near_the_edge_is_pulled_back_in(self, body, x, size):
+        import numpy as np
+
+        frame = me.Frame()
+        frame.text(body, (x, 900), size, me.WHITE, "bold", tracking=5)
+        array = np.asarray(frame.finish())
+        columns = np.nonzero((array.max(axis=2) > 40).any(axis=0))[0]
+
+        assert columns.min() >= me.SIDE_MARGIN - 6, f"{body} touches the left edge"
+        assert columns.max() <= array.shape[1] - me.SIDE_MARGIN + 6, (
+            f"{body} runs off the right edge")
+
+    def test_the_untracked_path_is_clamped_too(self):
+        """Two drawing paths, and only clamping one of them leaves the bug in
+        half the templates."""
+        import numpy as np
+
+        frame = me.Frame()
+        frame.text("NEURAL DOWNREGULATION", (980, 900), 44, me.WHITE, "bold")
+        array = np.asarray(frame.finish())
+        columns = np.nonzero((array.max(axis=2) > 40).any(axis=0))[0]
+        assert columns.max() <= array.shape[1] - 1
+
+    def test_the_clamp_allows_for_ink_running_wider_than_advance(self):
+        """textlength measures advance, not ink. A bold glyph overhangs its own
+        box by up to 7%, which is enough for one more letter to cross the
+        gutter."""
+        assert me._INK_OVER_ADVANCE > 1.0
+
+    def test_a_line_wider_than_the_frame_is_centred(self):
+        """It will still overflow, but symmetrically, which reads as a design
+        choice rather than a defect."""
+        frame = me.Frame()
+        assert frame.safe_x(80.0, 4000.0) == pytest.approx(frame.w / 2.0)
+
+    def test_opting_out_still_works(self):
+        """Templates that position their own geometry-bound text must be able
+        to bypass the clamp."""
+        frame = me.Frame()
+        assert frame.safe_x(2000.0, 10.0) < 2000.0     # clamped by default
