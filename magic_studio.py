@@ -206,6 +206,30 @@ def split_matchup(prompt: str) -> tuple[str, str]:
     return left, right
 
 
+def _has_word(text: str, words: "tuple[str, ...]") -> bool:
+    """
+    True when any of `words` appears in `text` as a whole word or phrase.
+
+    A phrase containing a space is matched as a phrase; a single word is
+    bounded on both sides, so "rain" cannot match inside "brain" and "ai"
+    cannot match inside "explained". Prefix hints that are deliberately partial
+    -- "procrastinat", to catch both noun and verb -- are matched on a leading
+    boundary only.
+    """
+    for word in words:
+        if " " in word:
+            if word in text:
+                return True
+            continue
+        if re.search(r"(?<![a-z])" + re.escape(word) + r"(?![a-z])", text):
+            return True
+        # A hint that is already a stem matches anything built on it.
+        if word.endswith(("at", "is")) and re.search(
+                r"(?<![a-z])" + re.escape(word), text):
+            return True
+    return False
+
+
 def detect_style(prompt: str) -> str:
     """
     The style a prompt is asking for, when it is obvious from the words.
@@ -217,18 +241,28 @@ def detect_style(prompt: str) -> str:
     if not text.strip():
         return DEFAULT_STYLE
 
-    if any(word in text for word in ("hour", "sleep", "asmr", "ambient", "study",
-                                     "rain", "noise", "fireplace", "thunderstorm")):
-        return "atmosphere"
+    # Whole words only. Substring matching sent "Why Your Brain Hates Your
+    # Diet" to the ambient engine, because "Brain" contains "rain" -- and for a
+    # psychology channel the word "brain" is in half the titles. "The Gollwitzer
+    # Study" went the same way on "study", which is in the list for study
+    # music. Same class of bug as "ai" matching inside "explained".
+    # An explicit "vs" is unambiguous, so it goes first.
     if split_matchup(text) != ("", ""):
         return "duel"
-    # Abstract-concept prompts go to the vector engine before the "why"/"how"
-    # test, or "Why consistency beats intensity" -- the canonical Minimalist
-    # Motion subject -- routes itself to a footage-based commentary.
-    if any(word in text for word in _MINIMALIST_HINTS):
+
+    # Behavioural subjects before ambient ones. "Revenge Bedtime
+    # Procrastination: Tracing the Sleep Loop" is a psychology topic that
+    # merely contains the word sleep, and testing ambient first sent it to the
+    # soundscape engine. A specific subject beats a generic one.
+    if _has_word(text, _MINIMALIST_HINTS):
         return "minimalist"
-    if any(word in text for word in ("why", "how", "history", "explained",
-                                     "breakdown", "story of", "fell", "rise of")):
+
+    if _has_word(text, ("hour", "hours", "sleep", "asmr", "ambient",
+                        "rain", "noise", "fireplace", "thunderstorm",
+                        "study music", "white noise", "brown noise")):
+        return "atmosphere"
+    if _has_word(text, ("why", "how", "history", "explained", "breakdown",
+                        "story of", "fell", "rise of")):
         return "commentary"
     return DEFAULT_STYLE
 
@@ -246,6 +280,11 @@ _MINIMALIST_HINTS: tuple[str, ...] = (
     "smart people", "fail", "failure", "success", "willpower", "regret",
     "paradox", "choice", "dopamine", "detox", "attention", "distraction",
     "perfectionism", "impatience", "envy", "ego", "fear of",
+    # A psychology channel writes titles full of these, and without them every
+    # one fell through to the footage engine on the "why"/"how" test.
+    "brain", "diet", "hunger", "decision", "deciding", "bias", "biases",
+    "cognitive", "neuro", "friction", "sabotage", "reward", "tolerance",
+    "craving", "impulse", "identity", "study", "loop",
 )
 
 

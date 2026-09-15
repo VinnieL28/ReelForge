@@ -840,3 +840,51 @@ class TestPrimaryEngineEncoding:
         assert probe_at > write_at, (
             "the gpu flag is read before the encode, so a CPU fallback is "
             "reported as a GPU render")
+
+
+class TestStyleDetectionWholeWords:
+    """
+    Substring matching sent a psychology channel's titles to the ambient
+    engine: "Why Your Brain Hates Your Diet" matched "rain" inside "Brain",
+    and "The Gollwitzer Study" matched "study" from study-music. For a channel
+    whose whole subject is the brain, that is most of the catalogue.
+
+    Same class of bug as "ai" matching inside "explained" in niche_engine.
+    """
+
+    @pytest.mark.parametrize("prompt", [
+        "Evolutionary Hunger: Why Your Brain Hates Your Diet",
+        "The Brain On Deadlines",
+        "Your Brain Is Not Broken",
+    ])
+    def test_brain_does_not_match_rain(self, prompt):
+        assert ms.detect_style(prompt) == "minimalist", prompt
+
+    def test_a_named_study_is_not_study_music(self):
+        assert ms.detect_style("The Gollwitzer Study: Why Deciding is "
+                               "Not Enough") == "minimalist"
+
+    def test_a_psychology_topic_that_mentions_sleep_is_not_a_soundscape(self):
+        """A specific behavioural subject beats a generic ambient word."""
+        assert ms.detect_style("Revenge Bedtime Procrastination: Tracing "
+                               "the Sleep Loop") == "minimalist"
+
+    @pytest.mark.parametrize("prompt", [
+        "8-hour rain on window", "brown noise for studying",
+        "thunderstorm for sleep 3 hours", "crackling fireplace 1 hour",
+    ])
+    def test_real_soundscape_prompts_still_route_to_atmosphere(self, prompt):
+        """Fixing the false positives must not break the true ones."""
+        assert ms.detect_style(prompt) == "atmosphere", prompt
+
+    def test_an_explicit_matchup_still_wins(self):
+        assert ms.detect_style("Range Rover vs Porsche Cayenne") == "duel"
+
+    def test_a_phrase_hint_is_matched_as_a_phrase(self):
+        assert ms._has_word("brown noise for studying", ("brown noise",))
+        assert not ms._has_word("brown bread", ("brown noise",))
+
+    def test_a_bare_word_is_bounded_on_both_sides(self):
+        assert ms._has_word("the rain fell", ("rain",))
+        assert not ms._has_word("my brain hurts", ("rain",))
+        assert not ms._has_word("training day", ("rain",))
