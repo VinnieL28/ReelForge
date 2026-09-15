@@ -2059,11 +2059,14 @@ if "minimal" not in st.session_state:
         "preset": None,
         "concept": "",
         "template": AUTO_TEMPLATE,
-        "duration": 18,
+        # Inside the band the slider offers, and over the sixty seconds TikTok
+        # pays at. 18 was the old single-metaphor default and is now below the
+        # slider's own minimum.
+        "duration": 66,
         "bgm": True,
         "bgm_volume": 0.30,
         "sfx": True,
-        "narrate": False,
+        "narrate": True,
         "voice": "Charon",
         "ai_disclosed": False,
         "spec": None,        # the scene the last render used
@@ -4805,11 +4808,16 @@ def render_minimalist_studio() -> None:
             st.caption("Gemini chooses from the six metaphors below based on your concept."
                        if template == AUTO_TEMPLATE else str(TEMPLATES[template]["blurb"]))
         with c2:
+            # The default was 18, left over from when a scene was one metaphor
+            # and the band was 15-25s. It is now below the slider's own minimum
+            # -- and more to the point, below the sixty seconds TikTok pays at.
             duration = st.slider(
                 "Length (s)", int(SCENE_MIN_SECONDS), int(SCENE_MAX_SECONDS),
-                int(state.get("duration", 18)), 1, key="mm_duration",
-                help="15–25s is the retention sweet spot for Shorts: long enough to "
-                     "land an idea, short enough to loop.",
+                int(state.get("duration") or SCENE_MIN_SECONDS + 4), 1,
+                key="mm_duration",
+                help="Over 60s so TikTok Creator Rewards counts it, and under 70 "
+                     "so it still loops. The narration's real length decides the "
+                     "final runtime; this sets what the script is written to.",
             )
             state["duration"] = duration
 
@@ -4835,8 +4843,11 @@ def render_minimalist_studio() -> None:
                                        help="A riser into a sub-bass hit, placed so the impact "
                                             "lands on the frame the object clears the obstacle.")
         with a3:
+            # On by default. Without a voice the acts have no word counts to
+            # share the runtime by, and a silent sixty-second vector loop is not
+            # a video anyone watches to the end.
             state["narrate"] = st.checkbox("🎙️ Narrate the thesis",
-                                           value=bool(state.get("narrate", False)), key="mm_narrate",
+                                           value=bool(state.get("narrate", True)), key="mm_narrate",
                                            help="Gemini TTS reads the one-line thesis. Leading "
                                                 "silence is trimmed so the voice starts at 0.0s.")
             state["voice"] = pick("Voice", MM_VOICES, str(state.get("voice") or "Charon"),
@@ -4862,11 +4873,20 @@ def render_minimalist_studio() -> None:
             if st.button("✨ Generate Metaphor & Animate", width="stretch",
                          key="mm_go", disabled=not str(state.get("concept") or "").strip()):
                 spec: dict[str, Any] | None = None
-                with st.spinner("Gemini is writing the scene..."):
+                with st.spinner("Gemini is planning the scene..."):
                     try:
-                        raw = generate_scene_spec(
-                            str(state["concept"]), str(state["template"]), float(state["duration"]),
-                        )
+                        # Three acts when the model is left to choose the
+                        # metaphor, which is what the one-click flow does and
+                        # what stops a minute of one static drawing. Asking for
+                        # a specific template is a request for that template,
+                        # so it stays a single scene.
+                        if str(state["template"]) == AUTO_TEMPLATE:
+                            raw = gemini_engine.generate_scene_plan(str(state["concept"]))
+                        else:
+                            raw = generate_scene_spec(
+                                str(state["concept"]), str(state["template"]),
+                                float(state["duration"]),
+                            )
                         spec = normalise_spec(raw)
                     except Exception as exc:
                         # A dead key or a 503 must not cost the user the video.
