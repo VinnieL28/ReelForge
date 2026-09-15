@@ -208,6 +208,208 @@ def write_clip(
 
 
 # ---------------------------------------------------------------------------
+# Loudness
+#
+# A finished render measured -22.8 LUFS integrated with a true peak of
+# -2.9 dBFS. Social platforms normalise to about -14, so everything this made
+# played roughly nine decibels quieter than the video before it in the feed --
+# which reads as amateur before a word is heard.
+#
+# Nine decibels of flat gain is not available: it would put the true peak at
+# +5.9 dBFS and clip. Reaching the target needs the dynamic range brought in as
+# well as the level brought up, which is what ffmpeg's loudnorm does. It is a
+# separate pass over the finished file, with the video stream copied, so it
+# costs an I/O-bound rewrite rather than a second encode.
+# ---------------------------------------------------------------------------
+
+# What the platforms normalise to. Anything quieter is turned up by the player,
+# anything louder is turned down; matching it means the mix is heard as mixed.
+TARGET_LUFS = -14.0
+
+# Ceiling for the true peak, in dBFS. -1.5 leaves room for the intersample
+# peaks a lossy re-encode introduces downstream.
+TARGET_TRUE_PEAK_DB = -1.5
+
+# What loudnorm's limiter is actually asked for, which has to sit below the
+# ceiling. Measured: requesting exactly -1.5 produced a finished file at
+# -1.2 dBFS, because the limiter runs before the AAC encode and the encode adds
+# its own intersample peaks. Half a decibel of headroom covers that.
+_TRUE_PEAK_HEADROOM_DB = 0.5
+
+# Loudness range. 11 LU keeps the sub-bass drop feeling like a drop instead of
+# flattening it into the bed.
+TARGET_LRA = 11.0
+
+
+def measure_loudness(path: str, ffmpeg: str = "") -> dict[str, float]:
+    """
+    Integrated loudness and true peak of a file, via ffmpeg's ebur128.
+
+    Returns {"lufs", "true_peak", "lra"}; any value that could not be parsed
+    comes back as 0.0, which the caller must read as unknown.
+    """
+    import re
+    import subprocess
+
+    import imageio_ffmpeg
+
+    ffmpeg = ffmpeg or imageio_ffmpeg.get_ffmpeg_exe()
+    try:
+        proc = subprocess.run(
+            [ffmpeg, "-hide_banner", "-nostats", "-i", os.path.abspath(path),
+             "-af", "ebur128=peak=true", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=FFMPEG_TIMEOUT)
+    except Exception:
+        return {"lufs": 0.0, "true_peak": 0.0, "lra": 0.0}
+
+    text = proc.stderr or ""
+    # The summary block at the end is the integrated figure; the per-frame
+    # lines above it are not.
+    tail = text[text.rfind("Integrated loudness"):] if "Integrated loudness" in text else ""
+
+    def grab(pattern: str, source: str) -> float:
+        found = re.findall(pattern, source)
+        try:
+            return float(found[-1])
+        except (IndexError, TypeError, ValueError):
+            return 0.0
+
+    return {
+        "lufs": grab(r"I:\s*(-?\d+\.?\d*)\s*LUFS", tail),
+        "true_peak": grab(r"Peak:\s*(-?\d+\.?\d*)\s*dBFS", tail),
+        "lra": grab(r"LRA:\s*(-?\d+\.?\d*)\s*LU", tail),
+    }
+
+
+def _loudnorm_measure(path: str, target_lufs: float, true_peak_db: float,
+                      lra: float, ffmpeg: str) -> dict[str, str]:
+    """
+    loudnorm's own analysis pass, as the JSON it prints to stderr.
+
+    Returns {} when anything about the parse fails, which makes the caller fall
+    back to the single-pass filter -- less accurate, but still an improvement
+    on leaving the mix nine decibels quiet.
+    """
+    import json
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            [ffmpeg, "-hide_banner", "-nostats", "-i", os.path.abspath(path),
+             "-af", (f"loudnorm=I={target_lufs}:TP={true_peak_db}:LRA={lra}"
+                     ":print_format=json"),
+             "-f", "null", "-"],
+            capture_output=True, text=True, timeout=FFMPEG_TIMEOUT)
+    except Exception:
+        return {}
+
+    text = proc.stderr or ""
+    start = text.rfind("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        return {}
+
+    try:
+        parsed = json.loads(text[start:end + 1])
+    except (ValueError, TypeError):
+        return {}
+
+    wanted = ("input_i", "input_tp", "input_lra", "input_thresh", "target_offset")
+    if not all(key in parsed for key in wanted):
+        return {}
+    # Refuse the degenerate analysis of a silent track: -inf breaks the filter.
+    if any("inf" in str(parsed[key]).lower() for key in wanted):
+        return {}
+    return {key: str(parsed[key]) for key in wanted}
+
+def normalise_loudness(path: str, target_lufs: float = TARGET_LUFS,
+                       true_peak_db: float = TARGET_TRUE_PEAK_DB,
+                       lra: float = TARGET_LRA,
+                       progress_callback: Callable[[str], None] | None = None,
+                       ffmpeg: str = "") -> dict[str, Any]:
+    """
+    Brings a finished render up to the platform loudness target, in place.
+
+    The video stream is copied, so only the audio is re-encoded. Returns
+    {"before", "after", "applied"} -- and `applied` is False with the file
+    untouched whenever the measurement or the pass fails, because a video that
+    is too quiet is a worse video and a video that is gone is a lost render.
+    """
+    import os as _os
+    import shutil
+    import subprocess
+    import tempfile as _tempfile
+
+    import imageio_ffmpeg
+
+    ffmpeg = ffmpeg or imageio_ffmpeg.get_ffmpeg_exe()
+    source = _os.path.abspath(path)
+    before = measure_loudness(source, ffmpeg)
+
+    if not before["lufs"]:
+        if progress_callback:
+            progress_callback("Could not measure loudness; leaving the mix alone.")
+        return {"before": before, "after": before, "applied": False}
+
+    if progress_callback:
+        progress_callback(f"Loudness {before['lufs']:.1f} LUFS -> "
+                          f"{target_lufs:.0f} LUFS...")
+
+    # The limiter is asked for a little below the ceiling; see the constant.
+    limiter_tp = float(true_peak_db) - _TRUE_PEAK_HEADROOM_DB
+
+    work = _tempfile.mkdtemp(prefix="rf_loud_")
+    staged = _os.path.join(work, "normalised.mp4")
+    try:
+        # Two passes, not one. Single-pass loudnorm works from a running
+        # estimate and lands near the target rather than on it: measured, it
+        # produced -15.6 LUFS against a -14 request and a true peak of
+        # -0.8 dBFS against a -1.5 ceiling -- over the limit it was given. The
+        # first pass measures the file, the second applies the correction with
+        # those figures supplied, which is what makes the limiter exact.
+        stats = _loudnorm_measure(source, target_lufs, limiter_tp, lra, ffmpeg)
+        measured = ""
+        if stats:
+            measured = (f":measured_I={stats['input_i']}"
+                        f":measured_TP={stats['input_tp']}"
+                        f":measured_LRA={stats['input_lra']}"
+                        f":measured_thresh={stats['input_thresh']}"
+                        f":offset={stats['target_offset']}:linear=true")
+
+        proc = subprocess.run(
+            [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", source,
+             "-af", (f"loudnorm=I={target_lufs}:TP={limiter_tp}:LRA={lra}"
+                     f"{measured}:print_format=summary"),
+             "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+             # AAC frames are 1024 samples, so the re-encode pads the tail and
+             # the audio comes out up to ~0.1s longer than the picture. This
+             # project holds A/V sync at 0.000s across every mode, and -shortest
+             # is what keeps the loudness pass from being the thing that breaks
+             # it: the padding is trimmed rather than muxed in.
+             "-shortest",
+             "-movflags", "+faststart", staged],
+            capture_output=True, text=True, timeout=FFMPEG_TIMEOUT)
+
+        if proc.returncode != 0 or not _os.path.exists(staged):
+            tail = "\n".join((proc.stderr or "").strip().splitlines()[-6:])
+            if progress_callback:
+                progress_callback(f"Loudness pass failed, keeping the original. {tail[:120]}")
+            return {"before": before, "after": before, "applied": False}
+
+        shutil.move(staged, source)
+    except Exception as exc:                                  # noqa: BLE001
+        if progress_callback:
+            progress_callback(f"Loudness pass failed ({type(exc).__name__}); "
+                              "keeping the original.")
+        return {"before": before, "after": before, "applied": False}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+    after = measure_loudness(source, ffmpeg)
+    return {"before": before, "after": after, "applied": True}
+
+
+# ---------------------------------------------------------------------------
 # Gemini File API pre-flight
 #
 # The File API rejects a clip by accepting the upload and then parking it in

@@ -853,7 +853,14 @@ Return ONE JSON object and nothing else:
 "labels" are the words stamped onto that act's geometry -- one or two words
 each, uppercase, 16 characters at most. Which slots exist depends on the
 metaphor; use the ones that suit it and leave the rest out:
-{label_slots}"""
+{label_slots}
+
+COPY RULES for every title, subtitle and label:
+- Subject and verb must agree. "why decisions fail", never "why decision
+  fails". A plural subject takes a plural verb.
+- No trailing full stop on a title or a label. Subtitles may have one.
+- Sentence case for subtitles, and the title in the words you would say aloud.
+  Do not write in all capitals; the renderer sets the case itself."""
 
 
 def build_scene_plan_prompt(concept: str) -> str:

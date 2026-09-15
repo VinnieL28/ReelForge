@@ -182,14 +182,15 @@ class TestDispatch:
         video, not of the current act."""
         import inspect
 
-        source = inspect.getsource(me.make_scene_frame)
+        # Drawn in _draw_act, which every path goes through.
+        source = inspect.getsource(me._draw_act)
         assert "draw_progress(frame, t, duration)" in source, (
             "the hairline is being drawn on the act's clock")
 
     def test_the_payoff_belongs_to_the_video_not_to_every_act(self):
         import inspect
 
-        source = inspect.getsource(me.make_scene_frame)
+        source = inspect.getsource(me._draw_act)
         assert "draw_footer(frame, spec, t, duration)" in source, (
             "the closing line is being drawn at the end of every act")
 
@@ -341,8 +342,10 @@ class TestLabelsStayInFrame:
     def test_a_line_wider_than_the_frame_is_centred(self):
         """It will still overflow, but symmetrically, which reads as a design
         choice rather than a defect."""
+        # Centred in the SAFE box, not on the canvas, so it leans away
+        # from the action rail on the right.
         frame = me.Frame()
-        assert frame.safe_x(80.0, 4000.0) == pytest.approx(frame.w / 2.0)
+        assert frame.safe_x(80.0, 4000.0) == pytest.approx(sum(me.SAFE_X) / 2.0)
 
     def test_opting_out_still_works(self):
         """Templates that position their own geometry-bound text must be able

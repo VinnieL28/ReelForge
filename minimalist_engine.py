@@ -32,8 +32,8 @@ from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
 import vector_rig as rig
 from paths import resolve_font
-from video_engine import (_SCRATCH_RENDERS, purge_scratch_renders,
-                          video_encoder, write_clip)
+from video_engine import (_SCRATCH_RENDERS, normalise_loudness,
+                          purge_scratch_renders, video_encoder, write_clip)
 
 # ---------------------------------------------------------------------------
 # Look
@@ -42,38 +42,56 @@ from video_engine import (_SCRATCH_RENDERS, purge_scratch_renders,
 CANVAS: tuple[int, int] = (1080, 1920)
 SUPERSAMPLE = 2                       # draw at 2x, box-filter down: free AA
 
-# The bottom band every vertical platform covers with its own chrome: the
-# caption and @handle on TikTok, the description and audio row on Reels, the
-# title and progress scrubber on Shorts. 200px of a 1920 frame is a little over
-# 10%, which clears all three.
+# The box platform chrome leaves alone, in canvas coordinates.
+#
+# A symmetric gutter was wrong for a vertical feed. TikTok's action rail --
+# like, comment, share, sound -- sits on the RIGHT and is roughly 180px wide,
+# and the caption plus the progress scrubber take the bottom. The top carries
+# the account row and the feed tabs. Measured on a real render before this
+# existed, content spanned x 78-1000 and y 249-1694: labels, the chart endpoint
+# and the progress hairline were all sitting under platform UI.
 #
 # Enforced in Frame.text and Frame.wrapped rather than left to each template to
-# remember, because it was not remembered: measured across all fifteen
-# templates before this existed, every single one put type inside the band --
-# the payoff line sat at y=1720 and the progress hairline at y=1866, which is
-# underneath TikTok's caption.
+# remember, because it was not remembered -- every one of the templates put
+# type outside the old band.
 #
-# Geometry is deliberately *not* clamped. A staircase reaching the floor is the
+# Geometry is deliberately NOT clamped. A staircase reaching the floor is the
 # picture; a sentence hidden behind a caption is a bug.
-# The action rail on Shorts and TikTok -- like, comment, share, sound -- plus
-# the caption and the progress scrubber. Measured against the taller of the
-# two: 220px of a 1920 frame is 11.5%, which clears the rail on a 20:9 phone
-# rather than only on a 16:9 one.
+SAFE_X: tuple[float, float] = (100.0, 900.0)
+SAFE_Y_BOX: tuple[float, float] = (320.0, 1500.0)
+
+# The single left/right gutter, for anything that asks for one number.
+SIDE_MARGIN: float = SAFE_X[0]
+
+# Kept because the templates measure their geometry against it. This is the
+# older, looser bottom limit and it no longer governs type.
 SAFE_BOTTOM = 220
 SAFE_Y: float = CANVAS[1] - SAFE_BOTTOM
 
-# Type stops 30px higher again, which is the room the progress hairline needs.
-TEXT_SAFE_Y: float = SAFE_Y - 30.0
+# Where type stops: inside the safe box, and far enough above the progress
+# hairline that a payoff line can never land on it.
+TEXT_SAFE_Y: float = SAFE_Y_BOX[1] - 34.0
 
-# Side gutter. A label that touches the edge reads as a rendering fault even
-# when every glyph is present.
-SIDE_MARGIN: float = 34.0
+# The band the closing caption owns. Nothing else may be placed in it, and the
+# scene's own annotations fade out underneath it while it is on screen.
+#
+# The outro used to be composited at a fixed y over whatever the template had
+# already drawn there, so the first word landed on a chart label and was
+# unreadable. Reserving the band is what makes that impossible rather than
+# unlikely.
+CAPTION_BAND: tuple[float, float] = (TEXT_SAFE_Y - 132.0, TEXT_SAFE_Y)
+
+# How long the annotation layer takes to clear once the caption arrives.
+CAPTION_DUCK_SECONDS = 0.3
 
 # Ink runs wider than advance width: a bold glyph overhangs its own box and
 # antialiasing adds a little more. Measured across every size and weight the
 # templates use, the worst case was 7.1% -- so a clamp that trusts textlength
 # alone still lets the last letter cross the gutter.
 _INK_OVER_ADVANCE: float = 1.08
+
+# Same figure the vertical clamp uses, named where the caption band reads it.
+_INK_OVER_ANCHOR_FOR_BAND: float = 0.85
 
 # How far ink actually falls below a centred text anchor, as a fraction of the
 # nominal size. The clamps used 0.62, which is roughly a baseline-to-descender
@@ -392,12 +410,36 @@ class Frame:
 
     def safe_y(self, y: float, size: float) -> float:
         """
-        Lifts a text baseline out of the platform's bottom chrome.
+        Pulls a text baseline inside the platform's chrome, top and bottom.
 
-        0.62 of the point size is the descender-inclusive half-height for a
-        vertically centred line, which is the anchor every caller here uses.
+        The bottom is the caption and scrubber; the top is the account row and
+        the "Following / For You" tabs. `_INK_BELOW_ANCHOR` of the point size
+        is how far ink reaches below a vertically centred anchor, measured
+        rather than assumed.
         """
-        return min(float(y), TEXT_SAFE_Y - size * _INK_BELOW_ANCHOR)
+        low = SAFE_Y_BOX[0] + size * _INK_BELOW_ANCHOR
+        high = TEXT_SAFE_Y - size * _INK_BELOW_ANCHOR
+        if low > high:
+            return (low + high) / 2.0
+        wanted = max(low, min(float(y), high))
+
+        # Keep annotations out of the caption's band. The caption itself opts
+        # out with `reserved=True`; everything else is lifted clear of it.
+        if not self.reserved:
+            ceiling = CAPTION_BAND[0] - size * _INK_BELOW_ANCHOR
+            if wanted > ceiling and ceiling > low:
+                return ceiling
+        return wanted
+
+    # Set while the closing caption is being drawn, so its own placement is
+    # not lifted out of the band it owns.
+    reserved: bool = False
+
+    # Scales every non-reserved text colour. Driven to 0 over
+    # CAPTION_DUCK_SECONDS when the closing caption arrives, so the scene's
+    # annotation layer clears out from underneath it instead of competing.
+    # The ground is black, so scaling toward black IS the fade.
+    annotation_alpha: float = 1.0
 
     def safe_x(self, x: float, width: float) -> float:
         """
@@ -413,9 +455,11 @@ class Frame:
         but symmetrically, which reads as a design choice rather than a defect.
         """
         half = width / 2.0
-        low, high = SIDE_MARGIN + half, self.w - SIDE_MARGIN - half
+        low, high = SAFE_X[0] + half, SAFE_X[1] - half
         if low > high:
-            return self.w / 2.0
+            # Wider than the safe box: centre it inside the box rather than on
+            # the canvas, so it leans away from the action rail.
+            return sum(SAFE_X) / 2.0
         return max(low, min(high, float(x)))
 
     def text(self, body: str, centre: tuple[float, float], size: int = 56,
@@ -427,6 +471,9 @@ class Frame:
         s = self.ss
         font = load_face(int(size * s), weight)
         y = self.safe_y(centre[1], size) if clamp_safe else centre[1]
+
+        if not self.reserved and self.annotation_alpha < 1.0:
+            colour = mix(colour, self.annotation_alpha)
 
         if tracking <= 0:
             width = float(self.draw.textlength(body, font=font))
@@ -452,6 +499,9 @@ class Frame:
         """Centre-wraps a sentence around `centre`."""
         if not body:
             return
+        if not self.reserved and self.annotation_alpha < 1.0:
+            colour = mix(colour, self.annotation_alpha)
+
         font = load_face(int(size * self.ss), weight)
         limit = max_width * self.ss
 
@@ -717,7 +767,7 @@ def draw_footer(frame: Frame, spec: dict[str, Any], t: float, duration: float) -
     line = str(spec.get("payoff") or "").upper()
     if not line:
         return
-    start = max(0.0, duration - 4.2)
+    start = max(0.0, duration - CAPTION_LEAD_SECONDS)
     alpha = fade(t, start, attack=0.8)
     if alpha > 0.01:
         # Anchored to the safe line rather than to a fixed y. It used to ask
@@ -728,14 +778,19 @@ def draw_footer(frame: Frame, spec: dict[str, Any], t: float, duration: float) -
         # templates, bottom-aligning here leaves 3.8% ink behind the text --
         # a deliberate move further up collided with each template's own axis
         # labels at 28%.
-        frame.wrapped(line, (frame.w / 2, TEXT_SAFE_Y), size=52,
-                      colour=mix(WHITE, alpha), weight="bold",
-                      max_width=900, leading=1.18)
+        frame.reserved = True
+        try:
+            frame.wrapped(line, (frame.w / 2, TEXT_SAFE_Y), size=52,
+                          colour=mix(WHITE, alpha), weight="bold",
+                          max_width=900, leading=1.18)
+        finally:
+            frame.reserved = False
 
 
-# The hairline sits just inside the safe area, not at the foot of the frame,
-# and below TEXT_SAFE_Y so a payoff line can never land on top of it.
-PROGRESS_Y: float = SAFE_Y - 8.0
+# The hairline was at y=1692, underneath the platform's own scrubber. It sits
+# inside the bottom of the safe box now -- above it in screen terms -- where it
+# is actually visible, and below TEXT_SAFE_Y so type never collides with it.
+PROGRESS_Y: float = SAFE_Y_BOX[1] - 14.0
 
 
 def draw_progress(frame: Frame, t: float, duration: float) -> None:
@@ -2338,7 +2393,28 @@ def normalise_act(raw: dict[str, Any]) -> dict[str, Any]:
 
 # The shortest an act can run and still register as its own idea rather than a
 # flicker. Below this the cut reads as a glitch.
+# How long the picture and the sound take to go out at the tail.
+#
+# The video used to hard-cut on its final frame with the audio still at full
+# level, which on a loop reads as a glitch rather than an ending.
+END_FADE_SECONDS = 0.6
+
 MIN_ACT_SECONDS = 8.0
+
+# The longest. Every template finishes its reveals in the first few seconds and
+# then holds, so a 22-second act is roughly six seconds of animation followed
+# by sixteen of a still picture. Capping the act is what forces the narration
+# to be split across more of them.
+MAX_ACT_SECONDS = 12.0
+
+# How long the outgoing act stays on screen under the incoming one.
+#
+# Without it the cut was a black flash. Each template fades its own geometry in
+# over its first beat, so at a new act's local t=0 the screen is genuinely
+# empty -- measured at the 20.8s boundary, mean brightness fell from 26.8 to
+# 1.9 for five frames and then climbed back. Not a transition artefact: a
+# fade-from-nothing built into every template.
+ACT_OVERLAP = 0.5
 
 
 def allocate_acts(spec: dict[str, Any], duration: float) -> list[dict[str, Any]]:
@@ -2374,7 +2450,27 @@ def allocate_acts(spec: dict[str, Any], duration: float) -> list[dict[str, Any]]
 
     # Absorb rounding into the last act so the acts sum to exactly `duration`.
     acts[-1]["seconds"] = max(0.1, duration - acts[-1]["start"])
+
+    # The cap cannot be enforced by shortening -- the acts have to cover the
+    # narration or the picture ends before the voice does. What it can do is
+    # record the overflow, which is the signal that the plan needed more acts
+    # for this runtime. plan_act_count() turns that into a number the planner
+    # can be asked for up front.
+    for act in acts:
+        act["over_cap"] = max(0.0, act["seconds"] - MAX_ACT_SECONDS)
     return acts
+
+
+def plan_act_count(seconds: float) -> int:
+    """
+    How many acts a narration of this length needs.
+
+    Derived from the cap rather than fixed at three: at 12 seconds an act, a
+    66-second narration wants six, and asking for three guarantees that each
+    one finishes its reveals early and then sits still.
+    """
+    wanted = int(math.ceil(float(seconds) / MAX_ACT_SECONDS))
+    return max(2, min(8, wanted))
 
 
 def act_at(spec: dict[str, Any], t: float,
@@ -2454,6 +2550,51 @@ def fallback_scene_spec(concept: str, template: str = DEFAULT_TEMPLATE,
 ProgressFn = Callable[[int, int, str], None]
 
 
+def text_boxes_overlap(first: tuple[float, float, float, float],
+                       second: tuple[float, float, float, float]) -> bool:
+    """
+    True when two text bounding boxes intersect. Each box is (x0, y0, x1, y1).
+
+    Used by the layout check rather than at render time: measuring every glyph
+    on every frame would cost more than the drawing does.
+    """
+    ax0, ay0, ax1, ay1 = first
+    bx0, by0, bx1, by1 = second
+    return not (ax1 <= bx0 or bx1 <= ax0 or ay1 <= by0 or by1 <= ay0)
+
+
+# The closing caption holds the last few seconds. Kept as a named value
+# because the duck has to start at exactly the same moment.
+CAPTION_LEAD_SECONDS = 4.2
+
+
+def annotation_alpha_at(t: float, duration: float) -> float:
+    """
+    How visible the scene's own labels are at `t`, 0-1.
+
+    Full until the closing caption starts, then down to nothing over
+    CAPTION_DUCK_SECONDS so the caption is never read against competing type.
+    """
+    start = max(0.0, float(duration) - CAPTION_LEAD_SECONDS)
+    if t < start:
+        return 1.0
+    return max(0.0, 1.0 - (t - start) / max(1e-6, CAPTION_DUCK_SECONDS))
+
+
+def annotation_ceiling(size: float) -> float:
+    """
+    The lowest y a non-caption text anchor of this size can be placed at.
+
+    This is the invariant the caption band actually rests on: every label goes
+    through Frame.safe_y, and while `reserved` is false that call can never
+    return a y whose ink reaches into the band. Checking it here is exact,
+    where counting ink in the band would also count geometry -- and geometry is
+    deliberately not clamped, because a curve passing behind the caption is the
+    picture, not a bug.
+    """
+    return CAPTION_BAND[0] - float(size) * _INK_OVER_ANCHOR_FOR_BAND
+
+
 def make_scene_frame(spec: dict[str, Any], t: float, duration: float) -> np.ndarray:
     """
     One finished RGB frame at time `t`. Public so tests can inspect a frame.
@@ -2467,15 +2608,63 @@ def make_scene_frame(spec: dict[str, Any], t: float, duration: float) -> np.ndar
     And the payoff is the closing line of the argument, so it belongs to the
     end of the video rather than to the end of every act.
     """
-    frame = Frame(reuse=True)
     act, local_t, act_seconds = act_at(spec, t, duration)
 
+    # Across a boundary both acts are drawn and mixed, so the outgoing picture
+    # is still on screen while the incoming one fades up. Without this the cut
+    # is a black flash: every template fades its geometry in over its own first
+    # beat, so a new act at local t=0 has nothing on screen yet.
+    previous = _outgoing_act(spec, t)
+    if previous is not None:
+        older, older_t, older_seconds, blend = previous
+        under = _draw_act(spec, older, older_t, older_seconds, t, duration)
+        over = _draw_act(spec, act, local_t, act_seconds, t, duration)
+        return _mix_frames(under, over, blend)
+
+    return _draw_act(spec, act, local_t, act_seconds, t, duration)
+
+
+def _draw_act(spec: dict[str, Any], act: dict[str, Any], local_t: float,
+              act_seconds: float, t: float, duration: float) -> np.ndarray:
+    """One act's frame, with the whole-video furniture on top."""
+    frame = Frame(reuse=False)
+    # The scene's labels clear out from under the closing caption.
+    frame.annotation_alpha = annotation_alpha_at(t, duration)
     scene: SceneFn = TEMPLATES[str(act["template"])]["fn"]
     scene(frame, local_t, act, act_seconds)
     draw_titles(frame, act, local_t)
     draw_footer(frame, spec, t, duration)
     draw_progress(frame, t, duration)
     return frame.finish()
+
+
+def _outgoing_act(spec: dict[str, Any], t: float):
+    """
+    The act still fading out at `t`, or None.
+
+    Returns (act, its local time, its length, how far the incoming act has
+    faded in) so the caller can mix the two.
+    """
+    acts = spec.get("acts") or []
+    if len(acts) < 2 or ACT_OVERLAP <= 0:
+        return None
+
+    for act in acts[1:]:
+        start = float(act["start"])
+        if start <= t < start + ACT_OVERLAP:
+            index = acts.index(act)
+            older = acts[index - 1]
+            blend = (t - start) / ACT_OVERLAP
+            return (older, max(0.0, t - float(older["start"])),
+                    max(0.1, float(older["seconds"])), blend)
+    return None
+
+
+def _mix_frames(under: np.ndarray, over: np.ndarray, blend: float) -> np.ndarray:
+    """Linear cross-dissolve. `blend` 0 is all `under`, 1 is all `over`."""
+    weight = max(0.0, min(1.0, float(blend)))
+    mixed = under.astype(np.float32) * (1.0 - weight) + over.astype(np.float32) * weight
+    return np.clip(mixed, 0, 255).astype(np.uint8)
 
 
 def render_animation(
@@ -2492,7 +2681,7 @@ def render_animation(
     know the narration length before the duration is final, and that decision
     belongs one level up in `build_minimalist_video`.
     """
-    from moviepy import AudioFileClip, VideoClip
+    from moviepy import AudioFileClip, VideoClip, afx, vfx
 
     spec = normalise_spec(spec)
     duration = float(spec["duration"])
@@ -2509,11 +2698,23 @@ def render_animation(
     clip = VideoClip(make_frame, duration=duration)
     open_clips: list[Any] = [clip]
 
+    # An ending. It used to hard-cut on the final frame with the audio still at
+    # full level, which on a platform that loops reads as a glitch rather than
+    # a finish. Measured before this: the last 1.2s held a flat mean brightness
+    # of 21.0 and the final audio sample was at full scale.
+    fade = min(END_FADE_SECONDS, duration * 0.25)
+    if fade > 0:
+        clip = clip.with_effects([vfx.FadeOut(fade)])
+        open_clips.append(clip)
+
     if audio_path and os.path.exists(audio_path):
         bed = AudioFileClip(audio_path)
         open_clips.append(bed)
         if bed.duration > duration:
             bed = bed.subclipped(0, duration)
+        if fade > 0:
+            # Matched to the picture, so the two land together.
+            bed = bed.with_effects([afx.AudioFadeOut(fade)])
         clip = clip.with_audio(bed)
         open_clips.append(clip)
 
@@ -2542,6 +2743,18 @@ def render_animation(
             if progress_callback else None),
     )
 
+    # Up to the platform loudness target. A separate pass over the finished
+    # file with the video stream copied -- see video_engine.normalise_loudness
+    # for why flat gain cannot get there on its own.
+    loudness: dict[str, Any] = {"applied": False}
+    if audio_path and os.path.exists(audio_path):
+        loudness = normalise_loudness(
+            output_path,
+            progress_callback=(
+                (lambda message: progress_callback(total, total, message))
+                if progress_callback else None),
+        )
+
     # Re-read after the write: a fallback poisons the probe, so asking now is
     # what actually happened rather than what was planned.
     enc = video_encoder()
@@ -2561,6 +2774,8 @@ def render_animation(
         "climax": spec["climax"],
         "size": CANVAS,
         "gpu": bool(enc.get("gpu")),
+        "loudness": loudness,
+        "end_fade": fade,
     }
 
 
