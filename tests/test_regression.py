@@ -712,8 +712,18 @@ class TestShortsCap:
             runtime = ne.storyboard_runtime(capped)
             assert runtime <= ne.SHORTS_MAX_SECONDS + 0.05, (count, each, runtime)
 
-    def test_the_window_is_short_of_the_platform_limit(self):
-        assert 55.0 <= ne.SHORTS_MIN_SECONDS < ne.SHORTS_MAX_SECONDS <= 58.0
+    def test_the_window_clears_the_payout_floor(self):
+        """
+        This used to assert 55-58s, deliberately *under* sixty, because
+        YouTube Shorts capped at sixty seconds. That ceiling went to three
+        minutes in late 2024, and the binding constraint is now the other end:
+        TikTok Creator Rewards pays nothing at or under sixty, so a band that
+        sat just below it earned nothing on every episode.
+        """
+        import compliance
+
+        assert ne.SHORTS_MIN_SECONDS > compliance.TIKTOK_REWARDS_MIN_SECONDS
+        assert ne.SHORTS_MIN_SECONDS < ne.SHORTS_MAX_SECONDS <= 70.0
 
 
 # ---------------------------------------------------------------------------

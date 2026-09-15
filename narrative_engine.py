@@ -89,8 +89,8 @@ NARRATIVE_TONES: dict[str, dict[str, str]] = {
 
 DURATION_FORMATS: dict[str, dict[str, Any]] = {
     "short": {
-        "label": "60s Short (9:16)",
-        "seconds": 60,
+        "label": "62-70s Short (9:16)",
+        "seconds": 66,
         "aspect": (1080, 1920),
         "segments": (10, 16),
         "note": "One idea, one turn, one landing.",
@@ -123,8 +123,14 @@ DEFAULT_FORMAT = "short"
 # leaves the Shorts shelf entirely. The band is deliberately short of the limit:
 # encoders round frame counts up, and a board cut to exactly 60.0s ships at
 # 60.03s.
-SHORTS_MIN_SECONDS = 55.0
-SHORTS_MAX_SECONDS = 58.0
+# Long enough to be paid for. The band was 55-58s under a label that said
+# "60s Short", which is below TikTok's 60-second Creator Rewards floor -- so
+# every episode rendered in this format earned nothing there. 62 rather than 60
+# for the same reason the vector engine uses it: narration lands within a few
+# percent of a word budget rather than on it, and a target of exactly 60 puts
+# half the renders under the bar.
+SHORTS_MIN_SECONDS = 62.0
+SHORTS_MAX_SECONDS = 70.0
 
 # Narration pace. Measured against Gemini TTS at its default rate, which is a
 # little slower than edge-tts with the +12% boost this project uses elsewhere.
@@ -1200,7 +1206,40 @@ def fit_storyboard_to(segments: Sequence[dict[str, Any]], total: float) -> list[
         segment["start"] = round(cursor, 2)
         segment["end"] = round(cursor + segment["duration"], 2)
         cursor = segment["end"]
+
+    # Absorb the rounding into the last shot so the board lands exactly on the
+    # runtime it was given. Each duration rounds to two places, and across
+    # forty-odd segments that drift adds up: a board capped at 70s came out at
+    # 70.09, which is over a limit whose whole purpose is being a limit. The
+    # floor still wins -- a shot is never dragged below a flash frame to make
+    # the arithmetic tidy.
+    overshoot = round(cursor - total, 3)
+    if abs(overshoot) > 0.005 and segments:
+        # Spread backwards rather than dumping it all on the last shot. When
+        # every segment is already at the flash-frame floor -- which is exactly
+        # the case a hard cap produces -- one shot has no room to give, and the
+        # board stays over a limit whose whole purpose is being a limit.
+        for segment in reversed(segments):
+            if abs(overshoot) <= 0.005:
+                break
+            current = float(segment["duration"])
+            room = current - MIN_SEGMENT_SECONDS if overshoot > 0 else float("inf")
+            take = min(overshoot, room) if overshoot > 0 else overshoot
+            if abs(take) <= 0.005:
+                continue
+            segment["duration"] = round(current - take, 2)
+            overshoot = round(overshoot - take, 3)
+        _restack(segments)
     return segments
+
+
+def _restack(segments: Sequence[dict[str, Any]]) -> None:
+    """Recomputes start and end down a board after any duration changes."""
+    cursor = 0.0
+    for segment in segments:
+        segment["start"] = round(cursor, 2)
+        segment["end"] = round(cursor + float(segment["duration"]), 2)
+        cursor = float(segment["end"])
 
 
 def cap_for_shorts(segments: Sequence[dict[str, Any]],
