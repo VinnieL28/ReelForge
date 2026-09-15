@@ -958,18 +958,43 @@ def make_suspense_bgm(duration: float, sample_rate: int = 44100) -> NDArray[np.f
 
 
 def _load_mono(path: str, sample_rate: int) -> NDArray[np.float32]:
-    """Decodes any audio file to a mono float array at `sample_rate`."""
-    from moviepy import AudioFileClip
+    """
+    Decodes any audio file to a mono float array at `sample_rate`.
 
-    clip = AudioFileClip(path)
+    Read through ffmpeg rather than MoviePy, for two measured reasons.
+
+    MoviePy's resample is wrong. On a 44.1kHz file whose true peak is 0.85,
+    `to_soundarray(fps=16000)` came back peaking at 0.163 -- a fivefold
+    attenuation -- and on a file that was mostly silence it came back as
+    nothing at all. Everything downstream compares against an absolute
+    threshold, so a signal that quiet reads as silence: the leading-silence
+    trim had been finding nothing to trim, in this engine and in the vector
+    one.
+
+    And reading at the native rate instead is not a way round it: a clip whose
+    duration lands exactly on a sample boundary makes MoviePy read one frame
+    past the end and raise "Accessing time t=1.00-1.00 with clip
+    duration=1.000000".
+
+    ffmpeg does both correctly, in one pass, and is already a hard dependency.
+    """
+    import subprocess
+
+    import imageio_ffmpeg
+
+    rate = max(1, int(sample_rate))
     try:
-        samples = np.asarray(clip.to_soundarray(fps=sample_rate), dtype=np.float32)
-    finally:
-        clip.close()
+        proc = subprocess.run(
+            [imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error",
+             "-i", os.path.abspath(path),
+             "-f", "f32le", "-ac", "1", "-ar", str(rate), "-"],
+            capture_output=True, timeout=600)
+    except Exception:
+        return np.zeros(0, dtype=np.float32)
 
-    if samples.ndim == 2:
-        samples = samples.mean(axis=1)
-    return samples.astype(np.float32)
+    if proc.returncode != 0 or not proc.stdout:
+        return np.zeros(0, dtype=np.float32)
+    return np.frombuffer(proc.stdout, dtype="<f4").astype(np.float32)
 
 
 def speech_duck_curve(
@@ -1256,6 +1281,78 @@ def build_ducked_bed(
     save_wav_to_file(bed, sample_rate, output_path)
     return output_path
 
+
+def trim_silence(
+    audio_path: str,
+    output_path: str | None = None,
+    keep: float = 0.04,
+    threshold: float = 0.02,
+) -> dict[str, Any]:
+    """
+    Removes dead air from BOTH ends of a TTS take.
+
+    The trailing half matters more than it sounds. Narrative Studio cuts its
+    picture to cover the voice, so a take that ends with a long silent tail
+    does not produce a video with a quiet ending -- it produces a video as long
+    as the silence. One take came back with minutes of it and the episode
+    rendered at 655 seconds from a 131-word script, in sync, with the first
+    subtitle held for thirty-six of them.
+
+    Returns {"path", "trimmed_head", "trimmed_tail", "duration"}; `path` is the
+    original file when there was nothing worth trimming at either end.
+    """
+    from moviepy import AudioFileClip
+
+    def _untouched(duration: float = 0.0) -> dict[str, Any]:
+        # Measured inside the guard, not before it: reading the duration of an
+        # unreadable file raises, out of a function whose whole contract is
+        # that it does not.
+        if duration <= 0:
+            try:
+                duration = float(get_audio_duration(audio_path))
+            except Exception:
+                duration = 0.0
+        return {"path": audio_path, "trimmed_head": 0.0, "trimmed_tail": 0.0,
+                "duration": duration}
+
+    try:
+        samples = _load_mono(audio_path, 16000)
+    except Exception:
+        return _untouched()
+
+    if samples.size == 0:
+        return _untouched(0.0)
+
+    loud = np.abs(samples) > float(threshold)
+    if not loud.any():
+        # Entirely silent. Trimming it to nothing would be worse than leaving
+        # it: the caller can see a zero-length take and say so.
+        return _untouched(len(samples) / 16000.0)
+
+    rate = 16000.0
+    total = len(samples) / rate
+    first = float(np.argmax(loud)) / rate
+    last = float(len(loud) - np.argmax(loud[::-1])) / rate
+
+    head = max(0.0, first - float(keep))
+    tail_end = min(total, last + float(keep))
+
+    if head < 0.05 and (total - tail_end) < 0.05:
+        return _untouched(total)
+
+    if output_path is None:
+        output_path = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
+
+    clip = AudioFileClip(audio_path)
+    try:
+        cut = clip.subclipped(head, min(tail_end, float(clip.duration)))
+        cut.write_audiofile(output_path, fps=44100, logger=None)
+        duration = float(cut.duration)
+    finally:
+        clip.close()
+
+    return {"path": output_path, "trimmed_head": head,
+            "trimmed_tail": max(0.0, total - tail_end), "duration": duration}
 
 def trim_leading_silence(
     audio_path: str,

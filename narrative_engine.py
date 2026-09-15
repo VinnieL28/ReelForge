@@ -129,6 +129,14 @@ SHORTS_MAX_SECONDS = 58.0
 # Narration pace. Measured against Gemini TTS at its default rate, which is a
 # little slower than edge-tts with the +12% boost this project uses elsewhere.
 WORDS_PER_SECOND = 2.6
+
+# The slowest a narration can credibly be and still be a reading of its script.
+# Measured: Gemini TTS runs about 2.0 words a second on this material, so half
+# that is a wide margin -- wide enough that only a broken take trips it.
+MIN_PLAUSIBLE_WORDS_PER_SECOND = 1.0
+
+# How long the picture and sound take to go out at the tail.
+END_FADE_SECONDS = 0.6
 MIN_SEGMENT_SECONDS = 1.6
 MAX_SEGMENT_SECONDS = 9.0
 
@@ -1281,8 +1289,9 @@ def produce_episode(
     """
     from moviepy import AudioFileClip, CompositeAudioClip
 
-    from audio_engine import build_ducked_bed, synthesize_narration
-    from video_engine import burn_ass_subtitles, source_duration
+    from audio_engine import build_ducked_bed, synthesize_narration, trim_silence
+    from video_engine import (burn_ass_subtitles, normalise_loudness,
+                              source_duration)
 
     def say(message: str) -> None:
         if progress:
@@ -1302,8 +1311,34 @@ def produce_episode(
                                  else "narration.mp3"),
         style="Measured, unhurried, close-mic. Let the sentences land.",
     )
+    # Dead air at either end is not a quiet moment here -- the picture is cut
+    # to cover the voice, so a silent tail becomes runtime. One take produced a
+    # 655-second episode from a 131-word script.
+    cleaned = trim_silence(str(narration["path"]),
+                           output_path=os.path.join(workspace, "narration_trim.wav"))
+    if str(cleaned["path"]) != str(narration["path"]):
+        scratch.append(str(cleaned["path"]))
+        narration = {**narration, "path": cleaned["path"],
+                     "duration": cleaned["duration"]}
+        if cleaned["trimmed_head"] or cleaned["trimmed_tail"]:
+            say(f"Trimmed {cleaned['trimmed_head']:.1f}s of silence from the front "
+                f"and {cleaned['trimmed_tail']:.1f}s from the end.")
+
     speech = float(narration["duration"])
     words = list(narration.get("words") or [])
+
+    # And a floor under the whole thing. If the voice still does not resemble
+    # the script it was given, the timings cannot be trusted and building an
+    # episode on them produces a long, silent, perfectly in-sync video.
+    spoken_words = len(str(episode.get("script") or "").split())
+    if spoken_words:
+        plausible = spoken_words / MIN_PLAUSIBLE_WORDS_PER_SECOND
+        if speech > plausible:
+            say(f"The narration measured {speech:.0f}s for {spoken_words} words, "
+                f"which is not a reading of this script. Using the storyboard's "
+                f"own timing instead.")
+            words = []
+            speech = min(speech, storyboard_runtime(segments))
 
     # --- re-cut the board onto the real voice ------------------------------
     if words:
@@ -1428,6 +1463,12 @@ def produce_episode(
         shutil.copyfile(muxed, output_path)
         final = output_path
 
+    # An ending, and a level. Both were missing: the episode hard-cut on its
+    # last frame with the audio at full, and measured -18.4 LUFS against the
+    # -14 platforms normalise to.
+    _fade_tail(final, END_FADE_SECONDS)
+    normalise_loudness(final, progress_callback=say)
+
     for path in scratch:
         try:
             os.remove(path)
@@ -1458,6 +1499,49 @@ def produce_episode(
         "shorts_trimmed": bool(shorts_trimmed),
     }
 
+
+def _fade_tail(path: str, seconds: float = 0.6, ffmpeg: str | None = None) -> str:
+    """
+    Fades the picture and the sound out together at the end, in place.
+
+    A separate ffmpeg pass rather than part of the mux, because the mux copies
+    the video stream and a fade has to touch pixels. Failure leaves the file
+    untouched: an episode that ends abruptly is a worse episode, not a lost one.
+    """
+    import shutil
+    import subprocess
+    import tempfile as _tempfile
+
+    import imageio_ffmpeg
+
+    from video_engine import source_duration, video_encoder
+
+    ffmpeg = ffmpeg or imageio_ffmpeg.get_ffmpeg_exe()
+    total = source_duration(path)
+    fade = min(float(seconds), total * 0.25)
+    if total <= 0 or fade <= 0.05:
+        return path
+
+    start = max(0.0, total - fade)
+    work = _tempfile.mkdtemp(prefix="rf_fade_")
+    staged = os.path.join(work, "faded.mp4")
+    try:
+        proc = subprocess.run(
+            [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i",
+             os.path.abspath(path),
+             "-vf", f"fade=t=out:st={start:.3f}:d={fade:.3f}",
+             "-af", f"afade=t=out:st={start:.3f}:d={fade:.3f}",
+             *video_encoder()["cli"], "-pix_fmt", "yuv420p",
+             "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
+             "-shortest", staged],
+            capture_output=True, text=True, timeout=900)
+        if proc.returncode == 0 and os.path.exists(staged):
+            shutil.move(staged, path)
+    except Exception:
+        pass
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    return path
 
 def _mux(picture: str, audio: str, output_path: str,
          ffmpeg: str | None = None) -> str:
