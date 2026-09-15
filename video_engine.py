@@ -79,7 +79,10 @@ FFMPEG_TIMEOUT = 300
 
 GPU_CODEC = "h264_nvenc"
 GPU_PRESET = "p5"
-GPU_CQ = "25"
+# Constant-quality target. 25 produced a 609 kb/s stream for 1080x1920 line
+# art over glows and gradients -- which banded visibly before the platform had
+# even re-encoded it. 21 lands the same content around 3-4 Mb/s.
+GPU_CQ = "21"
 CPU_CODEC = "libx264"
 # veryfast, not medium. Measured on this project's 1080x1920 output at CRF 20:
 # 2.18x faster and 12% smaller, because a faster preset spends fewer bits
@@ -87,7 +90,7 @@ CPU_CODEC = "libx264"
 # includes the Docker image, since there is no GPU in the container -- this is
 # the difference between a render that finishes and one someone gives up on.
 CPU_PRESET = "veryfast"
-CPU_CRF = "20"
+CPU_CRF = "18"
 
 _encoder_cache: dict[str, Any] | None = None
 
@@ -133,9 +136,15 @@ def video_encoder(force_cpu: bool = False) -> dict[str, Any]:
         if probe_gpu_encoder():
             _encoder_cache = {
                 "codec": GPU_CODEC, "preset": GPU_PRESET,
-                "ffmpeg_params": ["-rc", "vbr", "-cq", GPU_CQ, "-b:v", "0"],
+                # -spatial-aq redistributes bits toward flat, low-detail
+                # regions, which is precisely where this engine banded: a glow
+                # falling off across a black background is a wide, smooth
+                # gradient and the default rate control starves it.
+                "ffmpeg_params": ["-rc", "vbr", "-cq", GPU_CQ, "-b:v", "0",
+                                  "-spatial-aq", "1", "-aq-strength", "8"],
                 "cli": ["-c:v", GPU_CODEC, "-preset", GPU_PRESET,
-                        "-rc", "vbr", "-cq", GPU_CQ, "-b:v", "0"],
+                        "-rc", "vbr", "-cq", GPU_CQ, "-b:v", "0",
+                        "-spatial-aq", "1", "-aq-strength", "8"],
                 "gpu": True,
             }
         else:
@@ -180,7 +189,9 @@ def write_clip(
             codec=enc["codec"],
             audio_codec="aac" if with_audio else None,
             preset=enc["preset"],
-            ffmpeg_params=list(enc["ffmpeg_params"]) + ["-pix_fmt", "yuv420p"],
+            audio_fps=DELIVERY_SAMPLE_RATE if with_audio else None,
+            ffmpeg_params=list(enc["ffmpeg_params"]) + [
+                "-pix_fmt", "yuv420p", "-movflags", "+faststart"],
         )
         return output_path
     except Exception as exc:
@@ -202,9 +213,16 @@ def write_clip(
         codec=CPU_CODEC,
         audio_codec="aac" if with_audio else None,
         preset="veryfast",
-        ffmpeg_params=["-crf", CPU_CRF, "-pix_fmt", "yuv420p"],
+        audio_fps=DELIVERY_SAMPLE_RATE if with_audio else None,
+        ffmpeg_params=["-crf", CPU_CRF, "-pix_fmt", "yuv420p",
+                       "-movflags", "+faststart"],
     )
     return output_path
+
+
+# What every platform re-encodes audio to. Writing anything higher is size
+# with no listener on the other end of it; the delivered file carried 96 kHz.
+DELIVERY_SAMPLE_RATE = 48000
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +399,13 @@ def normalise_loudness(path: str, target_lufs: float = TARGET_LUFS,
              "-af", (f"loudnorm=I={target_lufs}:TP={limiter_tp}:LRA={lra}"
                      f"{measured}:print_format=summary"),
              "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+             # The delivery rate has to be set HERE, not on the encoder that
+             # wrote the file: this pass runs after it and re-encodes the
+             # audio. loudnorm works internally at 192 kHz, so with no -ar the
+             # stream inherits that and AAC ships it at 96 -- which is what the
+             # delivered file carried even after write_clip started asking for
+             # 48.
+             "-ar", str(DELIVERY_SAMPLE_RATE),
              # AAC frames are 1024 samples, so the re-encode pads the tail and
              # the audio comes out up to ~0.1s longer than the picture. This
              # project holds A/V sync at 0.000s across every mode, and -shortest

@@ -188,11 +188,28 @@ class TestDispatch:
             "the hairline is being drawn on the act's clock")
 
     def test_the_payoff_belongs_to_the_video_not_to_every_act(self):
+        """
+        The closing card is built from `spec`, not from `act`. Drawn from the
+        act it would fire at the end of each one, and a six-act video would ask
+        for the follow six times.
+        """
         import inspect
 
         source = inspect.getsource(me._draw_act)
-        assert "draw_footer(frame, spec, t, duration)" in source, (
-            "the closing line is being drawn at the end of every act")
+        assert "draw_closing_card(card, spec, card_alpha)" in source
+        assert "closing_alpha_at(t, duration)" in source, (
+            "the closing card is being timed on the act's clock")
+
+    def test_the_closing_card_replaces_the_scene_rather_than_sharing_it(self):
+        """The payoff used to be a caption on the bottom rail of a scene that
+        was still animating behind it."""
+        import inspect
+
+        source = inspect.getsource(me._draw_act)
+        assert "base.astype(np.float32) * scene_alpha" in source, (
+            "the scene is not being faded out under the card")
+        assert "TRANSITION_BLACK_AT" in source, (
+            "the closing handover is crossing rather than going through black")
 
 
 # ---------------------------------------------------------------------------
@@ -289,10 +306,47 @@ class TestPlanPromptDemandsFacts:
         for key in ("two_doors", "gravity_funnel", "split_path"):
             assert key in prompt
 
-    def test_it_asks_for_three_and_forbids_repeats(self):
+    def test_it_asks_for_as_many_acts_as_the_runtime_can_hold(self):
+        """
+        Three acts over 66 seconds is 22 seconds each, and every template in
+        this engine finishes animating in about six -- so two thirds of the
+        video was a still picture. The count comes from MAX_ACT_SECONDS now.
+        """
         prompt = ge.build_scene_plan_prompt("x")
-        assert "THREE ACTS" in prompt
+        assert f"{ge.default_act_count()} ACTS" in prompt
+        assert ge.default_act_count() >= 5
         assert "same one twice" in prompt
+
+    def test_the_beats_scale_with_the_act_count(self):
+        """Six acts is not three acts with two repeated."""
+        names = [name for name, _ in ge.act_beats(6)]
+        assert names[0] == "CLAIM" and names[-1] == "TURN"
+        assert len(set(names)) == 6
+        assert [n for n, _ in ge.act_beats(3)] == ["CLAIM", "MECHANISM", "TURN"]
+
+    def test_every_ladder_rung_opens_on_the_claim_and_closes_on_the_turn(self):
+        for count in range(2, 9):
+            names = [name for name, _ in ge.act_beats(count)]
+            assert len(names) == count
+            assert names[0] == "CLAIM", count
+            assert names[-1] == "TURN", count
+
+    def test_the_metaphors_are_routed_by_domain(self):
+        """Two videos on unrelated topics were drawing from the same fourteen
+        shapes in the same order, which is most of why they looked alike."""
+        finance = ge.build_scene_plan_prompt("index funds vs active management")
+        psych = ge.build_scene_plan_prompt("the paradox of choice")
+        assert "DOMAIN: finance" in finance
+        assert "DOMAIN: psychology" in psych
+        assert "compounding_jar" in finance.split("reach first for:")[1][:200]
+        assert "delusion_mirror" in psych.split("reach first for:")[1][:200]
+
+    def test_it_demands_the_picture_agree_with_the_words(self):
+        """An act arguing that fees compound into losses rendered a vessel
+        filling up and a counter climbing to 9.75x."""
+        prompt = ge.build_scene_plan_prompt("x")
+        assert '"drain"' in prompt and '"fill"' in prompt
+        assert "Loss is never drawn as growth" in prompt
 
 
 class TestLabelsStayInFrame:

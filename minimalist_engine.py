@@ -32,8 +32,9 @@ from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
 import vector_rig as rig
 from paths import resolve_font
-from video_engine import (_SCRATCH_RENDERS, normalise_loudness,
-                          purge_scratch_renders, video_encoder, write_clip)
+from video_engine import (_SCRATCH_RENDERS, DELIVERY_SAMPLE_RATE,
+                          normalise_loudness, purge_scratch_renders,
+                          video_encoder, write_clip)
 
 # ---------------------------------------------------------------------------
 # Look
@@ -435,6 +436,39 @@ class Frame:
     # not lifted out of the band it owns.
     reserved: bool = False
 
+    # Every line this frame actually drew, as (body, x0, y0, x1, y1) in canvas
+    # space -- after the safe-area clamps, which is the whole point. A
+    # template's call site says where it *asked* for a line; this says where
+    # the line went. The two differ whenever a clamp fires, and that gap is
+    # where the vessel's stacked readout lived.
+    #
+    # One tuple per text call, so the cost is an append and the list dies with
+    # the frame.
+    # (body, x0, y0, x1, y1, group). Lines of one wrapped paragraph share a
+    # group: they are set on a leading, and a leading tighter than the
+    # conservative ink bound used here is normal typography rather than a
+    # collision. Anything drawn by a separate call gets its own group, which is
+    # where real collisions live.
+    _text_boxes: list[tuple[str, float, float, float, float, int]] | None = None
+    _group: int = 0
+    _hold_group: bool = False
+
+    @property
+    def text_boxes(self) -> list[tuple[str, float, float, float, float, int]]:
+        return list(self._text_boxes or ())
+
+    def _record_text(self, body: str, centre_x: float, y: float,
+                     advance: float, size: float) -> None:
+        """Files one drawn line's ink box. Ink, not advance: see _INK_OVER_ADVANCE."""
+        if self._text_boxes is None:
+            self._text_boxes = []
+        if not self._hold_group:
+            self._group += 1
+        half_w = advance * _INK_OVER_ADVANCE / 2.0
+        half_h = size * _INK_BELOW_ANCHOR
+        self._text_boxes.append((body, centre_x - half_w, y - half_h,
+                                 centre_x + half_w, y + half_h, self._group))
+
     # Scales every non-reserved text colour. Driven to 0 over
     # CAPTION_DUCK_SECONDS when the closing caption arrives, so the scene's
     # annotation layer clears out from underneath it instead of competing.
@@ -481,6 +515,7 @@ class Frame:
                  if clamp_safe else centre[0])
             self.draw.text((x * s, y * s), body, font=font,
                            fill=colour, anchor=anchor)
+            self._record_text(body, x, y, width / s, size)
             return
 
         gap = tracking * s
@@ -489,6 +524,7 @@ class Frame:
         centre_x = (self.safe_x(centre[0], total * _INK_OVER_ADVANCE / s)
                     if clamp_safe else centre[0])
         x = centre_x * s - total / 2
+        self._record_text(body, centre_x, y, total / s, size)
         for ch, w in zip(body, widths):
             self.draw.text((x, y * s), ch, font=font, fill=colour, anchor="lm")
             x += w + gap
@@ -525,9 +561,14 @@ class Frame:
                     + size * _INK_BELOW_ANCHOR) - TEXT_SAFE_Y
         if overflow > 0:
             top -= overflow
-        for i, line in enumerate(lines):
-            self.text(line, (centre[0], top + i * step), size, colour, weight,
-                      clamp_safe=False)
+        self._group += 1
+        self._hold_group = True
+        try:
+            for i, line in enumerate(lines):
+                self.text(line, (centre[0], top + i * step), size, colour, weight,
+                          clamp_safe=False)
+        finally:
+            self._hold_group = False
 
     # -- output ------------------------------------------------------------
     def finish(self, glow: float = GLOW_STRENGTH) -> np.ndarray:
@@ -730,6 +771,9 @@ def label(spec: dict[str, Any], slot: str, fallback: str = "",
         value = str(supplied.get(slot) or "").strip()
         if value:
             return value.upper()[:limit]
+    # The caller's fallback wins over the template's placeholder. It used to
+    # be the other way around, so scene_vessel asking for "YEAR" on a
+    # thirty-year axis still got the template's "DAY".
     defaults = LABEL_SLOTS.get(str(spec.get("template") or ""), {})
     return (fallback or defaults.get(slot, "")).upper()[:limit]
 
@@ -757,34 +801,13 @@ def draw_titles(frame: Frame, spec: dict[str, Any], t: float) -> None:
     frame.wrapped(title, (frame.w / 2, 300), size=72, colour=mix(WHITE, alpha),
                   weight="bold", max_width=900, leading=1.15)
     if subtitle:
-        frame.wrapped(subtitle, (frame.w / 2, 430), size=38,
-                      colour=mix(GREY, fade(t, 0.55, attack=0.7)), weight="light",
-                      max_width=820)
-
-
-def draw_footer(frame: Frame, spec: dict[str, Any], t: float, duration: float) -> None:
-    """Closing line, held for the last beat so the point lands."""
-    line = str(spec.get("payoff") or "").upper()
-    if not line:
-        return
-    start = max(0.0, duration - CAPTION_LEAD_SECONDS)
-    alpha = fade(t, start, attack=0.8)
-    if alpha > 0.01:
-        # Anchored to the safe line rather than to a fixed y. It used to ask
-        # for a literal y and let the clamp bottom-align it, which worked while
-        # SAFE_BOTTOM happened to be 200: raising the margin to 220 moved the
-        # safe line up and left that literal below it, so the payoff bled six
-        # pixels into the action rail. Measured across all fourteen
-        # templates, bottom-aligning here leaves 3.8% ink behind the text --
-        # a deliberate move further up collided with each template's own axis
-        # labels at 28%.
-        frame.reserved = True
-        try:
-            frame.wrapped(line, (frame.w / 2, TEXT_SAFE_Y), size=52,
-                          colour=mix(WHITE, alpha), weight="bold",
-                          max_width=900, leading=1.18)
-        finally:
-            frame.reserved = False
+        # 44, not 38, and mixed brighter. At 38px light grey it was the
+        # smallest type in the frame on the device most of the audience is
+        # holding -- the report called it "too small/thin for mobile", and a
+        # subtitle nobody reads is a line of the argument thrown away.
+        frame.wrapped(subtitle, (frame.w / 2, 432), size=44,
+                      colour=mix((170, 170, 170), fade(t, 0.55, attack=0.7)),
+                      weight="light", max_width=880)
 
 
 # The hairline was at y=1692, underneath the platform's own scrubber. It sits
@@ -867,12 +890,50 @@ def scene_curve(frame: Frame, t: float, spec: dict[str, Any], duration: float) -
 # Template 2 -- The 1% Daily Vessel
 # ---------------------------------------------------------------------------
 
-_JAR = (330.0, 720.0, 750.0, 1440.0)         # left, top, right, bottom
+# Raised off the old (330, 720, 750, 1440). The bottom used to sit at 1440,
+# which left the readout nowhere to go but into the caption band, and the
+# clamp then stacked it on the axis caption.
+_JAR = (340.0, 712.0, 740.0, 1296.0)         # left, top, right, bottom
 _JAR_DAYS = 365
+
+# How the fill is drawn.
+#
+# It was a solid block of pure white. 400x580 pixels of 255 on black clips to a
+# flat shape with no detail in it, throws enough glow to wash the outline it is
+# supposed to sit inside, and makes any white type over it invisible -- which
+# is what happened to the counter from 31s.
+#
+# A dim body under bright hatching reads as volume rather than as a slab, keeps
+# the mean luminance of the area down by about two thirds, and is the same
+# drawing language as the rest of the engine: this is a line-art channel, and
+# the one place it was filling a large area solid is the one place it looked
+# like a different piece of software.
+# Measured inside the glass, over the area the fill occupies: solid white read
+# 250 mean with most of it clipped at 255. These three land it at 99 with 8%
+# clipped -- still unmistakably full, no longer a light source.
+_FILL_BODY = 0.12
+_FILL_HATCH = 0.70
+_FILL_HATCH_GAP = 46.0
+
+# What the counter counts, when the plan does not say.
+#
+# The slot defaults to "DAY" from the template, which read "DAY 0" beside an
+# axis marked 30y. The axis and the counter are the same quantity, so the
+# suffix decides both.
+_AXIS_UNITS: dict[str, str] = {"d": "DAY", "w": "WEEK", "mo": "MONTH",
+                               "m": "MONTH", "y": "YEAR", "q": "QUARTER"}
 
 
 def scene_vessel(frame: Frame, t: float, spec: dict[str, Any], duration: float) -> None:
-    """A jar filling on a 1.01^n curve: nothing, nothing, nothing, then everything."""
+    """
+    A vessel on a compounding curve: nothing, nothing, nothing, then everything.
+
+    Runs in both directions. `direction: "drain"` starts it full and empties it
+    on the same curve, because the compounding argument is made about losses at
+    least as often as about gains -- fees, attrition, interest owed -- and a
+    container filling up under the words "compound into major losses" tells the
+    viewer the opposite of what the narration is telling them.
+    """
     ph = phases_of(spec, duration)
     draw_ambient(frame, t, ph, spec)
 
@@ -881,45 +942,97 @@ def scene_vessel(frame: Frame, t: float, spec: dict[str, Any], duration: float) 
     span = max(duration - lead - 2.2, 1.0)
     u = clamp((t - lead) / span)
 
-    day = int(u * _JAR_DAYS)
-    growth = 1.01 ** day
+    draining = str(spec.get("direction") or "fill").lower() in ("drain", "down", "loss")
+    # The axis is the scale the argument is actually made on. Fee drag is a
+    # decades-long effect and was being plotted over 360 days.
+    axis_max = max(1, int(spec.get("axis_max") or _JAR_DAYS))
+    axis_suffix = str(spec.get("axis_suffix") or "d")
+
+    step = int(u * axis_max)
+    growth = 1.01 ** (u * _JAR_DAYS)
     ceiling = 1.01 ** _JAR_DAYS
-    level = clamp((growth - 1.0) / (ceiling - 1.0))
+    curve = clamp((growth - 1.0) / (ceiling - 1.0))
+
+    # Where the level ends up. A drain that always empties is as wrong as a
+    # fill under the word "losses": a 1% annual fee costs roughly a quarter of
+    # a thirty-year portfolio, and drawing that as an empty jar overstates the
+    # argument by four times. The plan supplies the landing point; the defaults
+    # are the honest generic ones.
+    try:
+        end_value = float(spec.get("end_value") or 0.0)
+    except (TypeError, ValueError):
+        end_value = 0.0
+    if draining:
+        start, end = 1.0, clamp(end_value or 0.72)
+    else:
+        start, end = 0.0, clamp(end_value or 1.0)
+
+    level = clamp(start + (end - start) * curve)
+    # What the counter says. Draining counts what is left, as a share.
+    readout = f"{100.0 * level:.0f}%" if draining else f"{growth:.2f}x"
 
     # Fluid first, so the outline sits on top of it.
     if level > 0.002:
+        # Held a wave's amplitude clear of the rim, so a full vessel does not
+        # slosh its surface out through the lip.
         surface = bottom - (bottom - top) * level
+        surface = min(max(surface, top + 16.0), bottom)
         body: list[tuple[float, float]] = []
         for i in range(41):
             x = left + (right - left) * (i / 40)
             wave = math.sin(i / 40 * math.pi * 3 + t * 2.4) * 6 * (0.4 + level)
             body.append((x, surface + wave))
         body += [(right, bottom), (left, bottom)]
-        frame.polygon(body, WHITE)
+        frame.polygon(body, mix(WHITE, _FILL_BODY))
+        # Hatching through the body, so it has depth instead of being a slab.
+        # Clipped to the waterline rather than drawn over it: a rule crossing
+        # the surface would read as a scale marking, not as fill.
+        hatch = mix(WHITE, _FILL_HATCH)
+        y = bottom - _FILL_HATCH_GAP / 2
+        while y > surface + 8:
+            frame.line((left + 8, y), (right - 8, y), hatch, 3)
+            y -= _FILL_HATCH_GAP
+        # A bright waterline so the surface still has an edge.
+        frame.polyline(body[:41], WHITE, 4)
 
     # Vessel outline and lip.
     frame.rect((left, top, right, bottom), WHITE, width=7, radius=34)
     frame.line((left - 26, top), (right + 26, top), WHITE, 7)
 
-    # Tick marks: quarters of a year up the side.
+    # Tick marks up the side, on whatever scale the argument uses.
     for i in range(1, 5):
         y = bottom - (bottom - top) * (i / 4)
-        frame.line((right + 14, y), (right + 46, y), DIM if level < i / 4 else GREY, 4)
-        frame.text(f"{i * 90}d", (right + 96, y), 26,
-                   DIM if level < i / 4 else GREY, weight="light")
+        reached = (curve if draining else level) >= i / 4
+        frame.line((right + 14, y), (right + 46, y), GREY if reached else DIM, 4)
+        frame.text(f"{axis_max * i // 4}{axis_suffix}", (right + 100, y), 26,
+                   GREY if reached else DIM, weight="light")
 
-    # Compounding particles falling in, one per simulated fortnight.
+    # Particles: falling in when it fills, draining out of the bottom when it
+    # does not. They are the only thing on screen that says which way this goes
+    # before the level has moved far enough to tell.
     for k in range(14):
         phase = (t * 0.9 + k * 0.37) % 1.0
         if phase > 0.62:
             continue
+        travel = phase / 0.62
         x = left + 46 + (k * 97) % max(1.0, (right - left - 92))
-        y = top - 130 + phase / 0.62 * 130
-        frame.circle((x, y), 7, mix(WHITE, 1.0 - phase / 0.62))
+        y = (bottom + travel * 120) if draining else (top - 130 + travel * 130)
+        frame.circle((x, y), 7, mix(WHITE, 1.0 - travel))
 
-    frame.text(f'{label(spec, "unit")} {day}', (frame.w / 2, 1478), 38, GREY, tracking=5)
-    frame.text(f"{growth:.2f}x", (frame.w / 2, 1552), 62,
-               WHITE if level > 0.5 else GREY, tracking=2)
+    # The readout sits ABOVE the vessel, stacked, with real leading between the
+    # two lines. It used to be under it at 1478 and 1552 -- both below the safe
+    # line, so the clamp lifted them to within 21px of each other and drew 38px
+    # type through 62px type. Above the glass it is also never on the fill,
+    # which is what made it vanish once the white reached it.
+    unit = label(spec, "unit", fallback=_AXIS_UNITS.get(axis_suffix.lower(), "DAY"))
+    # 96px apart, not 66. The ink of a 66px line reaches 56px either side of
+    # its anchor and a 30px line reaches 26, so anything closer than 82px
+    # between centres overlaps -- and at 66 apart these two were drawn through
+    # each other, which is the same fault this readout was moved up here to
+    # escape. The collision check in tests/test_layout.py measures it now
+    # rather than leaving it to someone looking at a frame.
+    frame.text(readout, (frame.w / 2, 576), 66, WHITE, tracking=2)
+    frame.text(f"{unit} {step}", (frame.w / 2, 672), 30, GREY, tracking=5)
 
 
 # ---------------------------------------------------------------------------
@@ -1528,7 +1641,14 @@ def scene_climb(frame: Frame, t: float, spec: dict[str, Any], duration: float) -
 
 # --- 3. The Delusion Mirror -------------------------------------------------
 
-_MIRROR_BOX = (560.0, 660.0, 960.0, 1400.0)     # left, top, right, bottom
+# The floor this scene stands on. It was 1400, and the two captions were
+# asked for at 1470 and 1448 -- below TEXT_SAFE_Y, so the clamp hoisted both to
+# 1305, which is mid-shin on a figure standing at 1400. Dropping the floor to
+# 1250 puts the captions below the feet and still inside the safe area, without
+# either the scene or the clamp having to know about the other.
+_MIRROR_FLOOR = 1250.0
+_MIRROR_CAPTION_Y = _MIRROR_FLOOR + 46.0
+_MIRROR_BOX = (560.0, 560.0, 960.0, _MIRROR_FLOOR)   # left, top, right, bottom
 
 
 def scene_mirror(frame: Frame, t: float, spec: dict[str, Any], duration: float) -> None:
@@ -1540,9 +1660,10 @@ def scene_mirror(frame: Frame, t: float, spec: dict[str, Any], duration: float) 
     grow = ph.travel(t, ease_out_cubic)
 
     # The real figure, unchanged throughout.
-    rig.draw_figure(frame, "idle", phase=(t * 0.35) % 1.0, anchor=(300, 1400),
-                    height=330, colour=GREY, weight=6.0, facing=1)
-    frame.text(label(spec, "real"), (300, 1470), 34,
+    rig.draw_figure(frame, "idle", phase=(t * 0.35) % 1.0,
+                    anchor=(300, _MIRROR_FLOOR),
+                    height=320, colour=GREY, weight=6.0, facing=1)
+    frame.text(label(spec, "real"), (300, _MIRROR_CAPTION_Y), 34,
                mix(GREY, fade(t, ph.lead + 0.3, 0.6)), tracking=4)
 
     # The mirror.
@@ -1562,14 +1683,15 @@ def scene_mirror(frame: Frame, t: float, spec: dict[str, Any], duration: float) 
         frame.circle(skeleton.head, skeleton.head_radius * (1.7 + ring * 0.85),
                      mix(WHITE, glow_level * 0.30 / (ring + 1)), 3)
 
-    frame.text(label(spec, "imagined"), ((left + right) / 2, bottom + 48), 36,
+    frame.text(label(spec, "imagined"), ((left + right) / 2, _MIRROR_CAPTION_Y), 36,
                mix(WHITE, fade(t, ph.lead + 0.8, 0.6) * glow_level), tracking=4)
 
-    # The gap between them, stated at the beat.
+    # The gap between them, stated at the beat. Above the two captions rather
+    # than level with the knees.
     gap = ph.after(t, 0.8)
     if gap > 0:
-        frame.line((380, 1160), (left - 30, 1160), mix(WHITE, gap * 0.7), 4)
-        frame.text(label(spec, "gap"), ((380 + left) / 2, 1120), 30,
+        frame.line((380, 1030), (left - 30, 1030), mix(WHITE, gap * 0.7), 4)
+        frame.text(label(spec, "gap"), ((380 + left) / 2, 986), 30,
                    mix(WHITE, gap), tracking=4)
 
 
@@ -1983,18 +2105,35 @@ def _door(frame: Frame, centre_x: float, glow: float, colour: tuple[int, int, in
                            (left + _DOOR_W + spread * 1.6, _DOOR_Y + 150 * glow),
                            (left - spread * 1.6, _DOOR_Y + 150 * glow)],
                           mix(WHITE, 0.05 * glow / (ring + 1)))
+        # 0.18, not 0.30. At 0.30 plus the glow pass the interior clipped to a
+        # flat bright rectangle, and a white figure standing in it had nothing
+        # left to read against -- the "distorted Y/blob" in the report.
         frame.rect((left + 14, top + 14, left + _DOOR_W - 14, _DOOR_Y),
-                   mix(WHITE, 0.30 * glow))
+                   mix(WHITE, 0.18 * glow))
 
     frame.rect((left, top, left + _DOOR_W, _DOOR_Y), colour, width=8, radius=6)
     frame.line((left, _DOOR_Y), (left + _DOOR_W, _DOOR_Y), colour, 8)
-    # The handle, and the leaf swinging in when it opens.
     frame.circle((left + _DOOR_W - 46, _DOOR_Y - _DOOR_H / 2), 11, colour)
+
     if open_amount > 0.02:
-        swing = _DOOR_W * 0.55 * open_amount
-        frame.polyline([(left, top), (left + swing, top + 40 * open_amount),
-                        (left + swing, _DOOR_Y - 40 * open_amount), (left, _DOOR_Y)],
-                       mix(colour, 0.6), 5)
+        # The leaf swings OUT, off the hinge on the left jamb. It used to be
+        # drawn as a slanted line inside the frame, which reads as a crack in
+        # the wall rather than as a door: the whole point of the shot is that
+        # something opened toward the viewer.
+        #
+        # One-point perspective, cheaply: the free edge travels left of the
+        # hinge and its top and bottom converge as it comes toward us, so the
+        # leaf is a trapezoid rather than a parallelogram.
+        reach = _DOOR_W * 0.78 * open_amount
+        taper = _DOOR_H * 0.10 * open_amount
+        edge_x = left - reach
+        frame.polyline([(left, top), (edge_x, top + taper),
+                        (edge_x, _DOOR_Y - taper * 0.45), (left, _DOOR_Y)],
+                       mix(colour, 0.85), 6)
+        # The hinge stile, so the leaf is clearly attached to the jamb.
+        frame.line((left, top), (left, _DOOR_Y), mix(colour, 0.9), 6)
+        # Its handle travels with it.
+        frame.circle((edge_x + 26, (top + _DOOR_Y) / 2), 9, mix(colour, 0.7))
 
 
 def scene_doors(frame: Frame, t: float, spec: dict[str, Any], duration: float) -> None:
@@ -2014,18 +2153,32 @@ def scene_doors(frame: Frame, t: float, spec: dict[str, Any], duration: float) -
     _door(frame, _DOOR_RIGHT_X, (0.25 + 0.75 * walk) * reveal,
           mix(WHITE, reveal), open_amount=chosen)
 
+    # Gated on `reveal`, which is how far the doors themselves have drawn.
+    # These two used to fade in on a clock of their own, so "COMFORT" appeared
+    # at 41s naming a door that did not finish drawing until 43.
     frame.text(label(spec, "left"), (_DOOR_LEFT_X, floor + 70), 34,
-               mix(GREY, fade(t, ph.lead + 0.3, 0.6) * (1.0 - 0.4 * chosen)), tracking=4)
+               mix(GREY, fade(t, ph.lead + 0.3, 0.6) * reveal * (1.0 - 0.4 * chosen)),
+               tracking=4)
     frame.text(label(spec, "right"), (_DOOR_RIGHT_X, floor + 70), 38,
-               mix(WHITE, fade(t, ph.lead + 0.5, 0.6)), tracking=4)
+               mix(WHITE, fade(t, ph.lead + 0.5, 0.6) * reveal), tracking=4)
 
-    # The figure starts between the doors and walks to the lit one.
-    start_x, end_x = 540.0, _DOOR_RIGHT_X
-    x = start_x + (end_x - start_x) * walk
-    pose = "walking" if chosen <= 0 else "reaching_upward"
-    height = 300 - 90 * chosen        # walking away, into the doorway
-    rig.draw_figure(frame, pose, phase=(t * 1.5) % 1.0, anchor=(x, floor),
-                    height=height, colour=WHITE, weight=7.0 - 2.0 * chosen)
+    # The figure starts between the doors and walks to the lit one, then keeps
+    # walking into it and is gone.
+    #
+    # It used to switch to "reaching_upward" and shrink to 210px at the
+    # threshold, which put a small Y-shaped figure on top of the brightest
+    # rectangle in the frame -- white on white, reported as a "distorted
+    # Y/blob". It stays a walking figure and dims out into the light instead,
+    # which is also what walking through a door looks like.
+    # It stops at the threshold rather than in the middle of the lit panel,
+    # and only crosses it while it is fading out.
+    threshold = _DOOR_RIGHT_X - _DOOR_W / 2 - 55
+    x = 540.0 + (threshold - 540.0) * walk + (_DOOR_RIGHT_X - threshold) * chosen
+    present = 1.0 - clamp(chosen / 0.75)
+    if present > 0.02:
+        rig.draw_figure(frame, "walking", phase=(t * 1.5) % 1.0,
+                        anchor=(x, floor), height=300,
+                        colour=mix(WHITE, present), weight=7.0)
 
     if chosen > 0.4:
         frame.text(label(spec, "through"), (frame.w / 2, floor - _DOOR_H - 110), 40,
@@ -2309,6 +2462,9 @@ def normalise_spec(raw: dict[str, Any] | None) -> dict[str, Any]:
         "title": str(raw.get("title") or preset["title"] or "").strip(),
         "subtitle": str(raw.get("subtitle") or preset["subtitle"] or "").strip(),
         "payoff": str(raw.get("payoff") or preset["payoff"] or "").strip(),
+        # What the closing card asks for. The model may write it; if it does
+        # not, every video still ends on an ask rather than on a full stop.
+        "cta": str(raw.get("cta") or DEFAULT_CTA).strip()[:40],
         "thesis": str(raw.get("thesis") or "").strip(),
         "duration": duration,
         "climax": climax,
@@ -2373,6 +2529,15 @@ def normalise_act(raw: dict[str, Any]) -> dict[str, Any]:
         "thesis": str(raw.get("thesis") or "").strip(),
         "labels": raw.get("labels") if isinstance(raw.get("labels"), dict) else {},
         "elements": raw.get("elements") if isinstance(raw.get("elements"), list) else [],
+        # Which way the geometry moves, and on what scale. An act arguing that
+        # fees compound into losses and an act arguing that deposits compound
+        # into wealth want the same vessel running opposite directions -- and
+        # the one that got rendered filled up under the word "losses".
+        "direction": ("drain" if str(raw.get("direction") or "").lower()
+                      in ("drain", "down", "loss", "decreasing") else "fill"),
+        "axis_max": max(1, int(raw.get("axis_max") or 365)),
+        "end_value": _positive(raw.get("end_value")),
+        "axis_suffix": str(raw.get("axis_suffix") or "d").strip()[:3],
         "ambient": max(0.0, min(1.5, float(raw.get("ambient", 1.0) or 0.0))),
         "climax_fraction": max(0.15, min(0.9, fraction)),
         "concept": str(raw.get("concept") or "").strip(),
@@ -2399,6 +2564,19 @@ def normalise_act(raw: dict[str, Any]) -> dict[str, Any]:
 # level, which on a loop reads as a glitch rather than an ending.
 END_FADE_SECONDS = 0.6
 
+# The shortest video this engine is allowed to produce.
+#
+# TikTok Creator Rewards pays on videos over sixty seconds and nothing at all
+# under it, so a 59-second render is not a slightly worse video -- it is an
+# unpaid one. The runtime is derived from the narration, and the narration only
+# ever pushed it *up*: a voice reading faster than the word budget assumed
+# simply landed short. minimalist_1789502356.mp4 came out at 56.29s.
+#
+# 63 rather than 60 because the loudness pass and the AAC packetiser each move
+# the final duration by a few hundredths, and because a video that lands at
+# 60.04 is one rounding decision away from being unpaid.
+PAYOUT_FLOOR_SECONDS = 63.0
+
 MIN_ACT_SECONDS = 8.0
 
 # The longest. Every template finishes its reveals in the first few seconds and
@@ -2407,14 +2585,33 @@ MIN_ACT_SECONDS = 8.0
 # to be split across more of them.
 MAX_ACT_SECONDS = 12.0
 
-# How long the outgoing act stays on screen under the incoming one.
+# How long the handover between two acts takes.
 #
-# Without it the cut was a black flash. Each template fades its own geometry in
-# over its first beat, so at a new act's local t=0 the screen is genuinely
-# empty -- measured at the 20.8s boundary, mean brightness fell from 26.8 to
-# 1.9 for five frames and then climbed back. Not a transition artefact: a
-# fade-from-nothing built into every template.
-ACT_OVERLAP = 0.5
+# Without any overlap the cut was a black flash. Each template fades its own
+# geometry in over its first beat, so at a new act's local t=0 the screen is
+# genuinely empty -- measured at the 20.8s boundary, mean brightness fell from
+# 26.8 to 1.9 for five frames and then climbed back. Not a transition artefact:
+# a fade-from-nothing built into every template.
+#
+# The first fix for that was a cross-dissolve, and it was wrong. These frames
+# are white line art on pure black, so a dissolve does not blend them -- it
+# shows both. At 19.0s of minimalist_1789502356.mp4 two titles ghost through
+# each other, act 3's figure stands inside act 2's beaker, and two pairs of
+# labels sit on the same baseline. Nothing is hidden by anything, because there
+# is nothing to hide behind: the ground is black and black is additive zero.
+#
+# So the handover goes *through* black instead of across. The outgoing act
+# fades down to nothing, and only then does the incoming one come up. They are
+# never both on screen. The window is longer than the dissolve was because it
+# now has two halves to fit.
+ACT_OVERLAP = 0.7
+
+# Where in that window the screen is at its darkest. 0.5 splits it evenly.
+#
+# The incoming act's own clock runs through its whole half, so by the time it
+# becomes visible its geometry has already begun drawing itself -- which is the
+# original black-flash problem solved properly rather than papered over.
+TRANSITION_BLACK_AT = 0.5
 
 
 def allocate_acts(spec: dict[str, Any], duration: float) -> list[dict[str, Any]]:
@@ -2563,9 +2760,82 @@ def text_boxes_overlap(first: tuple[float, float, float, float],
     return not (ax1 <= bx0 or bx1 <= ax0 or ay1 <= by0 or by1 <= ay0)
 
 
-# The closing caption holds the last few seconds. Kept as a named value
-# because the duck has to start at exactly the same moment.
-CAPTION_LEAD_SECONDS = 4.2
+# How long the closing card owns the screen.
+#
+# It used to be a caption on the bottom rail of a scene that had already
+# finished animating: title and subtitle faded out, the top sixty percent of
+# the frame went empty, and the payoff sat on the action-safe line for four
+# seconds with nothing asking for the follow.
+#
+# The card replaces the scene instead of sharing it with one. That buys the
+# full frame for the one line the video exists to deliver, and it is the only
+# part of the runtime where asking for something is not competing with the
+# argument.
+CLOSING_SECONDS = 5.6
+
+# How long the swap takes, scene out and card in.
+#
+# It runs through black in two halves, for the reason ACT_OVERLAP does: the
+# first version cross-faded, and at 60.6s of a six-act render the payoff was
+# drawn across two lit doorways with "FOLLOW FOR MORE" sitting on top of "THE
+# HARD ONE". White line art on black does not blend, it accumulates.
+#
+# The rest of CLOSING_SECONDS is hold: 5.6 - 1.0 - END_FADE_SECONDS leaves the
+# payoff fully up and perfectly still for 4.0 seconds, which is the floor for a
+# line somebody has to read, decide about, and act on.
+CLOSING_FADE = 1.0
+
+# Kept as the old name because the annotation duck is driven from it and
+# several callers and tests reach for it.
+CAPTION_LEAD_SECONDS = CLOSING_SECONDS
+
+# What the closing card asks for. A video that argues something and then stops
+# has spent its whole retention budget and banked nothing.
+DEFAULT_CTA = "Follow for more"
+
+
+def closing_alpha_at(t: float, duration: float) -> float:
+    """
+    How much of the frame the closing card owns at `t`, 0-1.
+
+    0 for the whole argument, then up over CLOSING_FADE and held. The scene is
+    scaled by the complement, so the two never share the frame -- same
+    guarantee as the act handover, for the same reason.
+    """
+    start = max(0.0, float(duration) - CLOSING_SECONDS)
+    if t <= start:
+        return 0.0
+    return min(1.0, (t - start) / max(CLOSING_FADE, 1e-6))
+
+
+def draw_closing_card(frame: Frame, spec: dict[str, Any], alpha: float) -> None:
+    """
+    The last beat: the payoff centred in the frame, and the ask under it.
+
+    Centred rather than on the bottom rail because by this point it is the only
+    thing on screen, and a line of type sitting low in an empty frame reads as
+    something left over from a scene that ended rather than as the ending.
+    """
+    if alpha <= 0.01:
+        return
+    line = str(spec.get("payoff") or "").upper()
+    cta = str(spec.get("cta") or DEFAULT_CTA)
+
+    frame.reserved = True
+    try:
+        if line:
+            frame.wrapped(line, (frame.w / 2, 880.0), size=74,
+                          colour=mix(WHITE, alpha), weight="bold",
+                          max_width=880, leading=1.16)
+        # A rule and the ask, far enough below the payoff that the eye finishes
+        # the sentence before it is asked for anything.
+        rule = mix(WHITE, alpha * 0.28)
+        frame.line((frame.w / 2 - 110, 1100.0), (frame.w / 2 + 110, 1100.0), rule, 3)
+        if cta:
+            frame.text(cta.upper(), (frame.w / 2, 1188.0), 40,
+                       mix(GREY, alpha), weight="bold", tracking=6)
+    finally:
+        frame.reserved = False
 
 
 def annotation_alpha_at(t: float, duration: float) -> float:
@@ -2627,15 +2897,33 @@ def make_scene_frame(spec: dict[str, Any], t: float, duration: float) -> np.ndar
 def _draw_act(spec: dict[str, Any], act: dict[str, Any], local_t: float,
               act_seconds: float, t: float, duration: float) -> np.ndarray:
     """One act's frame, with the whole-video furniture on top."""
+    closing = closing_alpha_at(t, duration)
+
     frame = Frame(reuse=False)
-    # The scene's labels clear out from under the closing caption.
+    # The scene's labels clear out from under the closing card.
     frame.annotation_alpha = annotation_alpha_at(t, duration)
     scene: SceneFn = TEMPLATES[str(act["template"])]["fn"]
     scene(frame, local_t, act, act_seconds)
     draw_titles(frame, act, local_t)
-    draw_footer(frame, spec, t, duration)
     draw_progress(frame, t, duration)
-    return frame.finish()
+    base = frame.finish()
+
+    if closing <= 0.001:
+        return base
+
+    # Through black, in two halves, exactly as an act handover does. The scene
+    # is fully gone before the payoff has drawn a single pixel, so the last
+    # line of the argument is never read against live geometry.
+    scene_alpha = max(0.0, 1.0 - closing / TRANSITION_BLACK_AT)
+    card_alpha = max(0.0, (closing - TRANSITION_BLACK_AT)
+                     / max(1.0 - TRANSITION_BLACK_AT, 1e-6))
+
+    lit = base.astype(np.float32) * scene_alpha
+    if card_alpha > 0.0:
+        card = Frame(reuse=False)
+        draw_closing_card(card, spec, card_alpha)
+        lit = lit + card.finish().astype(np.float32)
+    return np.clip(lit, 0, 255).astype(np.uint8)
 
 
 def _outgoing_act(spec: dict[str, Any], t: float):
@@ -2661,9 +2949,26 @@ def _outgoing_act(spec: dict[str, Any], t: float):
 
 
 def _mix_frames(under: np.ndarray, over: np.ndarray, blend: float) -> np.ndarray:
-    """Linear cross-dissolve. `blend` 0 is all `under`, 1 is all `over`."""
+    """
+    Fades `under` out to black, then `over` up from it. `blend` runs 0..1.
+
+    Not a cross-dissolve. See ACT_OVERLAP: on black, a dissolve between two
+    line drawings shows both of them. The guarantee this gives instead is that
+    at every instant at most one act contributes any light, which is what makes
+    "titles never overlap" a property of the compositor rather than something
+    each template has to be careful about.
+    """
     weight = max(0.0, min(1.0, float(blend)))
-    mixed = under.astype(np.float32) * (1.0 - weight) + over.astype(np.float32) * weight
+    cut = TRANSITION_BLACK_AT
+
+    under_alpha = max(0.0, 1.0 - weight / max(cut, 1e-6))
+    over_alpha = max(0.0, (weight - cut) / max(1.0 - cut, 1e-6))
+
+    if over_alpha <= 0.0:
+        return (under.astype(np.float32) * under_alpha).astype(np.uint8)
+    if under_alpha <= 0.0:
+        return (over.astype(np.float32) * over_alpha).astype(np.uint8)
+    mixed = under.astype(np.float32) * under_alpha + over.astype(np.float32) * over_alpha
     return np.clip(mixed, 0, 255).astype(np.uint8)
 
 
@@ -2932,6 +3237,16 @@ def build_minimalist_video(
             spec["climax"] = float(spec["climax"]) * (grown / duration)
             duration = grown
             spec["duration"] = duration
+
+        # And a floor, because the narration could only ever push the runtime
+        # up. The difference is paid for out of the closing card, which is the
+        # one beat that reads better held than hurried -- see CLOSING_SECONDS.
+        if duration < PAYOUT_FLOOR_SECONDS:
+            spec["climax"] = float(spec["climax"]) * (PAYOUT_FLOOR_SECONDS / duration)
+            duration = PAYOUT_FLOOR_SECONDS
+            spec["duration"] = duration
+            stage(f"Stage 1/5 - Narration: {spoken:.0f}s read, held to "
+                  f"{PAYOUT_FLOOR_SECONDS:.0f}s for the payout floor.")
     else:
         stage("Stage 1/5 - Narration: skipped (silent cut).")
 
@@ -2984,7 +3299,10 @@ def build_minimalist_video(
         mix = CompositeAudioClip(tracks)
         mix.duration = duration
         mixed_path = scratch_wav("mmmix")
-        mix.write_audiofile(mixed_path, fps=44100, logger=None)
+        # 48 kHz: what every platform re-encodes to. The mix used to be
+        # written at 44.1 and MoviePy handed the encoder 96 kHz, which is
+        # double the delivery rate and pure file size.
+        mix.write_audiofile(mixed_path, fps=DELIVERY_SAMPLE_RATE, logger=None)
         open_clips.append(mix)
     else:
         stage("Stage 4/5 - Audio: silent.")

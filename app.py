@@ -6691,7 +6691,10 @@ def magic_context() -> dict[str, Any]:
         "fit": str(st.session_state.get("render_fit") or DEFAULT_FIT),
         "transition": str(st.session_state.get("render_transition") or "crossfade"),
         "transition_dur": float(st.session_state.get("render_transition_dur") or 0.5),
-        "fps": int(st.session_state.get("render_fps") or 24),
+        # 30, not 24. The vector engine draws continuous motion -- a figure
+        # walking, a needle settling -- and 24 judders on it where a
+        # photographic source would not.
+        "fps": int(st.session_state.get("render_fps") or 30),
         "watermark": str(st.session_state.get("render_watermark") or ""),
         "target": str(st.session_state.get("magic_target") or DEFAULT_TARGET),
         "music_style": str(audio.get("style") or "lofi"),

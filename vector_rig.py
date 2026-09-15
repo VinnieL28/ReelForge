@@ -62,6 +62,14 @@ HEAD_CENTRE = 0.912          # from the feet, upward
 NECK = 0.800
 CHEST = 0.640                # the torso hinge, between hip and neck
 HIP = 0.470
+# Half the shoulder span, as a fraction of height.
+#
+# Arms used to start at the neck -- one point, for both of them, sitting inside
+# the head's glow. A flexing pose then drew as two chevrons hanging beside the
+# head with nothing joining them to the body, which is what the frame-by-frame
+# report saw as "disconnected limbs". 0.090 puts each shoulder clear of a head
+# whose radius is 0.088, so the join is always visible.
+SHOULDER_HALF = 0.090
 UPPER_ARM = 0.175
 FOREARM = 0.165
 THIGH = 0.245
@@ -298,10 +306,17 @@ def build_skeleton(pose: str = "idle", phase: float = 0.0,
     neck = _tip(chest, math.pi - lean - curve, height * (NECK - CHEST))
     head = _tip(chest, math.pi - lean - curve, height * (HEAD_CENTRE - CHEST))
 
+    # The shoulders sit either side of the neck, square to the spine, so they
+    # lean and hunch with the torso instead of staying level while it curves.
+    spine = math.pi - lean - curve
+    shoulder_r = _tip(neck, spine - math.pi / 2 * facing, height * SHOULDER_HALF)
+    shoulder_l = _tip(neck, spine + math.pi / 2 * facing, height * SHOULDER_HALF)
+    sockets = {"l": shoulder_l, "r": shoulder_r}
+
     def arm(side: str) -> tuple[tuple[float, float], tuple[float, float]]:
         shoulder = float(angles[f"shoulder_{side}"]) * facing + lean + curve
         elbow_angle = float(angles[f"elbow_{side}"]) * facing + lean + curve
-        elbow = _tip(neck, shoulder, height * UPPER_ARM)
+        elbow = _tip(sockets[side], shoulder, height * UPPER_ARM)
         return elbow, _tip(elbow, elbow_angle, height * FOREARM)
 
     def leg(side: str) -> tuple[tuple[float, float], tuple[float, float]]:
@@ -317,8 +332,8 @@ def build_skeleton(pose: str = "idle", phase: float = 0.0,
 
     return Skeleton(
         head=head, neck=neck, chest=chest, hip=hip,
-        shoulder_l=neck, elbow_l=elbow_l, hand_l=hand_l,
-        shoulder_r=neck, elbow_r=elbow_r, hand_r=hand_r,
+        shoulder_l=shoulder_l, elbow_l=elbow_l, hand_l=hand_l,
+        shoulder_r=shoulder_r, elbow_r=elbow_r, hand_r=hand_r,
         knee_l=knee_l, foot_l=foot_l, knee_r=knee_r, foot_r=foot_r,
         height=height, head_radius=height * HEAD_RADIUS, lean=lean,
     )
@@ -338,14 +353,22 @@ def draw_skeleton(surface: Surface, skeleton: Skeleton,
     with a front and a back instead of as a flat tangle of lines.
     """
     stroke = weight if weight is not None else max(3.0, skeleton.height * 0.019)
-    back = tuple(int(c * 0.62) for c in colour)
 
-    surface.polyline([skeleton.neck, skeleton.elbow_l, skeleton.hand_l], back, stroke * 0.86)  # type: ignore[arg-type]
-    surface.polyline([skeleton.hip, skeleton.knee_l, skeleton.foot_l], back, stroke * 0.86)  # type: ignore[arg-type]
+    # 0.78, not 0.62. The far side has to read as *behind* the near side, not
+    # as absent: at 0.62 a GREY figure's back limbs come out at 84/255 and
+    # vanish into the glow wherever they cross the front ones, which the
+    # frame-by-frame report saw as a figure drawn "with one arm/one leg".
+    back = tuple(int(c * 0.78) for c in colour)
+
+    surface.polyline([skeleton.shoulder_l, skeleton.elbow_l, skeleton.hand_l], back, stroke * 0.88)  # type: ignore[arg-type]
+    surface.polyline([skeleton.hip, skeleton.knee_l, skeleton.foot_l], back, stroke * 0.88)  # type: ignore[arg-type]
 
     surface.polyline([skeleton.hip, skeleton.chest, skeleton.neck], colour, stroke)  # type: ignore[arg-type]
+    # The clavicle. Without it the two arms are joined to the spine only by
+    # being near it.
+    surface.polyline([skeleton.shoulder_l, skeleton.neck, skeleton.shoulder_r], colour, stroke * 0.9)  # type: ignore[arg-type]
     surface.polyline([skeleton.hip, skeleton.knee_r, skeleton.foot_r], colour, stroke)  # type: ignore[arg-type]
-    surface.polyline([skeleton.neck, skeleton.elbow_r, skeleton.hand_r], colour, stroke)  # type: ignore[arg-type]
+    surface.polyline([skeleton.shoulder_r, skeleton.elbow_r, skeleton.hand_r], colour, stroke)  # type: ignore[arg-type]
 
     surface.circle(skeleton.head, skeleton.head_radius, colour,
                    0.0 if filled_head else stroke)

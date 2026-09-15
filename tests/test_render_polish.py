@@ -77,14 +77,57 @@ class TestActCrossfade:
         spec = me.normalise_spec(me.fallback_scene_spec("x", "split_path", 18.0))
         assert me._outgoing_act(spec, 9.0) is None
 
-    def test_mixing_is_a_linear_dissolve(self):
+    def test_mixing_goes_through_black_rather_than_across(self):
+        """
+        A cross-dissolve was the wrong tool. These frames are white line art on
+        pure black, so blending two of them does not merge them -- it shows
+        both. At 19.0s of minimalist_1789502356.mp4 two titles ghosted through
+        each other and act 3's figure stood inside act 2's beaker.
+
+        The property that replaces it: at no point do both acts contribute
+        light.
+        """
         import numpy as np
 
         under = np.full((4, 4, 3), 200, np.uint8)
-        over = np.zeros((4, 4, 3), np.uint8)
+        over = np.full((4, 4, 3), 200, np.uint8)
+
         assert me._mix_frames(under, over, 0.0).mean() == pytest.approx(200, abs=1)
-        assert me._mix_frames(under, over, 1.0).mean() == pytest.approx(0, abs=1)
-        assert me._mix_frames(under, over, 0.5).mean() == pytest.approx(100, abs=1)
+        assert me._mix_frames(under, over, 1.0).mean() == pytest.approx(200, abs=1)
+        # Two full-brightness frames that would sum to 200 under a dissolve.
+        assert me._mix_frames(under, over, 0.5).mean() == pytest.approx(0, abs=1)
+
+    def test_only_one_act_is_ever_lit(self):
+        """The guarantee stated as the compositor's own invariant, so no
+        template has to be careful about it."""
+        import numpy as np
+
+        lit = np.full((2, 2, 3), 255, np.uint8)
+        dark = np.zeros((2, 2, 3), np.uint8)
+        for step in range(21):
+            blend = step / 20.0
+            from_under = me._mix_frames(lit, dark, blend).mean()
+            from_over = me._mix_frames(dark, lit, blend).mean()
+            assert from_under < 1 or from_over < 1, (
+                f"both acts contributed light at blend {blend:.2f}")
+
+    def test_the_handover_has_no_step_in_it(self):
+        """A dip is a transition; a jump is a glitch. Measured across the whole
+        window, no single frame may move more than a fifth of full scale."""
+        import numpy as np
+
+        spec = _plan(30, 30, 30)
+        edge = float(spec["acts"][1]["start"])
+        frames = [np.asarray(me.make_scene_frame(spec, edge - 0.3 + i * 0.05, 64.0)).mean()
+                  for i in range(int((me.ACT_OVERLAP + 0.6) / 0.05))]
+        steps = [abs(b - a) for a, b in zip(frames, frames[1:])]
+        assert max(steps) < 51.0, f"largest single-frame step was {max(steps):.1f}"
+
+
+def _card(spec):
+    frame = me.Frame()
+    me.draw_closing_card(frame, spec, 1.0)
+    return frame.finish()
 
 
 # ---------------------------------------------------------------------------
@@ -119,13 +162,52 @@ class TestCaptionBand:
         assert 0.2 < mid < 0.8
         assert me.annotation_alpha_at(63.0, 64.0) == 0.0
 
-    def test_the_duck_starts_exactly_when_the_caption_does(self):
+    def test_the_duck_starts_exactly_when_the_closing_card_does(self):
         """Two different leads would either fade the labels early or leave them
         under the first word."""
-        import inspect
+        assert me.CAPTION_LEAD_SECONDS == me.CLOSING_SECONDS
 
-        source = inspect.getsource(me.draw_footer)
-        assert "CAPTION_LEAD_SECONDS" in source
+    def test_the_closing_card_is_held_long_enough_to_act_on(self):
+        """It is the only beat in the video that asks for something. Fully up,
+        perfectly still, for at least four seconds."""
+        hold = me.CLOSING_SECONDS - me.CLOSING_FADE - me.END_FADE_SECONDS
+        assert hold == pytest.approx(4.0, abs=0.05) or hold > 4.0, (
+            f"the payoff is only still for {hold:.1f}s")
+
+    def test_the_closing_card_sits_inside_the_safe_area(self):
+        """Centred in open frame rather than on the bottom rail -- but the rail
+        is still the rail."""
+        import numpy as np
+
+        frame = me.Frame()
+        me.draw_closing_card(frame, {"payoff": "STOP PAYING TO UNDERPERFORM",
+                                     "cta": "Follow for more"}, 1.0)
+        rows = np.asarray(frame.finish()).mean(axis=(1, 2))
+        lit = np.nonzero(rows > 2)[0]
+        assert lit.size, "the closing card drew nothing"
+        assert lit.min() >= me.SAFE_Y_BOX[0], lit.min()
+        assert lit.max() <= me.SAFE_Y, lit.max()
+
+    def test_every_closing_card_asks_for_something(self):
+        """
+        Not "the CTA renders when supplied" -- a spec that carries no CTA falls
+        back to the default rather than ending on a full stop, so the ask is
+        not something a model can forget to include.
+        """
+        import numpy as np
+
+        supplied = np.asarray(_card({"payoff": "A LINE", "cta": "Subscribe now"}))
+        defaulted = np.asarray(_card({"payoff": "A LINE"}))
+        payoff_only = np.asarray(_card({"payoff": "A LINE", "cta": "", "_": 1}))
+
+        assert defaulted.sum() > 0
+        # The default is drawn whether the key is missing or empty.
+        assert defaulted.sum() == payoff_only.sum()
+        # And a real CTA replaces it rather than being ignored.
+        assert supplied.sum() != defaulted.sum()
+
+    def test_the_default_cta_is_the_one_the_engine_names(self):
+        assert me.DEFAULT_CTA and not me.DEFAULT_CTA.endswith(".")
 
     def test_overlapping_boxes_are_detected(self):
         assert me.text_boxes_overlap((0, 0, 100, 50), (50, 20, 150, 70))

@@ -162,10 +162,19 @@ DEFAULT_BAND = "general"
 #
 # 3 = this word alone settles it. 1 = a hint that needs company.
 _BAND_HINTS: dict[str, dict[str, int]] = {
+    # Widened after every one of "index funds vs active management", "the
+    # paradox of choice", "dopamine detox" and "why smart people fail" came
+    # back as `general`. The vocabulary here was the vocabulary of niche
+    # *names* -- "personal finance", "passive income" -- and what actually
+    # arrives is the vocabulary of arguments.
     "finance": {"investing": 3, "stock market": 3, "dividend": 3, "passive income": 3,
-                "crypto": 3, "real estate": 3, "personal finance": 3, "wealth": 2,
+                "crypto": 3, "real estate": 3, "personal finance": 3,
+                "index fund": 3, "index funds": 3, "etf": 3, "portfolio": 3,
+                "compound interest": 3, "expense ratio": 3, "retirement": 3,
+                "inflation": 3, "savings": 3, "salary": 2, "wealth": 2,
                 "money": 2, "millionaire": 2, "mortgage": 2, "debt": 2, "tax": 2,
-                "finance": 2, "business": 1, "entrepreneur": 1},
+                "finance": 2, "market": 2, "invest": 2, "fees": 2, "income": 2,
+                "budget": 2, "business": 1, "entrepreneur": 1},
     "tech_b2b": {"ai": 3, "software": 3, "saas": 3, "programming": 3, "coding": 3,
                  "cyber": 3, "startup": 2, "tech": 2, "gadget": 2, "computer": 1},
     "health": {"nutrition": 3, "workout": 3, "weight loss": 3, "supplement": 3,
@@ -177,8 +186,13 @@ _BAND_HINTS: dict[str, dict[str, int]] = {
                 "civilization": 3, "empire": 2, "unsolved": 2, "mystery": 2,
                 "military": 2, "history": 2, "war": 1},
     "psychology": {"dark psychology": 3, "stoic": 3, "manipulat": 3, "psychology": 3,
-                   "self-improvement": 3, "mindset": 2, "discipline": 2, "habit": 2,
-                   "motivation": 1},
+                   "self-improvement": 3, "cognitive": 3, "bias": 3, "dopamine": 3,
+                   "procrastinat": 3, "willpower": 3, "attention span": 3,
+                   "paradox of choice": 3, "overthink": 3, "burnout": 3,
+                   "psychological": 3, "behaviour": 2, "behavior": 2,
+                   "mindset": 2, "discipline": 2, "habit": 2, "focus": 2,
+                   "decision": 2, "anxiety": 2, "ego": 2, "motivation": 1,
+                   "fail": 1, "smart": 1},
     "entertainment": {"gaming": 3, "reaction": 3, "prank": 3, "anime": 2, "meme": 2,
                       "celebrity": 2, "drama": 1, "movie": 1},
     "relaxation": {"rain sounds": 3, "white noise": 3, "meditation": 3, "asmr": 3,

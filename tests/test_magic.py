@@ -615,14 +615,24 @@ class TestCaptionSafeArea:
         assert me.SAFE_Y == me.CANVAS[1] - me.SAFE_BOTTOM
         assert me.TEXT_SAFE_Y < me.SAFE_Y
 
-    def test_the_payoff_is_not_anchored_to_a_fixed_y(self):
-        import inspect
+    def test_the_payoff_never_paints_into_the_rail(self):
+        """
+        It used to be bottom-aligned against TEXT_SAFE_Y on the closing frames
+        of a live scene. It is a full-frame card now, centred in open space --
+        so the thing worth pinning is not where it is anchored but that the
+        rail is still respected.
+        """
+        import numpy as np
 
         import minimalist_engine as me
 
-        source = inspect.getsource(me.draw_footer)
-        assert "TEXT_SAFE_Y" in source, "the payoff is not anchored to the safe line"
-        assert "1720" not in source, "the payoff is back on a hardcoded y"
+        frame = me.Frame()
+        me.draw_closing_card(
+            frame, {"payoff": "STOP PAYING PROFESSIONALS TO UNDERPERFORM",
+                    "cta": "Follow for more"}, 1.0)
+        rows = np.asarray(frame.finish()).mean(axis=(1, 2))
+        lit = np.nonzero(rows > 2)[0]
+        assert lit.max() <= me.SAFE_Y, f"ink reached {lit.max()}, rail at {me.SAFE_Y}"
 
     @pytest.mark.parametrize("size", [36, 44, 52, 64, 72])
     def test_a_clamped_line_never_paints_into_the_rail(self, size):

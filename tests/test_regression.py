@@ -228,20 +228,33 @@ class TestDuelPerformance:
             worst = max(worst, int(np.abs(a - b).max()))
         assert worst <= 2, f"pictures differ by up to {worst} code values"
 
-    def test_frame_cost_is_under_budget(self):
+    def test_the_static_layers_are_built_once_not_per_frame(self):
+        """
+        This was an absolute budget -- 85ms a frame, from 99.9 before the fix
+        and 55.5 after. The trouble with a wall-clock number is that it is a
+        measurement of the machine as much as of the code: it fails on a loaded
+        laptop and on a slow CI box while the caching it exists to protect is
+        working perfectly, and both of those are false alarms about someone
+        else's work.
+
+        What it actually cares about is that the panel scrims and the divider
+        glow are baked once and reused. `_static_layer` is the lru_cache that
+        holds them, so asking it how many times it was missed answers the
+        question exactly -- and counts the same on any machine, under any load.
+        """
+        duel_engine._static_layer.cache_clear()
         clip = duel_engine.create_duel_round_clip(
             SIZE, ITEM_A, ITEM_B, ROUND, duration=5.5, layout="stacked")
-        clip.get_frame(0.5)                      # warm the caches
 
-        started = time.perf_counter()
-        for i in range(8):
-            clip.get_frame(0.5 + i * 0.5)
-        per_frame = (time.perf_counter() - started) / 8
+        for i in range(12):
+            clip.get_frame(0.4 + i * 0.4)
 
-        # Measured 99.9ms/frame before the fix and 55.5ms after, on this
-        # machine. 85ms leaves room for a slower CI box while still failing if
-        # the static layers go back to being rebuilt per frame.
-        assert per_frame < 0.085, f"{per_frame * 1000:.0f} ms/frame is back to pre-fix cost"
+        info = duel_engine._static_layer.cache_info()
+        assert info.misses <= 1, (
+            f"the static overlay was built {info.misses} times across 12 "
+            "frames -- it is back to being rebuilt per frame")
+        assert info.hits >= 11, (
+            f"only {info.hits} of 12 frames reused the baked overlay")
 
 
 class TestDuelPresetIsolation:

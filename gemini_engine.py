@@ -20,7 +20,7 @@ from typing import Any, Callable
 from dotenv import load_dotenv
 from google import genai
 
-from minimalist_engine import METAPHOR_TYPES, TEMPLATES
+from minimalist_engine import METAPHOR_TYPES, TEMPLATES, plan_act_count
 
 # Load .env next to this file so the key is available before Client() is built;
 # genai.Client() reads GEMINI_API_KEY (or GOOGLE_API_KEY) from the environment.
@@ -594,6 +594,132 @@ SCENE_PRESETS: dict[str, dict[str, str]] = {
 # Imported rather than restated: the prompt lists exactly the metaphors the
 # renderer can draw, so a model choice can never name a template that does not
 # exist. `suits` is the one-line hint the model picks on.
+# The moves an argument can make, in the order they earn their place.
+#
+# An act is a beat, not a third of the runtime. Adding acts to a longer video
+# should add *moves* -- the evidence, the objection -- rather than stretch the
+# same three, which is what produced 22-second acts where the animation
+# finished in six.
+ACT_BEATS: tuple[tuple[str, str], ...] = (
+    ("CLAIM", "the counter-intuitive thing, with the hardest fact you have, "
+              "in the first nine words"),
+    ("EVIDENCE", "the figure, named study or named effect that makes the claim "
+                 "impossible to wave away"),
+    ("MECHANISM", "WHY it is true -- the causal step, not a restatement"),
+    ("SCALE", "what it costs at size: over a career, across a population, "
+              "compounded over years"),
+    ("OBJECTION", "the obvious objection a sharp viewer is already forming, "
+                  "and why it does not hold"),
+    ("TURN", "what the viewer does differently, concretely, and what it costs "
+             "them not to"),
+)
+
+# Which beats a plan of N acts uses. CLAIM always opens and TURN always closes;
+# what fills the middle is what the extra runtime buys.
+_BEAT_LADDER: dict[int, tuple[int, ...]] = {
+    2: (0, 5),
+    3: (0, 2, 5),
+    4: (0, 1, 2, 5),
+    5: (0, 1, 2, 3, 5),
+    6: (0, 1, 2, 3, 4, 5),
+    7: (0, 1, 2, 3, 4, 2, 5),
+    8: (0, 1, 2, 3, 4, 1, 2, 5),
+}
+
+
+def act_beats(count: int) -> list[tuple[str, str]]:
+    """The named beats for a plan of `count` acts."""
+    count = max(2, min(8, int(count)))
+    return [ACT_BEATS[i] for i in _BEAT_LADDER[count]]
+
+
+# Which metaphors each domain reaches for first, and what counts as evidence
+# there.
+#
+# Two videos on unrelated topics were coming out looking like the same video,
+# because the model was given the same fourteen shapes in the same order with
+# no sense of what the topic was. Routing by domain is what makes a finance
+# short and a psychology short *look* different before the words are written --
+# and the evidence line is what stops the narration being true-sounding filler
+# in either one.
+DOMAIN_GUIDE: dict[str, dict[str, Any]] = {
+    "finance": {
+        "metaphors": ("compounding_jar", "split_path", "comparison_split",
+                      "gravity_funnel", "balance_scale", "growth_consistency",
+                      "domino_chain", "staircase_progress"),
+        "evidence": "Real instruments and real institutions: SPIVA, expense "
+                    "ratios, the 4% rule, a 7% real return, VOO or VTI by "
+                    "name, actual basis points. Compounding arguments are made "
+                    "over decades, never over days -- set axis_max to the "
+                    "number of years and axis_suffix to \"y\".",
+    },
+    "psychology": {
+        "metaphors": ("delusion_mirror", "chain_anchor", "two_doors",
+                      "balance_scale", "split_path", "gravity_funnel",
+                      "comparison_split", "domino_chain"),
+        "evidence": "Named effects and the people who found them: Iyengar and "
+                    "Lepper on jam, Baumeister on depletion, Sirois on mood "
+                    "repair, Zeigarnik, Dunning and Kruger. Name the effect, "
+                    "then say what it predicts.",
+    },
+    "health": {
+        "metaphors": ("growth_consistency", "staircase_progress",
+                      "compounding_jar", "sisyphus_boulder", "discipline_iceberg",
+                      "comparison_split", "split_path", "steep_staircase"),
+        "evidence": "Measured quantities with their units: VO2 max, grams of "
+                    "protein per kilo, hours of sleep, resting heart rate, "
+                    "all-cause mortality. Never a percentage without what it "
+                    "is a percentage of.",
+    },
+    "education": {
+        "metaphors": ("domino_chain", "gravity_funnel", "steep_staircase",
+                      "comparison_split", "staircase_progress", "split_path",
+                      "compounding_jar", "balance_scale"),
+        "evidence": "The mechanism, in order, with the real numbers: how much, "
+                    "how long, how many. Name the system or the project.",
+    },
+    "history": {
+        "metaphors": ("domino_chain", "chain_anchor", "steep_staircase",
+                      "gravity_funnel", "split_path", "comparison_split",
+                      "sisyphus_boulder", "two_doors"),
+        "evidence": "Dates, places and named people. One decision, its year, "
+                    "and what followed from it.",
+    },
+    "tech_b2b": {
+        "metaphors": ("comparison_split", "domino_chain", "steep_staircase",
+                      "split_path", "gravity_funnel", "balance_scale",
+                      "compounding_jar", "growth_consistency"),
+        "evidence": "Named systems, versions and measured limits: latency in "
+                    "milliseconds, cost per unit, adoption figures with a date "
+                    "on them.",
+    },
+    "general": {
+        "metaphors": ("split_path", "compounding_jar", "delusion_mirror",
+                      "domino_chain", "two_doors", "balance_scale",
+                      "sisyphus_boulder", "comparison_split"),
+        "evidence": "A figure, a date, a named researcher, a named study, a "
+                    "measured effect or a unit.",
+    },
+}
+
+
+def domain_guide(concept: str) -> dict[str, Any]:
+    """
+    The metaphor pool and evidence standard for this concept's domain.
+
+    Classification lives in niche_engine because that is where the CPM bands
+    are, and a topic's domain is the same question in both places.
+    """
+    try:
+        from niche_engine import classify_band
+
+        band = classify_band(concept)
+    except Exception:
+        band = "general"
+    guide = DOMAIN_GUIDE.get(band) or DOMAIN_GUIDE["general"]
+    return {"band": band, **guide}
+
+
 SCENE_METAPHORS: dict[str, dict[str, str]] = {
     key: {"label": str(TEMPLATES[key]["label"]), "suits": str(TEMPLATES[key]["suits"])}
     for key in METAPHOR_TYPES
@@ -620,8 +746,22 @@ SCENE_MIN_SECONDS, SCENE_MAX_SECONDS = 62.0, 70.0
 # with a word of margin at each end -- deliberately tight, because the point of
 # the band is that every render clears the Creator Rewards floor without
 # drifting far enough past it to bore anyone.
-SCENE_WORDS_PER_SECOND = 1.875
-SCENE_MIN_WORDS, SCENE_MAX_WORDS = 118, 130
+# Two measurements, and the first one was wrong. A 150-word thesis "came back
+# at 80.0s" -- but 80.0 was MAX_DURATION at the time, so that take was clipped
+# and the real rate was somewhere below the 1.875 it implied, not at it. The
+# honest measurement is the delivered file: minimalist_1789502356.mp4 read 119
+# words in 54.7s of speech, which is 2.17 words a second.
+#
+# At 2.17, the old 118-130 band buys 54-60 seconds. That is how a render aimed
+# at 62-70s arrived at 56.29 and earned nothing.
+SCENE_WORDS_PER_SECOND = 2.17
+
+# Aimed deliberately long. Overshooting the band costs a few seconds of
+# retention; undershooting it costs the entire payout, and those are not
+# comparable risks. 138-150 words is 64-69s at the measured rate and 74-80s if
+# the voice turns out to be slower than measured -- both fine, both paid.
+# PAYOUT_FLOOR_SECONDS catches anything that still lands short.
+SCENE_MIN_WORDS, SCENE_MAX_WORDS = 138, 150
 
 
 def build_scene_prompt(concept: str, template: str = "auto",
@@ -804,24 +944,30 @@ The tone is calm, certain and a little cold. Never use emoji, hashtags or
 exclamation marks.
 
 CONCEPT: {concept}
+DOMAIN: {band}
 
-Plan the video as THREE ACTS. Each act gets its own metaphor, because one piece
-of geometry on screen for a whole minute is the thing that loses the viewer.
-The three acts are one argument in three moves:
+Plan the video as {act_count} ACTS. Each act gets its own metaphor, because one
+piece of geometry on screen for a whole minute is the thing that loses the
+viewer -- and because an act that runs longer than about twelve seconds has
+finished animating and is holding a still picture for the rest of it.
 
-  Act 1 -- the claim. State the counter-intuitive thing, with the hardest fact
-           you have, in the first nine words.
-  Act 2 -- the mechanism. WHY it is true. This is where the specifics live.
-  Act 3 -- the turn. What the viewer should do differently, and the cost of not.
+The acts are one argument, and each one is a different move in it:
+
+{beats}
 
 Choose each act's metaphor from this catalogue by which geometry actually
-argues that act. Do not use the same one twice:
+argues that act. NEVER use the same one twice in one video:
 {catalogue}
 
+For this domain, reach first for: {preferred}
+Use others when the argument genuinely wants them -- but a video whose shapes
+all come from outside its domain's list usually means the argument drifted.
+
 THE RULE THAT MATTERS MOST -- every act's narration must carry something
-checkable. A figure, a date, a named researcher, a named study, a measured
-effect, a unit. Writing that could survive having its subject swapped is
-writing that says nothing:
+checkable. Writing that could survive having its subject swapped is writing
+that says nothing.
+
+  For this domain, that means: {evidence}
 
   BAD:  "Delay is borrowing against tomorrow. You accumulate a silent
          psychological debt and quiet shame."
@@ -833,27 +979,53 @@ If you do not know a real figure, use a real mechanism or a named effect
 instead. Never invent a statistic, a study or a person. A concrete mechanism
 beats a fabricated number every time.
 
-The three theses are read aloud as one continuous narration and their combined
-length sets the length of the video, so together they must total
-{words_low}-{words_high} words. Split them roughly evenly.
+The theses are read aloud as one continuous narration and their combined
+length sets the length of the video. Together they must total
+{words_low}-{words_high} words -- split roughly evenly, about {words_per_act}
+words each.
+
+THE PICTURE MUST AGREE WITH THE WORDS. A rendered act once argued "how small
+fees compound into major losses" over a vessel filling up and a counter
+climbing to 9.75x, which told the viewer the opposite of the narration. So:
+
+  "direction": "fill" when the quantity in that act GROWS, "drain" when it is
+     LOST, spent, eroded or paid away. Loss is never drawn as growth.
+  "axis_max" and "axis_suffix": the scale the argument is actually made on --
+     {{"axis_max": 30, "axis_suffix": "y"}} for something that plays out over
+     thirty years, {{"axis_max": 90, "axis_suffix": "d"}} for ninety days.
+     Compounding in money is a decades-long argument.
+  "end_value": 0.0-1.0, where the quantity ENDS as a share of where it began.
+     A 1% annual fee over thirty years leaves about 0.75, so write 0.75 -- not
+     0, which would say the fee took everything. Overstating it is as wrong as
+     drawing it backwards.
 
 Return ONE JSON object and nothing else:
 
 {{"acts": [
    {{"template": "<catalogue key>",
+     "beat": "<the beat name for this act>",
      "title": "2-5 words, uppercase, this act's idea",
      "subtitle": "one short line under the title",
      "labels": {{}},
+     "direction": "fill" | "drain",
+     "axis_max": 30, "axis_suffix": "y", "end_value": 0.75,
      "thesis": "this act's narration"}},
-   ... exactly 3 ...
+   ... exactly {act_count} ...
  ],
  "payoff": "the closing line of the whole video, 3-8 words",
+ "cta": "what the last card asks for, 2-4 words, e.g. Follow for more",
  "publish": {{"title": "...", "description": "...", "hashtags": ["..."]}}}}
 
 "labels" are the words stamped onto that act's geometry -- one or two words
 each, uppercase, 16 characters at most. Which slots exist depends on the
 metaphor; use the ones that suit it and leave the rest out:
 {label_slots}
+
+FILL THE LABELS FOR EVERY ACT. They are not decoration -- they are the only
+words the viewer reads on the geometry itself. A template left unlabelled falls
+back to placeholder copy, and a video about active management came out stamped
+"5 YEARS / 50 YEARS / COMFORT NOW", which is about nothing at all. Write them
+for THIS concept.
 
 COPY RULES for every title, subtitle and label:
 - Subject and verb must agree. "why decisions fail", never "why decision
@@ -863,26 +1035,50 @@ COPY RULES for every title, subtitle and label:
   Do not write in all capitals; the renderer sets the case itself."""
 
 
-def build_scene_plan_prompt(concept: str) -> str:
-    """The three-act prompt, with the metaphor catalogue spliced in."""
+def default_act_count(duration: float = 0.0) -> int:
+    """
+    How many acts a video of this length should be planned as.
+
+    Delegated to the renderer's own cap rather than fixed here, because the
+    number that matters is how long one template can hold the screen before it
+    has run out of animation -- and that is a property of the templates.
+    """
+    return plan_act_count(float(duration) or (SCENE_MIN_SECONDS + 4.0))
+
+
+def build_scene_plan_prompt(concept: str, acts: int = 0,
+                            duration: float = 0.0) -> str:
+    """The multi-act prompt, with the catalogue and the domain spliced in."""
+    count = max(2, min(8, int(acts))) if acts else default_act_count(duration)
+    guide = domain_guide(concept)
+
     catalogue = "\n".join(
         f'    "{key}": {spec["suits"]}' for key, spec in SCENE_METAPHORS.items())
     slots = "\n".join(
         f'    {key:<18} {sorted(spec["labels"])}'
         for key, spec in SCENE_METAPHORS.items() if spec.get("labels"))
+    beats = "\n".join(
+        f"  Act {i} -- {name}: {description}"
+        for i, (name, description) in enumerate(act_beats(count), start=1))
 
     return SCENE_PLAN_PROMPT.format(
         concept=str(concept).strip(),
+        band=str(guide["band"]).replace("_", " "),
+        act_count=count,
+        beats=beats,
         catalogue=catalogue,
+        preferred=", ".join(guide["metaphors"]),
+        evidence=guide["evidence"],
         label_slots=slots or "    (none)",
         words_low=SCENE_MIN_WORDS,
         words_high=SCENE_MAX_WORDS,
+        words_per_act=int(round((SCENE_MIN_WORDS + SCENE_MAX_WORDS) / 2 / count)),
     )
 
 
-def parse_scene_plan(raw: str) -> dict[str, Any]:
+def parse_scene_plan(raw: str, acts: int = 0, concept: str = "") -> dict[str, Any]:
     """
-    Validates a three-act plan into something normalise_spec can take.
+    Validates a multi-act plan into something normalise_spec can take.
 
     Returns {} rather than a partial plan when there are fewer than two usable
     acts: one act is what this was built to replace, so falling back to the
@@ -892,8 +1088,9 @@ def parse_scene_plan(raw: str) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         return {}
 
-    acts: list[dict[str, Any]] = []
-    for entry in (parsed.get("acts") or [])[:3]:
+    limit = max(2, min(8, int(acts))) if acts else 8
+    planned: list[dict[str, Any]] = []
+    for entry in (parsed.get("acts") or [])[:limit]:
         if not isinstance(entry, dict):
             continue
         thesis = str(entry.get("thesis") or "").strip()
@@ -901,54 +1098,79 @@ def parse_scene_plan(raw: str) -> dict[str, Any]:
             continue
         template = str(entry.get("template") or entry.get("metaphor_type")
                        or "").strip().lower()
-        acts.append({
+        try:
+            axis_max = max(1, int(entry.get("axis_max") or 365))
+        except (TypeError, ValueError):
+            axis_max = 365
+        try:
+            end_value = min(1.0, max(0.0, float(entry.get("end_value") or 0.0)))
+        except (TypeError, ValueError):
+            end_value = 0.0
+        planned.append({
             "template": template if template in SCENE_TEMPLATE_KEYS else "",
             "title": str(entry.get("title") or "").strip()[:40],
             "subtitle": str(entry.get("subtitle") or "").strip()[:90],
             "labels": entry.get("labels") if isinstance(entry.get("labels"), dict) else {},
+            "direction": str(entry.get("direction") or "fill").strip().lower(),
+            "axis_max": axis_max,
+            "axis_suffix": str(entry.get("axis_suffix") or "d").strip()[:3],
+            "end_value": end_value,
             "thesis": thesis,
         })
 
-    if len(acts) < 2:
+    if len(planned) < 2:
         return {}
 
-    # The same metaphor twice in a row defeats the point of acts, so a repeat
-    # is replaced with the next unused one from the catalogue.
+    # A repeated metaphor defeats the point of acts. The replacement is drawn
+    # from the concept's own domain pool first, so a finance video that asked
+    # for the same vessel twice gets another finance shape rather than
+    # whatever happens to sit next in the catalogue.
+    preferred = list(domain_guide(concept)["metaphors"]) if concept else []
+    spare = preferred + [key for key in SCENE_TEMPLATE_KEYS
+                         if key not in ("auto", "custom") and key not in preferred]
     seen: set[str] = set()
-    spare = [key for key in SCENE_TEMPLATE_KEYS if key != "auto"]
-    for act in acts:
+    for act in planned:
         if not act["template"] or act["template"] in seen:
             act["template"] = next(
                 (key for key in spare if key not in seen), act["template"] or spare[0])
         seen.add(act["template"])
 
     return {
-        "acts": acts,
+        "acts": planned,
         "payoff": str(parsed.get("payoff") or "").strip()[:60],
-        "thesis": " ".join(act["thesis"] for act in acts),
+        "cta": str(parsed.get("cta") or "").strip()[:40],
+        "thesis": " ".join(act["thesis"] for act in planned),
         "publish": parsed.get("publish") if isinstance(parsed.get("publish"), dict) else {},
         "source": "gemini-plan",
     }
 
 
 def generate_scene_plan(concept: str,
-                        progress: ProgressFn | None = None) -> dict[str, Any]:
+                        progress: ProgressFn | None = None,
+                        acts: int = 0,
+                        duration: float = 0.0) -> dict[str, Any]:
     """
-    A three-act plan for a concept.
+    A multi-act plan for a concept.
+
+    `acts` defaults to what the runtime can hold without any one metaphor
+    sitting still -- six at the usual length, where it used to be three at
+    twenty-two seconds each.
 
     Raises GeminiError when no model returns a usable plan; the caller falls
     back to the single-metaphor path, which still renders a video.
     """
+    count = max(2, min(8, int(acts))) if acts else default_act_count(duration)
     client = get_client()
-    prompt = build_scene_plan_prompt(concept)
+    prompt = build_scene_plan_prompt(concept, acts=count, duration=duration)
     last: Exception | None = None
 
     for model in MODEL_CANDIDATES:
         try:
             if progress:
-                progress(f"Asking {model} for a three-act plan...")
+                progress(f"Asking {model} for a {count}-act plan...")
             response = generate_with_retry(client, model, prompt, progress=progress)
-            plan = parse_scene_plan(getattr(response, "text", "") or "")
+            plan = parse_scene_plan(getattr(response, "text", "") or "",
+                                    acts=count, concept=concept)
             if plan:
                 plan["concept"] = str(concept).strip()
                 plan["model"] = model
@@ -957,7 +1179,7 @@ def generate_scene_plan(concept: str,
             last = exc
 
     raise GeminiError(
-        f"No model returned a usable three-act plan for {concept!r}"
+        f"No model returned a usable {count}-act plan for {concept!r}"
         + (f": {type(last).__name__}: {last}" if last else "."))
 
 
