@@ -710,18 +710,48 @@ class TestMonetizableLength:
         # that nobody scrolls before the payoff.
         assert gemini_engine.SCENE_MAX_SECONDS <= 70
 
-    def test_the_word_budget_fills_that_runtime(self):
+    def test_the_word_budget_plus_the_closing_card_fills_that_runtime(self):
+        """
+        This used to require the narration alone to cover the minimum runtime,
+        which was right while the tail after the last spoken word was 1.6
+        seconds. It is CLOSING_SECONDS + 0.4 now -- the card was coming up four
+        seconds before the narration finished and wiping the last act's
+        geometry mid-argument -- and six seconds of held payoff is runtime the
+        script does not have to write words for.
+        """
         import gemini_engine as ge
+        import minimalist_engine as me
 
-        # The budget must land inside the band at the rate this engine really
-        # speaks -- measured at 1.875 words/second by rendering one, not
-        # estimated. 150 words came back at 80.0s and was clipped.
         rate = ge.SCENE_WORDS_PER_SECOND
-        assert ge.SCENE_MIN_WORDS / rate >= ge.SCENE_MIN_SECONDS - 1, (
-            "the minimum budget speaks for less than the minimum runtime")
-        assert ge.SCENE_MAX_WORDS / rate <= ge.SCENE_MAX_SECONDS, (
-            f"{ge.SCENE_MAX_WORDS} words runs {ge.SCENE_MAX_WORDS / rate:.0f}s, "
-            f"past the {ge.SCENE_MAX_SECONDS:.0f}s band")
+        tail = me.CLOSING_SECONDS + 0.4
+
+        assert ge.SCENE_MIN_WORDS / rate + tail >= ge.SCENE_MIN_SECONDS, (
+            f"{ge.SCENE_MIN_WORDS} words speaks for "
+            f"{ge.SCENE_MIN_WORDS / rate:.0f}s and the card adds {tail:.0f}s, "
+            f"which is under the {ge.SCENE_MIN_SECONDS:.0f}s band")
+
+    def test_the_budget_clears_the_payout_floor_at_either_measured_rate(self):
+        """
+        The rate is a centre between two delivered renders (2.176 and 2.033
+        w/s), not a constant the voice honours. What has to hold is that the
+        budget clears sixty seconds at BOTH ends of that spread, because a
+        render that lands at 59 earns nothing.
+        """
+        import gemini_engine as ge
+        import minimalist_engine as me
+
+        tail = me.CLOSING_SECONDS + 0.4
+        for measured in (2.033, 2.176):
+            shortest = ge.SCENE_MIN_WORDS / measured + tail
+            assert shortest > compliance.TIKTOK_REWARDS_MIN_SECONDS, (
+                f"at {measured} w/s the shortest render is {shortest:.1f}s")
+
+    def test_there_is_a_floor_under_it_regardless(self):
+        """Belt and braces, and the braces are what caught the 56.29s render:
+        the rate is an average and an average is not a guarantee."""
+        import minimalist_engine as me
+
+        assert me.PAYOUT_FLOOR_SECONDS > compliance.TIKTOK_REWARDS_MIN_SECONDS
 
     def test_the_prompt_actually_asks_for_it(self):
         import gemini_engine as ge

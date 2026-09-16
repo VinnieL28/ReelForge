@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import math
 import os
+import shutil
 import threading
 import time
 from typing import Any, Callable, Sequence
@@ -33,8 +34,9 @@ from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 import vector_rig as rig
 from paths import resolve_font
 from video_engine import (_SCRATCH_RENDERS, DELIVERY_SAMPLE_RATE,
-                          normalise_loudness, purge_scratch_renders,
-                          video_encoder, write_clip)
+                          burn_ass_subtitles, normalise_loudness,
+                          purge_scratch_renders, video_encoder, write_ass_file,
+                          write_clip)
 
 # ---------------------------------------------------------------------------
 # Look
@@ -84,6 +86,55 @@ CAPTION_BAND: tuple[float, float] = (TEXT_SAFE_Y - 132.0, TEXT_SAFE_Y)
 
 # How long the annotation layer takes to clear once the caption arrives.
 CAPTION_DUCK_SECONDS = 0.3
+
+# Where the burned-in narration captions sit, as a distance up from the bottom
+# edge -- which is how libass measures MarginV for a bottom alignment.
+#
+# 460 puts an 88px line's block at roughly y=1372-1460: inside CAPTION_BAND,
+# which every label has been clamped out of since the band was introduced, and
+# clear of the progress hairline at PROGRESS_Y. The band was named for this and
+# then sat empty for months.
+# Measured off a burned frame, differenced against the same frame without
+# captions so the scene's own ink could not be mistaken for the caption's.
+#
+# At 490 a single 75px line puts its ink at y=1359-1416: inside CAPTION_BAND
+# (1334-1466), which every scene label is clamped out of, and 70px clear of the
+# progress hairline at PROGRESS_Y. 520 was 5px above the band, close enough to
+# a label sitting on the ceiling to touch it.
+CAPTION_MARGIN_V = 490
+
+# Words per caption phrase. Four is the CapCut default and it is the right one
+# here for a reason beyond fashion: Gemini TTS has no real word boundaries, so
+# these timings are estimated at a measured mean error of 0.31s. A four-word
+# phrase holds the screen about two seconds, which absorbs that; a one-word
+# phrase would not.
+#
+# Three rather than four, and 0.070 rather than the 0.082 default, because the
+# caption has to fit on ONE line. Two lines is 142px of ink and the band is
+# 132px, so a second line runs through the progress hairline and down into the
+# zone scene labels are clamped to -- measured, on the first burn.
+#
+# At 0.070 the widest three-word phrase in a real finance script sets to 830px
+# against 908px of usable width. Four words at the same size needs 1064px.
+CAPTION_WORDS_PER_PHRASE = 3
+CAPTION_FONT_SCALE = 0.070
+
+# The lowest frame rate this engine will render at, whatever the UI asks for.
+#
+# Every other engine cuts photographic or stock footage, where 24 is a look.
+# This one draws continuous procedural motion and 24 judders on all of it --
+# most visibly on a walk cycle and on a level that drains smoothly for ten
+# seconds. A caller asking for 60 still gets 60; nobody gets 24.
+MIN_FPS = 30
+
+
+def render_fps(requested: Any) -> int:
+    """The frame rate to actually draw at, given what the caller asked for."""
+    try:
+        wanted = int(requested or 0)
+    except (TypeError, ValueError):
+        wanted = 0
+    return max(MIN_FPS, wanted)
 
 # Ink runs wider than advance width: a bold glyph overhangs its own box and
 # antialiasing adds a little more. Measured across every size and weight the
@@ -616,7 +667,22 @@ class Frame:
 #   4. settle  the closing line lands and the frame holds
 # ---------------------------------------------------------------------------
 
-LEAD_IN = 1.1               # titles breathe before anything moves
+# How long a scene holds still before its geometry starts moving.
+#
+# 1.1 was written when a scene was one metaphor holding for eighteen seconds,
+# where a beat of quiet before the first move reads as composure. At six acts
+# it fires six times and every one of them reads as a stall -- the frame-by-
+# frame review called the whole video "slow" and "every hold feels long".
+LEAD_IN = 0.5
+
+# And almost nothing at the very top of the video.
+#
+# The first three seconds are the only ones that decide whether the rest is
+# watched. Measured on the delivered file: the vessel faded in and sat at 100%
+# while its counter crawled from year 0 to year 4, so the first thing the
+# viewer saw during the scroll decision was a still picture.
+OPENING_LEAD = 0.2
+
 SETTLE_OUT = 2.2            # the closing beat
 
 
@@ -626,9 +692,10 @@ class Phases:
     __slots__ = ("lead", "draw_end", "impact", "end", "duration")
 
     def __init__(self, duration: float, climax: float,
-                 draw_end: float | None = None) -> None:
+                 draw_end: float | None = None, opening: bool = False) -> None:
         self.duration = max(duration, 1.0)
-        self.lead = min(LEAD_IN, self.duration * 0.12)
+        self.lead = min(OPENING_LEAD if opening else LEAD_IN,
+                        self.duration * 0.12)
         self.end = max(self.lead + 0.5, self.duration - SETTLE_OUT)
         self.impact = min(max(climax, self.lead + 0.4), self.duration - 0.3)
         # The path finishes drawing before the object gets there, so the
@@ -658,8 +725,16 @@ class Phases:
 
 
 def phases_of(spec: dict[str, Any], duration: float) -> Phases:
+    """
+    The beat map for one scene.
+
+    An act starting at t=0 opens on the shorter lead: it is the one whose first
+    frames are the scroll decision. Presets land here too, which is right --
+    nothing is helped by a second of stillness at the top.
+    """
     return Phases(duration, float(spec.get("climax") or duration * 0.75),
-                  float(spec.get("draw_end") or 0.0) or None)
+                  float(spec.get("draw_end") or 0.0) or None,
+                  opening=not float(spec.get("start") or 0.0))
 
 
 # ---------------------------------------------------------------------------
@@ -762,15 +837,36 @@ LABEL_MAX_CHARS = 16
 LABEL_WRAP_CHARS = 44
 
 
+def missing_label_slots(template: str, labels: Any) -> list[str]:
+    """Which of a template's slots were not supplied. Public: the planner asks."""
+    wanted = LABEL_SLOTS.get(str(template) or "", {})
+    given = labels if isinstance(labels, dict) else {}
+    return [slot for slot in wanted
+            if not str(given.get(slot) or "").strip()]
+
+
 def label(spec: dict[str, Any], slot: str, fallback: str = "",
           wrap: bool = False) -> str:
-    """The text for one labelled slot, from the spec or the template default."""
+    """
+    The text for one labelled slot.
+
+    Falls back to the template's own copy for a preset render, and to nothing
+    for a planned act. The defaults are written for the metaphor rather than
+    for any particular subject -- "WHO YOU ARE / WHO YOU THINK" belongs to the
+    mirror, not to a video about fund fees -- so inside a plan they do not
+    degrade gracefully, they assert something false. An unlabelled shape reads
+    as restraint; a wrongly labelled one reads as a machine that was not paying
+    attention, and that is the read this whole engine exists to avoid.
+    """
     limit = LABEL_WRAP_CHARS if wrap else LABEL_MAX_CHARS
     supplied = spec.get("labels")
     if isinstance(supplied, dict):
         value = str(supplied.get(slot) or "").strip()
         if value:
             return value.upper()[:limit]
+
+    if spec.get("planned"):
+        return (fallback or "").upper()[:limit]
     # The caller's fallback wins over the template's placeholder. It used to
     # be the other way around, so scene_vessel asking for "YEAR" on a
     # thirty-year axis still got the template's "DAY".
@@ -792,8 +888,13 @@ def draw_ambient(frame: Frame, t: float, phases: Phases, spec: dict[str, Any]) -
 # ---------------------------------------------------------------------------
 
 def draw_titles(frame: Frame, spec: dict[str, Any], t: float) -> None:
-    """Title and subtitle, fading in over the first beat."""
-    alpha = fade(t, 0.15, attack=0.7)
+    """
+    Title and subtitle, fading in over the first beat.
+
+    Quickly. This used to take 0.85s to reach full, which on the opening act is
+    a third of the time the viewer is deciding with, spent on a fade.
+    """
+    alpha = fade(t, 0.05, attack=0.35)
     if alpha <= 0.01:
         return
     title = str(spec.get("title") or "").upper()
@@ -806,7 +907,7 @@ def draw_titles(frame: Frame, spec: dict[str, Any], t: float) -> None:
         # holding -- the report called it "too small/thin for mobile", and a
         # subtitle nobody reads is a line of the argument thrown away.
         frame.wrapped(subtitle, (frame.w / 2, 432), size=44,
-                      colour=mix((170, 170, 170), fade(t, 0.55, attack=0.7)),
+                      colour=mix((170, 170, 170), fade(t, 0.30, attack=0.45)),
                       weight="light", max_width=880)
 
 
@@ -963,11 +1064,21 @@ def scene_vessel(frame: Frame, t: float, spec: dict[str, Any], duration: float) 
     except (TypeError, ValueError):
         end_value = 0.0
     if draining:
-        start, end = 1.0, clamp(end_value or 0.72)
+        # Exponential decay to the landing point, not the fill's curve run
+        # backwards.
+        #
+        # What a drain draws is the ratio of two compounding series: what you
+        # keep against what you would have kept without the drag. That ratio is
+        # ((1+r-f)/(1+r))^t -- constant proportional loss per period, which is
+        # decay. Interpolating along 1.01^n instead gets the endpoint right and
+        # the middle wrong: at 56% after thirty years it showed 75% at year 24
+        # where the real figure is 64%. end^u is exact at both ends and correct
+        # in between.
+        end = clamp(end_value or 0.72)
+        level = clamp(end ** u) if end > 0 else clamp(1.0 - u)
     else:
         start, end = 0.0, clamp(end_value or 1.0)
-
-    level = clamp(start + (end - start) * curve)
+        level = clamp(start + (end - start) * curve)
     # What the counter says. Draining counts what is left, as a share.
     readout = f"{100.0 * level:.0f}%" if draining else f"{growth:.2f}x"
 
@@ -2487,10 +2598,15 @@ def normalise_spec(raw: dict[str, Any] | None) -> dict[str, Any]:
     #
     # Acts are normalised recursively but carry no duration of their own until
     # the narration is synthesized -- see allocate_acts.
+    #
+    # One act counts. The threshold here was two, which meant a single-act list
+    # was discarded in silence and act_at fell through to the spec itself -- so
+    # a caller asking for one comparison_split got a split_path carrying the
+    # preset's own copy, with nothing anywhere saying its act had been ignored.
     acts = raw.get("acts")
     if isinstance(acts, list):
         built = [normalise_act(act) for act in acts if isinstance(act, dict)]
-        if len(built) >= 2:
+        if built:
             spec["acts"] = built
 
     return spec
@@ -2528,6 +2644,10 @@ def normalise_act(raw: dict[str, Any]) -> dict[str, Any]:
         "payoff": "",                      # the closing line belongs to the whole
         "thesis": str(raw.get("thesis") or "").strip(),
         "labels": raw.get("labels") if isinstance(raw.get("labels"), dict) else {},
+        # Marks an act that came out of a multi-act plan, so `label` knows not
+        # to reach for the template's placeholder copy. Carried rather than
+        # inferred, because "has a thesis" is true of presets too.
+        "planned": bool(raw.get("planned")),
         "elements": raw.get("elements") if isinstance(raw.get("elements"), list) else [],
         # Which way the geometry moves, and on what scale. An act arguing that
         # fees compound into losses and an act arguing that deposits compound
@@ -2977,6 +3097,7 @@ def render_animation(
     output_path: str,
     fps: int = 30,
     audio_path: str | None = None,
+    subtitle_path: str | None = None,
     progress_callback: ProgressFn | None = None,
 ) -> dict[str, Any]:
     """
@@ -2989,6 +3110,7 @@ def render_animation(
     from moviepy import AudioFileClip, VideoClip, afx, vfx
 
     spec = normalise_spec(spec)
+    fps = render_fps(fps)
     duration = float(spec["duration"])
     total = max(1, int(duration * fps))
     drawn = {"n": 0}
@@ -3048,6 +3170,27 @@ def render_animation(
             if progress_callback else None),
     )
 
+    # Captions go on before the loudness pass, not after: loudness copies the
+    # video stream untouched, so burning first costs one re-encode instead of
+    # two. Never fatal -- a video without captions is worth far more than a
+    # lost render.
+    burned = False
+    if subtitle_path and os.path.exists(subtitle_path):
+        if progress_callback:
+            progress_callback(total, total, "Burning captions...")
+        staged = output_path.replace(".mp4", "_sub.mp4")
+        try:
+            burn_ass_subtitles(output_path, subtitle_path, staged)
+            shutil.move(staged, output_path)
+            burned = True
+        except Exception as exc:                              # noqa: BLE001
+            if progress_callback:
+                progress_callback(total, total,
+                                  f"Captions failed ({type(exc).__name__}); "
+                                  "keeping the clean render.")
+            if os.path.exists(staged):
+                os.remove(staged)
+
     # Up to the platform loudness target. A separate pass over the finished
     # file with the video stream copied -- see video_engine.normalise_loudness
     # for why flat gain cannot get there on its own.
@@ -3080,6 +3223,7 @@ def render_animation(
         "size": CANVAS,
         "gpu": bool(enc.get("gpu")),
         "loudness": loudness,
+        "captions": burned,
         "end_fade": fade,
     }
 
@@ -3173,6 +3317,7 @@ def build_minimalist_video(
     voice: str = "Charon",
     tts_provider: str = "gemini",
     tts_style: str = "Calm, certain, unhurried. Almost cold.",
+    captions: bool = True,
     progress_callback: ProgressFn | None = None,
 ) -> dict[str, Any]:
     """
@@ -3191,6 +3336,7 @@ def build_minimalist_video(
     )
 
     spec = normalise_spec(spec)
+    fps = render_fps(fps)
     duration = float(spec["duration"])
     steps, step = 5, {"n": 0}
 
@@ -3202,6 +3348,7 @@ def build_minimalist_video(
     # --- 1. narration decides the runtime ---------------------------------
     narration_path = ""
     narration_trimmed = 0.0
+    narration_words: list[dict[str, Any]] = []
 
     # With acts, the narration is the acts read end to end. It is synthesized
     # as one take rather than three: three takes joined leave an audible seam
@@ -3227,12 +3374,31 @@ def build_minimalist_video(
         cleaned = trim_leading_silence(str(take["path"]))
         narration_path = str(cleaned["path"])
         narration_trimmed = float(cleaned["trimmed"])
+
+        # The word timings were measured on the untrimmed take, so everything
+        # shifts back by whatever the trim removed from the front. Dropping
+        # this is how captions end up a beat late for the whole video.
+        narration_words = [
+            {**word,
+             "start": max(0.0, float(word.get("start", 0.0)) - narration_trimmed),
+             "end": max(0.0, float(word.get("end", 0.0)) - narration_trimmed)}
+            for word in (take.get("words") or [])
+        ]
         if narration_path != str(take["path"]):
             _SCRATCH_RENDERS.append(narration_path)
 
         spoken = float(cleaned["duration"])
-        if spoken + 1.6 > duration:
-            grown = min(MAX_DURATION, spoken + 1.6)
+
+        # Room for the whole argument AND the card that follows it.
+        #
+        # This was `spoken + 1.6`, and the closing card owns the last
+        # CLOSING_SECONDS of the runtime, so the card started four seconds
+        # before the narration finished: act 6's geometry was wiped off the
+        # screen while act 6's own thesis was still being read. The tail has to
+        # be at least as long as the beat that lives in it.
+        tail = CLOSING_SECONDS + 0.4
+        if spoken + tail > duration:
+            grown = min(MAX_DURATION, spoken + tail)
             # Keep the climax at the same point in the story, not the clock.
             spec["climax"] = float(spec["climax"]) * (grown / duration)
             duration = grown
@@ -3320,9 +3486,26 @@ def build_minimalist_video(
         if progress_callback:
             progress_callback(steps, steps, message)
 
+    # Burned-in captions, because most of this audience is watching muted.
+    #
+    # Without them the only words on screen are the act title and its subtitle,
+    # so every figure the narration carries -- the whole reason the script is
+    # written the way it is -- reaches nobody with the sound off.
+    subtitle_path = ""
+    if captions and narration_words:
+        subtitle_path = scratch_wav("mmsubs").replace(".wav", ".ass")
+        write_ass_file(
+            narration_words, subtitle_path, size=CANVAS,
+            position="bottom", margin_v=CAPTION_MARGIN_V,
+            max_words=CAPTION_WORDS_PER_PHRASE,
+            font_scale=CAPTION_FONT_SCALE,
+        )
+        _SCRATCH_RENDERS.append(subtitle_path)
+
     result = render_animation(
         spec, output_path, fps=fps,
         audio_path=mixed_path or None,
+        subtitle_path=subtitle_path or None,
         progress_callback=frame_progress,
     )
 
@@ -3338,6 +3521,8 @@ def build_minimalist_video(
         "voice": voice if narration_path else "",
         "bgm": bool(bgm),
         "sfx": bool(sfx),
+        "captions": bool(subtitle_path),
+        "caption_words": len(narration_words) if subtitle_path else 0,
         "thesis": thesis,
         "spec": spec,
         "publish": normalise_publish(spec),

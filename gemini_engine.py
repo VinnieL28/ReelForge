@@ -20,7 +20,8 @@ from typing import Any, Callable
 from dotenv import load_dotenv
 from google import genai
 
-from minimalist_engine import METAPHOR_TYPES, TEMPLATES, plan_act_count
+from minimalist_engine import (LABEL_SLOTS, METAPHOR_TYPES, TEMPLATES,
+                               missing_label_slots, plan_act_count)
 
 # Load .env next to this file so the key is available before Client() is built;
 # genai.Client() reads GEMINI_API_KEY (or GOOGLE_API_KEY) from the environment.
@@ -726,6 +727,17 @@ SCENE_METAPHORS: dict[str, dict[str, str]] = {
 }
 SCENE_TEMPLATE_KEYS = tuple(METAPHOR_TYPES) + ("custom", "auto")
 
+# Which slots each template stamps onto its geometry.
+#
+# Read from LABEL_SLOTS, which is where they live. The prompt used to build
+# this list from SCENE_METAPHORS -- which has no "labels" key at all -- so it
+# came out empty and told the model there were no slots to fill. Two things
+# depend on getting it from the right table: the prompt lists them, and the
+# parser uses them to tell an act that was labelled from one that was not.
+LABEL_SLOTS_FOR: dict[str, dict[str, str]] = {
+    key: dict(LABEL_SLOTS.get(key) or {}) for key in METAPHOR_TYPES
+}
+
 # Shorts retention: long enough to say something, short enough to loop.
 # Long enough to earn. TikTok Creator Rewards counts nothing under 60
 # seconds, so a 15-25s scene -- which is what this asked for until now -- was a
@@ -754,14 +766,25 @@ SCENE_MIN_SECONDS, SCENE_MAX_SECONDS = 62.0, 70.0
 #
 # At 2.17, the old 118-130 band buys 54-60 seconds. That is how a render aimed
 # at 62-70s arrived at 56.29 and earned nothing.
-SCENE_WORDS_PER_SECOND = 2.17
+# The mean of two delivered renders: 119 words in 54.70s (2.176) and 131 in
+# 64.44s (2.033). Spread that wide is what a TTS with no fixed cadence does on
+# different sentence shapes, so a single figure is a centre and not a promise
+# -- which is why the runtime has PAYOUT_FLOOR_SECONDS under it rather than
+# trusting this number to land the video above sixty seconds on its own.
+SCENE_WORDS_PER_SECOND = 2.10
 
-# Aimed deliberately long. Overshooting the band costs a few seconds of
-# retention; undershooting it costs the entire payout, and those are not
-# comparable risks. 138-150 words is 64-69s at the measured rate and 74-80s if
-# the voice turns out to be slower than measured -- both fine, both paid.
-# PAYOUT_FLOOR_SECONDS catches anything that still lands short.
-SCENE_MIN_WORDS, SCENE_MAX_WORDS = 138, 150
+# Aimed long enough to clear the payout floor and no longer.
+#
+# 138-150 was set when the tail after the narration was 1.6 seconds. It is
+# CLOSING_SECONDS + 0.4 now -- six -- because the closing card was starting
+# before the argument finished, and that tail is runtime the narration does not
+# have to fill. A 156-word render came out at 74.3s and read at 125 words a
+# minute, which is slow for this format.
+#
+# 130-142 words is 60-65s spoken at the measured 2.17 w/s, plus six seconds of
+# card: 66-71s delivered. Over the sixty-second floor with margin, and
+# PAYOUT_FLOOR_SECONDS still catches anything that lands short.
+SCENE_MIN_WORDS, SCENE_MAX_WORDS = 130, 142
 
 
 def build_scene_prompt(concept: str, template: str = "auto",
@@ -984,6 +1007,13 @@ length sets the length of the video. Together they must total
 {words_low}-{words_high} words -- split roughly evenly, about {words_per_act}
 words each.
 
+PAY OFF THE TITLE. If the concept promises a specific quantity -- "the year
+your fees overtake your returns", "the exact moment willpower fails", "how many
+hours" -- then one act must put that number on screen in its labels and say it
+in its thesis. A video titled "the year X happens" that never names a year has
+broken its own promise, and the viewer who came for the number leaves without
+it. Decide the figure first, then build the act that lands it.
+
 THE PICTURE MUST AGREE WITH THE WORDS. A rendered act once argued "how small
 fees compound into major losses" over a vessel filling up and a counter
 climbing to 9.75x, which told the viewer the opposite of the narration. So:
@@ -1054,9 +1084,15 @@ def build_scene_plan_prompt(concept: str, acts: int = 0,
 
     catalogue = "\n".join(
         f'    "{key}": {spec["suits"]}' for key, spec in SCENE_METAPHORS.items())
+    # From LABEL_SLOTS_FOR, and showing the default alongside each slot as
+    # an example of the KIND of phrase it takes -- not as something to copy.
+    # The defaults are written for the metaphor rather than for any subject,
+    # which is exactly why an act that fails to override them looks wrong.
     slots = "\n".join(
-        f'    {key:<18} {sorted(spec["labels"])}'
-        for key, spec in SCENE_METAPHORS.items() if spec.get("labels"))
+        f'    {key:<19} ' + ", ".join(
+            f'"{slot}" (e.g. "{example}")' for slot, example in sorted(wanted.items()))
+        for key, wanted in ((key, LABEL_SLOTS_FOR.get(key) or {})
+                            for key in METAPHOR_TYPES) if wanted)
     beats = "\n".join(
         f"  Act {i} -- {name}: {description}"
         for i, (name, description) in enumerate(act_beats(count), start=1))
@@ -1073,6 +1109,19 @@ def build_scene_plan_prompt(concept: str, acts: int = 0,
         words_low=SCENE_MIN_WORDS,
         words_high=SCENE_MAX_WORDS,
         words_per_act=int(round((SCENE_MIN_WORDS + SCENE_MAX_WORDS) / 2 / count)),
+    )
+
+
+def relabel_note(titles: Sequence[str]) -> str:
+    """The complaint appended to a retry when acts came back unlabelled."""
+    named = ", ".join(f'"{title}"' for title in titles if title) or "some acts"
+    return (
+        "\n\n---\nYOUR LAST ANSWER LEFT THE LABELS EMPTY ON: " + named + ".\n"
+        "An act with no labels is rendered with placeholder copy written for "
+        "the metaphor rather than for this concept, which puts words about a "
+        "completely different subject on screen. Return the whole plan again "
+        "with every act's \"labels\" filled in for THIS concept, using the slot "
+        "names listed for the metaphor that act uses."
     )
 
 
@@ -1111,6 +1160,7 @@ def parse_scene_plan(raw: str, acts: int = 0, concept: str = "") -> dict[str, An
             "title": str(entry.get("title") or "").strip()[:40],
             "subtitle": str(entry.get("subtitle") or "").strip()[:90],
             "labels": entry.get("labels") if isinstance(entry.get("labels"), dict) else {},
+            "planned": True,
             "direction": str(entry.get("direction") or "fill").strip().lower(),
             "axis_max": axis_max,
             "axis_suffix": str(entry.get("axis_suffix") or "d").strip()[:3],
@@ -1135,8 +1185,17 @@ def parse_scene_plan(raw: str, acts: int = 0, concept: str = "") -> dict[str, An
                 (key for key in spare if key not in seen), act["template"] or spare[0])
         seen.add(act["template"])
 
+    # Which acts came back with nothing stamped on their geometry. An act with
+    # no labels at all is the one that used to render the template's own
+    # placeholder copy, so this is the signal generate_scene_plan retries on.
+    unlabelled = [act["title"] or act["template"] for act in planned
+                  if LABEL_SLOTS_FOR.get(act["template"])
+                  and len(missing_label_slots(act["template"], act["labels"]))
+                  == len(LABEL_SLOTS_FOR[act["template"]])]
+
     return {
         "acts": planned,
+        "unlabelled": unlabelled,
         "payoff": str(parsed.get("payoff") or "").strip()[:60],
         "cta": str(parsed.get("cta") or "").strip()[:40],
         "thesis": " ".join(act["thesis"] for act in planned),
@@ -1171,6 +1230,24 @@ def generate_scene_plan(concept: str,
             response = generate_with_retry(client, model, prompt, progress=progress)
             plan = parse_scene_plan(getattr(response, "text", "") or "",
                                     acts=count, concept=concept)
+
+            # An act with nothing stamped on its geometry used to fall through
+            # to the template's placeholder copy, which is how a video about
+            # fund fees ended up captioned WHO YOU ARE / WHO YOU THINK. One
+            # retry, naming the acts, is cheap and usually enough.
+            if plan and plan.get("unlabelled"):
+                if progress:
+                    progress(f"{len(plan['unlabelled'])} acts came back "
+                             "unlabelled; asking again...")
+                retry = generate_with_retry(
+                    client, model,
+                    prompt + relabel_note(plan["unlabelled"]), progress=progress)
+                second = parse_scene_plan(getattr(retry, "text", "") or "",
+                                          acts=count, concept=concept)
+                # Keep whichever plan labelled more of its geometry.
+                if second and len(second.get("unlabelled") or []) < len(plan["unlabelled"]):
+                    plan = second
+
             if plan:
                 plan["concept"] = str(concept).strip()
                 plan["model"] = model
@@ -1288,6 +1365,12 @@ SCRIPT:
 {script}
 
 CONTEXT: the finished video runs {duration:.0f} seconds.
+MEASURED: {words} words, {sentences} sentences, {wpm:.0f} words per minute.
+
+Those three figures are counted, not estimated. If you cite a word count, a
+sentence count or a pace anywhere in your answer, use exactly these numbers.
+Do not produce your own -- a card that says "147 words" in one note and "156
+words" in another is read, correctly, as a card that measured neither.
 
 Score three axes from 1 to 10. Use the whole range in BOTH directions: a script
 that does the job well is an 8, and refusing to award one is as wrong as
@@ -1409,9 +1492,20 @@ def score_virality(
     except GeminiError:
         return base
 
+    import re as _re
+
+    body = str(script).strip()
+    seconds = float(entry.get("duration") or 0.0)
+    word_count = len([w for w in body.split() if w])
+    sentence_count = len([s for s in _re.split(r"(?<=[.!?])\s+", body)
+                          if len(s.split()) >= 3]) or 1
+
     prompt = VIRAL_PROMPT.format(
-        script=str(script).strip(),
-        duration=float(entry.get("duration") or 0.0),
+        script=body,
+        duration=seconds,
+        words=word_count,
+        sentences=sentence_count,
+        wpm=(word_count / seconds * 60.0) if seconds > 0 else 0.0,
     )
 
     last: Exception | None = None

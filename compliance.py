@@ -666,6 +666,84 @@ def score_hook(script: str) -> dict[str, Any]:
             "diagnosis": diagnosis, "opening_words": opening_words}
 
 
+# ---------------------------------------------------------------------------
+# What the script score cannot see
+# ---------------------------------------------------------------------------
+
+def render_checks(result: dict[str, Any] | None,
+                  spec: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """
+    Objective facts about a finished render, each either passing or not.
+
+    Deliberately not folded into the 1-10. That number grades a script, and a
+    script score of 8.8 was shown as a readiness verdict on a video whose
+    geometry was labelled for a different subject entirely -- averaging a fact
+    into a taste score is how a defect that size stays invisible.
+
+    Each entry is {"key", "ok", "label", "detail"}. Anything that cannot be
+    determined is omitted rather than guessed at.
+    """
+    result = result or {}
+    spec = spec or (result.get("spec") if isinstance(result.get("spec"), dict) else {}) or {}
+    checks: list[dict[str, Any]] = []
+
+    def add(key: str, ok: bool, label: str, detail: str) -> None:
+        checks.append({"key": key, "ok": bool(ok), "label": label, "detail": detail})
+
+    duration = float(result.get("duration") or 0.0)
+    if duration > 0:
+        add("payout_length", duration >= 60.0, "Over the TikTok payout floor",
+            f"{duration:.0f}s"
+            + ("" if duration >= 60.0 else " — Creator Rewards pays nothing under 60s"))
+
+    # The one that shipped. An act with no labels used to render the template's
+    # own placeholder copy, which is how a short about fund fees carried
+    # "WHO YOU ARE / WHO YOU THINK".
+    acts = spec.get("acts") or []
+    if acts:
+        try:
+            from minimalist_engine import LABEL_SLOTS, missing_label_slots
+
+            bare = [str(act.get("title") or act.get("template") or "?")
+                    for act in acts
+                    if LABEL_SLOTS.get(str(act.get("template") or ""))
+                    and len(missing_label_slots(str(act.get("template")), act.get("labels")))
+                    == len(LABEL_SLOTS[str(act.get("template"))])]
+        except Exception:                                     # noqa: BLE001
+            bare = []
+        add("act_labels", not bare, "Every scene labelled for this topic",
+            "all scenes" if not bare
+            else f"unlabelled: {', '.join(bare[:4])}")
+
+        add("act_count", len(acts) >= 4, "Enough scenes to hold a minute",
+            f"{len(acts)} scenes"
+            + ("" if len(acts) >= 4 else " — each one holds the screen too long"))
+
+    if "captions" in result:
+        add("captions", bool(result.get("captions")),
+            "Burned-in captions for muted viewing",
+            f"{int(result.get('caption_words') or 0)} words"
+            if result.get("captions") else "none — the figures never appear on screen")
+
+    loudness = result.get("loudness") or {}
+    after = loudness.get("after") if isinstance(loudness, dict) else None
+    if isinstance(after, dict) and after.get("lufs") is not None:
+        lufs = float(after["lufs"])
+        add("loudness", -16.0 <= lufs <= -12.0, "Loudness in the platform window",
+            f"{lufs:.1f} LUFS")
+
+    fps = int(result.get("fps") or 0)
+    if fps:
+        add("fps", fps >= 30, "Frame rate suits drawn motion",
+            f"{fps}fps" + ("" if fps >= 30 else " — 24 judders on continuous motion"))
+
+    return checks
+
+
+def failing_checks(checks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [check for check in checks if not check["ok"]]
+
+
 def score_density(script: str) -> dict[str, Any]:
     """Scores how much of the script is load-bearing, 1-10."""
     words = _words(script)

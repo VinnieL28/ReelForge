@@ -1439,6 +1439,7 @@ def build_ass_subtitles(
     max_words: int = 4,
     uppercase: bool = True,
     pop_scale: int = 112,
+    margin_v: int = 0,
 ) -> str:
     """
     Builds an .ass subtitle script with one Dialogue event per spoken word.
@@ -1454,12 +1455,15 @@ def build_ass_subtitles(
     font = ass_font_name()
     accent = KINETIC_COLOURS.get(highlight, ASS_YELLOW)
 
+    # `margin_v` is the distance from the frame edge the alignment anchors to.
+    # An explicit one wins, because an engine with its own reserved caption band
+    # knows where the captions go better than a percentage does.
     if position == "center":
-        alignment, margin_v = 5, 40
+        alignment, margin_v = 5, margin_v or 40
     elif position == "top":
-        alignment, margin_v = 8, int(h * 0.12)
+        alignment, margin_v = 8, margin_v or int(h * 0.12)
     else:                                   # lower third -- the default
-        alignment, margin_v = 2, int(h * 0.22)
+        alignment, margin_v = 2, margin_v or int(h * 0.22)
 
     side_margin = int(w * 0.08)
     header = (

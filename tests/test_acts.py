@@ -42,9 +42,32 @@ class TestActSpec:
     def test_a_plan_keeps_its_acts(self):
         assert len(_plan(30, 40, 30)["acts"]) == 3
 
-    def test_a_single_act_is_not_a_plan(self):
-        """One act is what this was built to replace."""
-        assert "acts" not in _plan(30)
+    def test_a_single_act_is_still_rendered_as_that_act(self):
+        """
+        This used to assert the opposite -- normalise_spec dropped any act list
+        shorter than two, on the grounds that "one act is what this was built
+        to replace". True of the planner, and parse_scene_plan enforces it
+        below. But the renderer is not the planner, and what dropping it
+        actually did was fall through to the top-level spec: a caller asking
+        for one comparison_split got a split_path carrying the preset's own
+        copy, with nothing anywhere reporting the substitution.
+
+        Refusing a one-act plan is the planner's job. Silently rendering
+        something else was nobody's.
+        """
+        spec = _plan(30)
+        assert len(spec["acts"]) == 1
+        act, _, _ = me.act_at(spec, 9.0, 30.0)
+        assert act is spec["acts"][0]
+
+    def test_the_planner_still_refuses_a_one_act_plan(self):
+        """Where the rule belongs, and where it always was."""
+        import gemini_engine as ge
+
+        one = ('{"acts": [{"template": "two_doors", "title": "A", '
+               '"subtitle": "b", "labels": {}, "thesis": "only one act here"}], '
+               '"payoff": "x"}')
+        assert ge.parse_scene_plan(one) == {}
 
     def test_a_spec_with_no_acts_is_untouched(self):
         """Every preset, the offline fallback and every existing caller hands

@@ -55,6 +55,7 @@ from audio_engine import (
     VIRAL_VOICES,
     DEFAULT_VOICE,
 )
+import compliance
 from compliance import (
     LICENCES,
     VIRAL_TARGET_SCORE,
@@ -1487,8 +1488,34 @@ def _score_tone(score: float) -> str:
     return "red"
 
 
+def render_render_checks(result: dict[str, Any] | None) -> None:
+    """
+    What the script score cannot see, as facts rather than as a number.
+
+    Kept out of the 1-10 on purpose. That score grades writing, and averaging
+    "two scenes are unlabelled" into a taste score is how a defect that size
+    stays invisible -- it scored 8.8 with four of six scenes carrying copy
+    about a different topic.
+    """
+    checks = compliance.render_checks(result or {})
+    if not checks:
+        return
+
+    failed = compliance.failing_checks(checks)
+    title = ("✅ Render checks — all clear" if not failed
+             else f"⚠️ Render checks — {len(failed)} to look at")
+
+    with st.expander(title, expanded=bool(failed)):
+        st.caption("Measured off the finished file. The score above grades the "
+                   "script; these are the things it cannot see.")
+        for check in checks:
+            mark = "✅" if check["ok"] else "⚠️"
+            st.markdown(f"{mark} **{check['label']}** — {check['detail']}")
+
+
 def render_viral_scorecard(script: str, scope: str, entry: dict[str, Any] | None = None,
-                           on_rewrite: Callable[[str], None] | None = None) -> None:
+                           on_rewrite: Callable[[str], None] | None = None,
+                           result: dict[str, Any] | None = None) -> None:
     """
     The 1-10 scorecard, with a one-click rewrite when it lands under target.
 
@@ -1570,6 +1597,8 @@ def render_viral_scorecard(script: str, scope: str, entry: dict[str, Any] | None
 
         for fix in card.get("fixes", [])[:4]:
             st.markdown(f"- {fix}")
+
+        render_render_checks(result)
 
         if card.get("needs_rewrite"):
             st.warning(
@@ -4975,7 +5004,8 @@ def render_minimalist_publish() -> None:
 
     # The animation's spoken script is its thesis; there is no other narration.
     render_viral_scorecard(str(spec.get("thesis") or ""),
-                           scope="minimalist", entry=entry or {})
+                           scope="minimalist", entry=entry or {},
+                           result=state.get("result") or {})
 
     with st.container(border=True):
         st.markdown("#### 📤 Publish pack")
@@ -7171,7 +7201,9 @@ def render_magic_result(result: dict[str, Any], allowed: Sequence[str]) -> None:
         st.caption(f"`{result['path']}`")
 
         if result.get("script"):
-            render_viral_scorecard(result["script"], "magic", result.get("entry") or {})
+            render_viral_scorecard(result["script"], "magic",
+                                   result.get("entry") or {},
+                                   result=result.get("render") or result)
 
 
 def render_dashboard(modes: Sequence[str]) -> None:
@@ -7623,7 +7655,10 @@ def main() -> None:
                  "Crop fills it edge to edge and loses the sides; Blur fill keeps "
                  "the whole picture over a blurred plate; Pad adds black bars.",
         )
-        fps = pick("FPS", [24, 30, 60], 24, "fps_pick", format_func=str)
+        # 30, not 24. The vector engine enforces its own floor either way
+        # (minimalist_engine.MIN_FPS), but 24 was a poor default for the
+        # rest of them too on anything with motion in it.
+        fps = pick("FPS", [24, 30, 60], 30, "fps_pick", format_func=str)
 
         divider()
         st.markdown('<div class="rf-section">Motion</div>', unsafe_allow_html=True)
