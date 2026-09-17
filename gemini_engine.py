@@ -771,7 +771,14 @@ SCENE_MIN_SECONDS, SCENE_MAX_SECONDS = 62.0, 70.0
 # different sentence shapes, so a single figure is a centre and not a promise
 # -- which is why the runtime has PAYOUT_FLOOR_SECONDS under it rather than
 # trusting this number to land the video above sixty seconds on its own.
-SCENE_WORDS_PER_SECOND = 2.10
+# ...and then the voice was told to hurry. With "a brisk, confident pace" in
+# place of "unhurried", the same 133-word script read at 2.32 words a second
+# against 1.90. The earlier figures were all taken on the unhurried voice.
+#
+# Two brisk takes are now measured: 133 words in 57.4s (2.32) and 151 in 59.9s
+# (2.52). The centre is their mean. 151 words a minute is also, for once,
+# exactly the pace both reviews of the slow renders asked for.
+SCENE_WORDS_PER_SECOND = 2.42
 
 # Aimed long enough to clear the payout floor and no longer.
 #
@@ -784,7 +791,55 @@ SCENE_WORDS_PER_SECOND = 2.10
 # 130-142 words is 60-65s spoken at the measured 2.17 w/s, plus six seconds of
 # card: 66-71s delivered. Over the sixty-second floor with margin, and
 # PAYOUT_FLOOR_SECONDS still catches anything that lands short.
-SCENE_MIN_WORDS, SCENE_MAX_WORDS = 130, 142
+#
+# 124-132 now, because the card is no longer silent. The payoff is read aloud
+# over it (about 2.5s) and the voice is followed by SPOKEN_CLOSE_HOLD rather
+# than six seconds of nothing, so the same delivered length needs fewer body
+# words. At the fastest measured rate, 2.176, 124 words is 57.0s + 2.5 + 1.6 =
+# 61.1s; at the slowest, 2.033, 132 words is 64.9 + 4.1 = 69.0s. Both are
+# paid, and the review that called 72 seconds "a lot" gets its few seconds
+# back without anyone getting a sixty-second floor taken away.
+# How much the rate varies around that centre, as a fraction.
+#
+# Three takes on the unhurried instruction measured 1.90, 2.03 and 2.18 words a
+# second -- a centre of 2.04, none further than 7% from it. The two brisk takes
+# sit at 2.32 and 2.52, which is only +-4% of 2.42, and it was tempting to
+# narrow this to match. Two samples do not measure a spread: the evidence that
+# this voice wanders by 7% stands until there are enough brisk takes to say
+# otherwise, and every widening of this number so far has come from a render
+# that surprised me.
+SCENE_RATE_SPREAD = 0.07
+
+
+def scene_rate_bounds() -> tuple[float, float]:
+    """(slowest, fastest) words a second the narration plausibly reads at."""
+    return (SCENE_WORDS_PER_SECOND * (1.0 - SCENE_RATE_SPREAD),
+            SCENE_WORDS_PER_SECOND * (1.0 + SCENE_RATE_SPREAD))
+
+
+# The budget, derived from that range rather than from the centre.
+#
+# Two limits, pulling opposite ways. The minimum has to clear the TikTok payout
+# floor even when the voice reads FAST, because a render that lands at 59
+# seconds earns nothing. The maximum has to stay watchable even when it reads
+# SLOW -- a 74-second video was called long by both reviews of one.
+#
+# Two limits at 2.25-2.59 w/s, with a five-word payoff read aloud and
+# SPOKEN_CLOSE_HOLD after it, pulling against each other:
+#
+#   the ceiling  157 words at the slow end is 72.7s. Both reviews of a
+#                74.3-second render called it long, so 73s is the cap.
+#   the floor    pinning the minimum so that even a FAST read needs no silent
+#                padding would want 153 words, and 153-157 is a four-word band.
+#                Every budget so far has been overshot -- 138-150 produced 164,
+#                124-132 produced 133, 140-148 produced 151 -- so a four-word
+#                band is not a spec, it is a coin toss.
+#
+# So the minimum gives way instead, by the smallest amount that leaves a band
+# wide enough to write inside: at 148 words a fast read lands at 60.7s and
+# PAYOUT_FLOOR_SECONDS holds the card 2.3s longer. That is a beat on a card
+# that would be held anyway, not the six silent seconds a review called out.
+SCENE_MIN_WORDS, SCENE_MAX_WORDS = 148, 155
 
 
 def build_scene_prompt(concept: str, template: str = "auto",
@@ -1005,7 +1060,29 @@ beats a fabricated number every time.
 The theses are read aloud as one continuous narration and their combined
 length sets the length of the video. Together they must total
 {words_low}-{words_high} words -- split roughly evenly, about {words_per_act}
-words each.
+words each. The payoff is read aloud after the last act, over the closing card,
+so write it to be said as well as seen.
+
+ONE SET OF NUMBERS. Decide the assumptions once -- one fee, one rate of return,
+one time horizon, one starting amount -- and make every figure in every thesis,
+label and payoff follow from them. A render once showed "1.5% FEE" on screen
+while the narration said "a one percent fee"; a viewer who knows the subject
+reads that as a video that does not.
+
+WORK THE NUMBERS OUT. Say the figure the assumptions actually produce, not a
+rounder or more dramatic one. "Half" means close to 50%. At 7% returns a 1%
+fee costs about a quarter of the gains over twenty-five years, not half --
+the render that said "half" was wrong by two to one in its first sentence.
+
+NO ABSOLUTES unless they are literally true: not "zero", "never", "always",
+"guaranteed", "everyone", "no one". "Past winners rarely stay winners" is
+true; "past performance carries zero predictive value" is not, and it is the
+kind of line that gets a channel corrected in its own comments.
+
+OPEN ON THE FIGURE. The first sentence carries the single most concrete number
+in the video -- a dollar amount beats a percentage, a percentage beats an
+adjective -- because it is on screen in the first second and it is what stops
+the scroll.
 
 PAY OFF THE TITLE. If the concept promises a specific quantity -- "the year
 your fees overtake your returns", "the exact moment willpower fails", "how many
@@ -1013,6 +1090,17 @@ hours" -- then one act must put that number on screen in its labels and say it
 in its thesis. A video titled "the year X happens" that never names a year has
 broken its own promise, and the viewer who came for the number leaves without
 it. Decide the figure first, then build the act that lands it.
+
+LABEL THE RANKED TEMPLATES IN THE RIGHT ORDER. comparison_split fills only
+its bottom bar, so tier3 is the row that WINS. A fees video labelled it
+"SPIVA 92% LAG" and the picture then showed a failure statistic winning:
+
+  BAD:  tier1 "ACTIVE 8%", tier2 "BENCHMARK 100%", tier3 "SPIVA 92% LAG"
+  GOOD: tier1 "ADVISOR 1.5%", tier2 "ACTIVE FUND 0.6%", tier3 "INDEX 0.03%"
+
+The same applies to balance_scale (the right pan wins), two_doors (the right
+door opens) and split_path (the bright path ends high, the flat grey one
+crashes). Put what the video RECOMMENDS on the winning side, every time.
 
 THE PICTURE MUST AGREE WITH THE WORDS. A rendered act once argued "how small
 fees compound into major losses" over a vessel filling up and a counter
@@ -1047,8 +1135,11 @@ Return ONE JSON object and nothing else:
  "publish": {{"title": "...", "description": "...", "hashtags": ["..."]}}}}
 
 "labels" are the words stamped onto that act's geometry -- one or two words
-each, uppercase, 16 characters at most. Which slots exist depends on the
-metaphor; use the ones that suit it and leave the rest out:
+each, uppercase, 16 characters at most, with figures written as figures:
+"88%", "$200K", "YEAR 25", "3 BPS" -- never "EIGHTY-EIGHT PERCENT". A longer
+label is shortened on screen, and a shortened label usually loses the word
+that mattered. Which slots exist depends on the metaphor; use the ones that
+suit it and leave the rest out:
 {label_slots}
 
 FILL THE LABELS FOR EVERY ACT. They are not decoration -- they are the only

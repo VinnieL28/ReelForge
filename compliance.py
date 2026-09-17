@@ -719,11 +719,45 @@ def render_checks(result: dict[str, Any] | None,
             f"{len(acts)} scenes"
             + ("" if len(acts) >= 4 else " — each one holds the screen too long"))
 
+    # A label the renderer had to shorten. "ACTIVE 88 PERCEN" sat on screen
+    # for ten seconds while every other check read OK.
+    if acts:
+        try:
+            from minimalist_engine import LABEL_MAX_CHARS, fit_label
+
+            cut = []
+            for act in acts:
+                for value in (act.get("labels") or {}).values():
+                    shown, shortened = fit_label(str(value or ""), LABEL_MAX_CHARS)
+                    if shortened:
+                        cut.append(f"{str(value).upper()} → {shown}")
+        except Exception:                                     # noqa: BLE001
+            cut = []
+        add("labels_fit", not cut, "Every label fits without cutting",
+            "all labels" if not cut else "shortened: " + "; ".join(cut[:3]))
+
     if "captions" in result:
         add("captions", bool(result.get("captions")),
             "Burned-in captions for muted viewing",
             f"{int(result.get('caption_words') or 0)} words"
             if result.get("captions") else "none — the figures never appear on screen")
+
+    # Estimated caption timings drift: the estimate put 85 of 133 words more
+    # than a quarter-second away from the voice, and a viewer saw it.
+    timing = str(result.get("caption_timing") or "")
+    if result.get("captions") and timing:
+        add("caption_timing", timing in ("measured", "exact"),
+            "Captions timed from the voice",
+            {"measured": "measured from the audio",
+             "exact": "exact, from the voice engine"}.get(
+                timing, "estimated — captions can drift up to a second; "
+                        "install faster-whisper"))
+
+    if "payoff_spoken" in result:
+        add("payoff_spoken", bool(result.get("payoff_spoken")),
+            "Closing line read aloud",
+            "the card arrives with the voice" if result.get("payoff_spoken")
+            else "the card sits silent at the end")
 
     loudness = result.get("loudness") or {}
     after = loudness.get("after") if isinstance(loudness, dict) else None

@@ -1402,6 +1402,51 @@ def _ass_escape(text: str) -> str:
                 .strip())
 
 
+# Words a caption phrase should not end on: each one belongs to the word after
+# it. "POTENTIAL AGAINST YOUR" and "REAL RETURN A" were both count-based cuts
+# that left one of these hanging, and the viewer reads the stranded word as the
+# end of a thought that has not finished.
+WEAK_PHRASE_ENDINGS: frozenset[str] = frozenset({
+    "a", "an", "the", "and", "or", "but", "nor", "so", "if", "than", "that",
+    "of", "to", "in", "on", "at", "for", "with", "by", "from", "as", "into",
+    "over", "per", "like", "your", "my", "our", "their", "his", "her", "its",
+    "is", "are", "was", "were", "be", "this", "these", "those", "every",
+})
+
+# Words that belong to the figure before them. "FAIL OVER 15 / YEARS" put a
+# number on one caption and what it counts on the next.
+UNIT_WORDS: frozenset[str] = frozenset({
+    "year", "years", "month", "months", "week", "weeks", "day", "days",
+    "hour", "hours", "minute", "minutes", "second", "seconds", "percent",
+    "basis", "points", "times", "x", "bps", "dollars", "cents", "people",
+})
+
+
+def _is_figure(word: dict[str, Any]) -> bool:
+    text = str(word.get("text") or "").strip()
+    return bool(text) and (text[0].isdigit() or text[0] in "$£€")
+
+
+# Punctuation that closes a clause. A phrase never runs across one.
+_CLAUSE_MARKS = (".", ",", ";", ":", "!", "?", "\u2014", "--")
+
+
+def _bare(word: dict[str, Any]) -> str:
+    return str(word.get("text") or "").strip().strip(".,;:!?\"'").lower()
+
+
+def _ends_clause(word: dict[str, Any]) -> bool:
+    """
+    True when the script put punctuation after this word.
+
+    Read from `raw` when the timings carry it (measured alignment keeps the
+    script's own token). edge-tts strips punctuation from its boundary text, so
+    for those words the pause test below is the only signal there is.
+    """
+    raw = str(word.get("raw") or word.get("text") or "").rstrip()
+    return raw.endswith(_CLAUSE_MARKS)
+
+
 def group_words_into_phrases(
     words: Sequence[dict[str, Any]],
     max_words: int = 4,
@@ -1410,9 +1455,10 @@ def group_words_into_phrases(
     """
     Chunks word timings into short on-screen phrases.
 
-    Splits on a natural pause as well as on length: edge-tts strips punctuation
-    from its boundary text, so the silence between words is the only reliable
-    signal that a sentence ended.
+    A phrase closes at a pause, at the end of a clause, or when it is full --
+    and when it is full it hands any trailing weak words ("the", "of", "your")
+    to the next phrase instead of stranding them. The cap is kept: the vector
+    engine's caption has to fit on one line.
     """
     phrases: list[list[dict[str, Any]]] = []
     current: list[dict[str, Any]] = []
@@ -1420,14 +1466,217 @@ def group_words_into_phrases(
     for word in words:
         if current:
             gap = float(word["start"]) - float(current[-1]["end"])
-            if gap > max_gap or len(current) >= max_words:
+            if gap > max_gap or _ends_clause(current[-1]):
                 phrases.append(current)
                 current = []
+            elif len(current) >= max_words:
+                carry: list[dict[str, Any]] = []
+                # A figure goes with the unit that follows it.
+                if (len(current) > 1 and _is_figure(current[-1])
+                        and _bare(word) in UNIT_WORDS):
+                    carry.insert(0, current.pop())
+                while (len(current) > 1 and len(carry) < max_words - 1
+                       and _bare(current[-1]) in WEAK_PHRASE_ENDINGS):
+                    carry.insert(0, current.pop())
+                phrases.append(current)
+                current = carry
         current.append(dict(word))
 
     if current:
         phrases.append(current)
     return phrases
+
+
+# ---------------------------------------------------------------------------
+# Spoken numbers, shown as figures
+# ---------------------------------------------------------------------------
+
+_NUM_UNITS: dict[str, int] = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+    "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16,
+    "seventeen": 17, "eighteen": 18, "nineteen": 19,
+}
+_NUM_TENS: dict[str, int] = {
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
+    "seventy": 70, "eighty": 80, "ninety": 90,
+}
+_NUM_SCALES: dict[str, int] = {
+    "hundred": 100, "thousand": 1_000, "million": 1_000_000,
+    "billion": 1_000_000_000, "trillion": 1_000_000_000_000,
+}
+
+
+_NUMERAL = re.compile(r"^\d[\d,]*(?:\.\d+)?$")
+
+
+def _num_key(word: dict[str, Any]) -> str:
+    return str(word.get("text") or "").strip().strip(".,;:!?\"'").lower()
+
+
+def _small_number(token: str) -> int | None:
+    """0-99 from one spoken token, hyphenated or not."""
+    if token in _NUM_UNITS:
+        return _NUM_UNITS[token]
+    if token in _NUM_TENS:
+        return _NUM_TENS[token]
+    if "-" in token:
+        head, _, tail = token.partition("-")
+        if head in _NUM_TENS and tail in _NUM_UNITS and 0 < _NUM_UNITS[tail] < 10:
+            return _NUM_TENS[head] + _NUM_UNITS[tail]
+    return None
+
+
+def _is_number_word(token: str) -> bool:
+    return _small_number(token) is not None or token in _NUM_SCALES
+
+
+def _parse_spoken(tokens: list[str]) -> float | None:
+    """
+    The value of a run of spoken number words, or None if it is not one.
+
+    Handles "two hundred thousand", "a hundred", "eighty-eight",
+    "one point five" and two-part years ("twenty twenty-four").
+    """
+    if not tokens:
+        return None
+    if "point" in tokens:
+        at = tokens.index("point")
+        base = _parse_spoken(tokens[:at]) if at else 0.0
+        digits = [_small_number(t) for t in tokens[at + 1:]]
+        if base is None or not digits or any(d is None or d > 9 for d in digits):
+            return None
+        return float(f"{int(base)}." + "".join(str(d) for d in digits))
+
+    words = [t for t in tokens if t != "and"]
+    scales = [t for t in words if t in _NUM_SCALES]
+    smalls = [_small_number(t) for t in words if t not in _NUM_SCALES]
+    if any(s is None for s in smalls):
+        return None
+
+    # "twenty twenty-four" -- two spoken halves of a year, no scale word.
+    if not scales and len(smalls) == 2 and 10 <= smalls[0] <= 99 and smalls[1] <= 99:
+        return float(smalls[0] * 100 + smalls[1])
+    if not scales and len(smalls) > 1:
+        return None
+
+    total, current = 0, 0
+    for token in words:
+        if token in _NUM_SCALES:
+            scale = _NUM_SCALES[token]
+            current = max(current, 1) * scale
+            if scale >= 1_000:
+                total += current
+                current = 0
+        else:
+            current += _small_number(token) or 0
+    return float(total + current)
+
+
+def _format_figure(value: float, money: bool = False) -> str:
+    """Digits as a caption shows them. Years stay bare; money always groups."""
+    if value == int(value):
+        grouped = money and value >= 1_000 or value >= 10_000
+        return f"{int(value):,}" if grouped else str(int(value))
+    return f"{value:g}"
+
+
+def spoken_numbers_as_figures(words: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Merges runs of spoken number words into one caption token.
+
+    "two hundred thousand dollars" -> "$200,000", "eighty-eight percent" ->
+    "88%", "a hundred thousand dollar portfolio" -> "$100,000 portfolio". The
+    merged token spans the whole run's time, so the figure is highlighted for
+    exactly as long as it is being said. Words that are not part of a number
+    pass through untouched, and so do figures the script already wrote as
+    digits.
+    """
+    source = [dict(word) for word in words]
+    out: list[dict[str, Any]] = []
+    i = 0
+    while i < len(source):
+        key = _num_key(source[i])
+        nxt = _num_key(source[i + 1]) if i + 1 < len(source) else ""
+        # A figure the script already wrote in digits still takes its unit:
+        # "1.5 percent" is shown as "1.5%", "40 dollars" as "$40".
+        if _NUMERAL.match(key) and nxt in ("percent", "percentage", "dollar", "dollars"):
+            raw_unit = str(source[i + 1].get("raw") or source[i + 1].get("text") or "")
+            tail = raw_unit.rstrip()[-1:] if raw_unit.rstrip()[-1:] in ",.;:!?" else ""
+            figure = key.replace(",", "")
+            text = (f"{key}%" if nxt.startswith("percent")
+                    else "$" + (_format_figure(float(figure), money=True)
+                                if figure.replace(".", "", 1).isdigit() else key))
+            merged = dict(source[i])
+            merged.update({"text": text, "raw": text + tail,
+                           "start": float(source[i]["start"]),
+                           "end": float(source[i + 1]["end"])})
+            out.append(merged)
+            i += 2
+            continue
+
+        # A run starts on a number, or on "a" before a scale ("a hundred").
+        # Never on a bare scale word: "200 THOUSAND DOLLARS" turned into
+        # "200 $1,000" when "thousand" was allowed to begin a number of its own.
+        starts_run = _small_number(key) is not None or (
+            key == "a" and nxt in _NUM_SCALES)
+        if not starts_run:
+            out.append(source[i])
+            i += 1
+            continue
+
+        j = i
+        tokens: list[str] = []
+        while j < len(source):
+            token = _num_key(source[j])
+            follow = _num_key(source[j + 1]) if j + 1 < len(source) else ""
+            if _is_number_word(token) or (token == "a" and j == i):
+                tokens.append("one" if token == "a" else token)
+            elif token == "point" and _small_number(follow) is not None:
+                tokens.append("point")
+            elif token == "and" and tokens and _is_number_word(follow):
+                tokens.append("and")
+            else:
+                break
+            j += 1
+            # A clause mark ends the number too: "fifteen, twenty" is a list.
+            raw = str(source[j - 1].get("raw") or source[j - 1].get("text") or "")
+            if raw.rstrip().endswith((",", ".", ";", ":", "!", "?")):
+                break
+
+        value = _parse_spoken(tokens)
+        last = j - 1
+        unit = _num_key(source[j]) if j < len(source) else ""
+        closed = str(source[last].get("raw") or "").rstrip().endswith(
+            (",", ".", ";", ":", "!", "?"))
+        # "one" on its own is usually a pronoun -- "the one that", "no one" --
+        # unless a unit says otherwise.
+        lone_one = tokens == ["one"] and (closed or unit not in (
+            "percent", "percentage", "dollar", "dollars"))
+        if value is None or lone_one:
+            out.append(source[i])
+            i += 1
+            continue
+
+        if not closed and unit in ("percent", "percentage"):
+            text, last = _format_figure(value) + "%", j
+        elif not closed and unit in ("dollar", "dollars"):
+            text, last = "$" + _format_figure(value, money=True), j
+        else:
+            text = _format_figure(value)
+
+        # The punctuation that followed the run still ends the clause.
+        tail = str(source[last].get("raw") or "").rstrip()
+        merged = dict(source[i])
+        merged.update({
+            "text": text,
+            "raw": text + (tail[-1] if tail[-1:] and tail[-1] in ",.;:!?" else ""),
+            "start": float(source[i]["start"]),
+            "end": float(source[last]["end"]),
+        })
+        out.append(merged)
+        i = last + 1
+    return out
 
 
 def build_ass_subtitles(
@@ -1440,9 +1689,12 @@ def build_ass_subtitles(
     uppercase: bool = True,
     pop_scale: int = 112,
     margin_v: int = 0,
+    figures: bool = False,
 ) -> str:
     """
     Builds an .ass subtitle script with one Dialogue event per spoken word.
+
+    `figures` shows spoken numbers as digits -- see spoken_numbers_as_figures.
 
     Each event shows the whole phrase with only the currently-spoken word in the
     accent colour, which is the CapCut / TikTok look. Plain ASS karaoke (\\k) is
@@ -1489,6 +1741,8 @@ def build_ass_subtitles(
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
 
+    if figures:
+        words = spoken_numbers_as_figures(words)
     phrases = group_words_into_phrases(words, max_words=max_words)
     lines: list[str] = []
 

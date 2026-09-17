@@ -21,6 +21,10 @@ google-genai==2.22.0       # Gemini: video grounding, scripts, scene specs, TTS
 python-dotenv==1.2.3       # loads GEMINI_API_KEY / PEXELS_API_KEY from .env
 yt-dlp==2026.8.19          # TikTok / Reels / Shorts ingestion
 requests==2.34.2           # Pexels and Wikimedia Commons lookups
+faster-whisper==1.2.1      # times Gemini narration word by word, locally, for
+                           # captions. Downloads the small.en model (~480MB) on
+                           # first use; without it captions fall back to an
+                           # estimate that drifts by up to a second.
 
 # Atmosphere Studio's YouTube publisher. Only imported by publisher.py, so the
 # other six modes run without them installed.
@@ -32,6 +36,6 @@ pytest==9.1.1              # pytest tests/
 
 # Authentication adds nothing: hashlib (PBKDF2-HMAC-SHA256), hmac, secrets and
 # json are all standard library. Verified against the imports in every module --
-# the eleven runtime pins above are exactly the eleven third-party packages the
+# the twelve runtime pins above are exactly the twelve third-party packages the
 # app imports, plus the two google-api packages that only Atmosphere Studio's
 # publisher touches; pytest is test-only.

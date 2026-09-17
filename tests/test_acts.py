@@ -220,8 +220,11 @@ class TestDispatch:
 
         source = inspect.getsource(me._draw_act)
         assert "draw_closing_card(card, spec, card_alpha)" in source
-        assert "closing_alpha_at(t, duration)" in source, (
+        # The video's clock, and the video's own closing time -- never an
+        # act's local one.
+        assert "closing_alpha_at(t, duration, closing_at)" in source, (
             "the closing card is being timed on the act's clock")
+        assert 'spec.get("closing_at")' in source
 
     def test_the_closing_card_replaces_the_scene_rather_than_sharing_it(self):
         """The payoff used to be a caption on the bottom rail of a scene that

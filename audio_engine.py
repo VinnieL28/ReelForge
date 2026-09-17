@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import os
 import asyncio
+import difflib
+import re
 import tempfile
+import threading
 from typing import Any, Callable, Coroutine, Sequence, TypeVar
 
 import numpy as np
@@ -779,9 +782,176 @@ def estimate_word_timings(audio_path: str, text: str) -> list[dict[str, Any]]:
             "start": round(at(cursor), 3),
             "end": round(at(min(cursor + share, speech_total)), 3),
             "text": word.strip(".,!?:;\"'") or word,
+            "raw": word,
         })
         cursor += share
     return timings
+
+
+# ---------------------------------------------------------------------------
+# Measured alignment
+# ---------------------------------------------------------------------------
+
+# The speech model that times a narration against its own script.
+#
+# small.en over base.en: on the benchmark above its median error is 44ms
+# against 84ms, and 95% of its words land within 0.14s against 0.24s. It costs
+# about 25s of CPU on a one-minute take, which is nothing beside the render.
+# English-only models, because every script this project writes is English and
+# the .en variants are the more accurate at the same size.
+ALIGN_MODEL = "small.en"
+
+_ALIGNER: Any = None
+_ALIGNER_LOCK = threading.Lock()
+_ALIGN_PUNCT = ".,!?:;\"'()"
+
+
+def _aligner() -> Any:
+    """
+    The speech model, loaded once per process.
+
+    Tries the local cache first so a render never waits on the network for a
+    model that is already on disk, and only then allows a download.
+    """
+    global _ALIGNER
+    with _ALIGNER_LOCK:
+        if _ALIGNER is None:
+            from faster_whisper import WhisperModel
+
+            try:
+                _ALIGNER = WhisperModel(ALIGN_MODEL, device="cpu",
+                                        compute_type="int8", local_files_only=True)
+            except Exception:                                 # noqa: BLE001
+                _ALIGNER = WhisperModel(ALIGN_MODEL, device="cpu",
+                                        compute_type="int8")
+        return _ALIGNER
+
+
+def _align_key(token: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(token).lower())
+
+
+def _spread(times: list[Any], script: Sequence[str], first: int, stop: int,
+            start: float, end: float) -> None:
+    """Lays script[first:stop] across start..end, weighted by length."""
+    if stop <= first:
+        return
+    end = max(end, start + 0.05 * (stop - first))
+    weights = [float(len(script[k].strip(_ALIGN_PUNCT)) + 1) for k in range(first, stop)]
+    total = sum(weights) or 1.0
+    cursor = start
+    for offset, weight in enumerate(weights):
+        share = (end - start) * weight / total
+        times[first + offset] = (cursor, cursor + share)
+        cursor += share
+
+
+def align_word_timings(audio_path: str, text: str) -> list[dict[str, Any]]:
+    """
+    Per-word timings for `text`, measured from the audio.
+
+    The recogniser's words are matched back onto the script's own, so the
+    captions keep the script's spelling and punctuation while taking their
+    times from what was actually said. Where the two disagree -- "eighty-eight
+    percent" heard as "88%" -- the script's words share the time the
+    recogniser gave that stretch. Script words it did not hear at all share
+    the gap between their neighbours. Each word also carries `raw`, the
+    script's token with its punctuation, which is what the caption phrasing
+    breaks on.
+
+    Raises when the model cannot run; timed_words() is the caller that falls
+    back.
+    """
+    script = [token for token in (text or "").split() if token.strip()]
+    if not script:
+        return []
+
+    samples = _load_mono(audio_path, 16000)
+    segments, _ = _aligner().transcribe(
+        samples, language="en", word_timestamps=True, beam_size=5,
+        condition_on_previous_text=False)
+    heard = [(str(word.word).strip(), float(word.start), float(word.end))
+             for segment in segments for word in (segment.words or [])]
+    if not heard:
+        raise RuntimeError("the recogniser heard no words")
+
+    times: list[Any] = [None] * len(script)
+    matcher = difflib.SequenceMatcher(
+        a=[_align_key(token) for token in script],
+        b=[_align_key(item[0]) for item in heard], autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for k in range(i2 - i1):
+                times[i1 + k] = (heard[j1 + k][1], heard[j1 + k][2])
+        elif tag == "replace":
+            _spread(times, script, i1, i2, heard[j1][1], heard[j2 - 1][2])
+
+    index = 0
+    while index < len(script):
+        if times[index] is not None:
+            index += 1
+            continue
+        stop = index
+        while stop < len(script) and times[stop] is None:
+            stop += 1
+        low = times[index - 1][1] if index else 0.0
+        high = times[stop][0] if stop < len(script) else max(low, heard[-1][2])
+        _spread(times, script, index, stop, low, high)
+        index = stop
+
+    # The recogniser hands the silence before a word to that word: on the
+    # benchmark, "On" after a full stop started 0.85s early -- the whole pause
+    # -- where every other word was within 0.22s. A start that falls in a gap
+    # the energy detector calls silent is moved to where the voice resumes.
+    #
+    # It also happens the other way. On a delivered render the voice resumed
+    # 0.28-0.46s before the recogniser's start for the next word, three times
+    # in 75 seconds -- a caption arriving after the voice it belongs to. So a
+    # start that lands inside speech is moved back to where that speech began,
+    # when a real pause sits between it and the word before.
+    regions = _speech_regions(samples, 16000, min_gap=0.18)
+    pauses = [(regions[k][1], regions[k + 1][0]) for k in range(len(regions) - 1)
+              if regions[k + 1][0] - regions[k][1] >= 0.2]
+
+    def onset(start: float, end: float, previous: float) -> float:
+        for region_start, region_end in regions:
+            if region_start <= start < region_end:
+                break
+            if start < region_start < end:
+                return region_start
+        resumed = [after for before, after in pauses
+                   if previous < before and after < start and start - after < 0.8]
+        return resumed[-1] if resumed else start
+
+    # A mismatched stretch can hand a word a time before its predecessor's.
+    # Captions have to move forward, so the order is enforced.
+    words: list[dict[str, Any]] = []
+    floor = 0.0
+    previous = -1.0
+    for token, (start, end) in zip(script, times):
+        raw_start = float(start)
+        start = max(onset(raw_start, float(end), previous), floor)
+        previous = raw_start
+        end = max(float(end), start + 0.02)
+        floor = start
+        words.append({"start": round(start, 3), "end": round(end, 3),
+                      "text": token.strip(_ALIGN_PUNCT) or token, "raw": token})
+    return words
+
+
+def timed_words(audio_path: str, text: str) -> tuple[list[dict[str, Any]], str]:
+    """
+    (word timings, "measured" | "estimated") for a take with no timings.
+
+    Measured when the speech model runs, estimated when it cannot -- a missing
+    model is a less accurate caption, never a failed render.
+    """
+    try:
+        return align_word_timings(audio_path, text), "measured"
+    except Exception as exc:                                  # noqa: BLE001
+        print(f"Warning: word alignment unavailable ({type(exc).__name__}: "
+              f"{str(exc)[:120]}); captions will use estimated timings.")
+        return estimate_word_timings(audio_path, text), "estimated"
 
 
 def synthesize_gemini(
@@ -835,14 +1005,18 @@ def synthesize_gemini(
                 continue
 
             _pcm16_to_wav(pcm, output_path)
+            words, source = timed_words(output_path, text)
             return {
                 "path": output_path,
                 "duration": len(pcm) / 2.0 / GEMINI_TTS_RATE,
-                "words": estimate_word_timings(output_path, text),
+                "words": words,
                 "provider": "gemini",
                 "voice": voice,
                 "model": model,
-                "timings_exact": False,
+                # Not "exact" in edge-tts's sense -- measured from the audio,
+                # to within about a tenth of a second on 95% of words.
+                "timings_exact": source == "measured",
+                "timing_source": source,
             }
         except Exception as exc:
             errors.append(f"{model}: {type(exc).__name__}: {str(exc)[:140]}")
@@ -884,6 +1058,7 @@ def synthesize_narration(
         "voice": voice or DEFAULT_VOICE,
         "model": "edge-tts",
         "timings_exact": True,
+        "timing_source": "exact",
     }
 
 

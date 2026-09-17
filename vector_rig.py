@@ -383,4 +383,9 @@ def draw_figure(surface: Surface, pose: str = "idle", phase: float = 0.0,
     """Poses and strokes in one call; returns the skeleton for hanging props."""
     skeleton = build_skeleton(pose, phase, anchor, height, facing)
     draw_skeleton(surface, skeleton, colour, weight, filled_head)
+    # A surface that keeps a record of what it drew gets told about the
+    # figure, so layout checks can measure labels against it.
+    recorder = getattr(surface, "record_figure", None)
+    if callable(recorder):
+        recorder(skeleton)
     return skeleton

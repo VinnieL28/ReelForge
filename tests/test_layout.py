@@ -235,3 +235,45 @@ class TestTitlesNeverShareAFrame:
                        / (1.0 - me.TRANSITION_BLACK_AT))
             assert scene == 0.0 or card == 0.0, (
                 f"at {t:.2f}s the scene is at {scene:.2f} and the card at {card:.2f}")
+
+
+class TestNoLabelIsDrawnAcrossAFigure:
+    """
+    The second kind of overlap the reviews named: "labels overlap figures",
+    and later "on the staircase scene, a label overlaps the stick figure".
+
+    Measured the same way as text on text -- against what the frame drew, via
+    the figure boxes vector_rig reports -- with a realistic long label in every
+    slot, because the short template defaults were never the problem. Five
+    templates failed when this was first run: the mirror's gap label, the
+    iceberg's peak label, the growth scene's input caption, and every stage
+    and checkpoint label on the two climbing scenes.
+    """
+
+    LONG = "ACTIVE 88 PERCENT"
+
+    def test_the_rig_reports_what_it_drew(self):
+        import vector_rig as rig
+
+        frame = me.Frame()
+        rig.draw_figure(frame, "idle", anchor=(540, 1200), height=300)
+        assert len(frame.figure_boxes) == 1
+        x0, y0, x1, y1 = frame.figure_boxes[0]
+        assert x0 < 540 < x1 and y0 < 1000 < y1
+
+    @pytest.mark.parametrize("template", me.METAPHOR_TYPES)
+    def test_across_the_whole_act(self, template):
+        slots = me.LABEL_SLOTS.get(template, {})
+        act = me.normalise_act({"template": template, **COPY,
+                                "labels": {slot: self.LONG for slot in slots}})
+        act.update({"seconds": ACT_SECONDS, "start": 0.0,
+                    "climax": ACT_SECONDS * 0.75})
+        for step in range(1, SAMPLES + 1):
+            t = step * ACT_SECONDS / SAMPLES
+            frame = me.Frame()
+            me.TEMPLATES[template]["fn"](frame, t, act, ACT_SECONDS)
+            for body, x0, y0, x1, y1, _ in frame.text_boxes:
+                for figure in frame.figure_boxes:
+                    assert not me.text_boxes_overlap((x0, y0, x1, y1), figure), (
+                        f"{template} at t={t:.1f}s drew {body!r} across a figure "
+                        f"at {tuple(round(v) for v in figure)}")

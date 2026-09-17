@@ -6812,8 +6812,14 @@ def _magic_minimalist(prompt: str, ctx: dict[str, Any], report: Report) -> dict[
         "script": str(spec.get("thesis") or concept),
         "magic_prompt": prompt,
     })
+    # The engine's own result rides along for the render checks. It used to be
+    # dropped here, so on the Dashboard the checks panel only ever saw the
+    # runtime -- the label, caption, frame-rate and loudness checks it exists
+    # for had nothing to read.
     return {"path": out_path, "duration": float(result["duration"]),
-            "script": str(spec.get("thesis") or concept), "entry": entry}
+            "script": str(spec.get("thesis") or concept), "entry": entry,
+            "render": {key: value for key, value in result.items()
+                       if key != "output_path"}}
 
 
 def _magic_duel(prompt: str, ctx: dict[str, Any], report: Report) -> dict[str, Any]:
@@ -7003,6 +7009,7 @@ def start_magic_job(prompt: str, style_key: str,
                 "duration": float(result.get("duration") or 0.0),
                 "script": str(result.get("script") or ""),
                 "entry": result.get("entry") or {},
+                "render": result.get("render") or {},
             })
         except Exception as exc:                              # noqa: BLE001
             job.fail(exc)

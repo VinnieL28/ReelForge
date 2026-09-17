@@ -710,41 +710,88 @@ class TestMonetizableLength:
         # that nobody scrolls before the payoff.
         assert gemini_engine.SCENE_MAX_SECONDS <= 70
 
-    def test_the_word_budget_plus_the_closing_card_fills_that_runtime(self):
+    def test_the_word_budget_plus_the_spoken_close_fills_that_runtime(self):
         """
-        This used to require the narration alone to cover the minimum runtime,
-        which was right while the tail after the last spoken word was 1.6
-        seconds. It is CLOSING_SECONDS + 0.4 now -- the card was coming up four
-        seconds before the narration finished and wiping the last act's
-        geometry mid-argument -- and six seconds of held payoff is runtime the
-        script does not have to write words for.
+        The tail after the argument is the payoff, read aloud over the card,
+        plus SPOKEN_CLOSE_HOLD. It used to be CLOSING_SECONDS + 0.4 of silence,
+        which a review of a delivered file called out -- "the last ~6 seconds
+        are silent" -- so the budget came down by the seconds that stopped
+        being dead air.
         """
         import gemini_engine as ge
         import minimalist_engine as me
 
         rate = ge.SCENE_WORDS_PER_SECOND
-        tail = me.CLOSING_SECONDS + 0.4
+        tail = 5 / rate + me.SPOKEN_CLOSE_HOLD          # a five-word payoff
 
         assert ge.SCENE_MIN_WORDS / rate + tail >= ge.SCENE_MIN_SECONDS, (
             f"{ge.SCENE_MIN_WORDS} words speaks for "
-            f"{ge.SCENE_MIN_WORDS / rate:.0f}s and the card adds {tail:.0f}s, "
+            f"{ge.SCENE_MIN_WORDS / rate:.0f}s and the close adds {tail:.1f}s, "
             f"which is under the {ge.SCENE_MIN_SECONDS:.0f}s band")
 
-    def test_the_budget_clears_the_payout_floor_at_either_measured_rate(self):
+    def test_the_shortest_script_pays_even_when_the_voice_hurries(self):
         """
-        The rate is a centre between two delivered renders (2.176 and 2.033
-        w/s), not a constant the voice honours. What has to hold is that the
-        budget clears sixty seconds at BOTH ends of that spread, because a
-        render that lands at 59 earns nothing.
+        The rate is a centre, not a constant the voice honours, so the floor
+        has to hold at the FAST end of its spread: a render that lands at 59
+        seconds earns nothing.
+
+        This used to carry its own literal (2.033 w/s) and kept passing after
+        the voice instruction changed underneath it -- the figure belonged to
+        the old unhurried delivery. It reads the spread now.
         """
         import gemini_engine as ge
         import minimalist_engine as me
 
-        tail = me.CLOSING_SECONDS + 0.4
-        for measured in (2.033, 2.176):
-            shortest = ge.SCENE_MIN_WORDS / measured + tail
-            assert shortest > compliance.TIKTOK_REWARDS_MIN_SECONDS, (
-                f"at {measured} w/s the shortest render is {shortest:.1f}s")
+        _, fast = ge.scene_rate_bounds()
+        shortest = (ge.SCENE_MIN_WORDS + 5) / fast + me.SPOKEN_CLOSE_HOLD
+        assert shortest > compliance.TIKTOK_REWARDS_MIN_SECONDS, (
+            f"at {fast:.2f} w/s the shortest render is {shortest:.1f}s")
+
+    def test_the_longest_script_stays_watchable_when_the_voice_dawdles(self):
+        """
+        And the ceiling has to hold at the SLOW end. 74.3s was called long by
+        both reviews of the render that produced it, and six of those seconds
+        were a silent card.
+        """
+        import gemini_engine as ge
+        import minimalist_engine as me
+
+        slow, _ = ge.scene_rate_bounds()
+        longest = (ge.SCENE_MAX_WORDS + 5) / slow + me.SPOKEN_CLOSE_HOLD
+        assert longest < 73.0, f"{longest:.1f}s at {slow:.2f} w/s"
+
+    def test_the_band_is_wide_enough_to_write_inside(self):
+        """
+        A four-word band is not a spec, it is a coin toss -- and this one
+        caught exactly that: pinning the minimum so a fast read never needs
+        padding left 153-157. Every budget so far has been overshot anyway
+        (138-150 produced 164 words, 140-148 produced 151).
+        """
+        import gemini_engine as ge
+
+        assert ge.SCENE_MAX_WORDS - ge.SCENE_MIN_WORDS >= 5
+
+    def test_a_fast_read_is_padded_by_a_beat_not_by_dead_air(self):
+        """
+        The minimum gives way to the band, so a fast read can finish under the
+        payout floor and be held to it. What must not come back is the six
+        silent seconds a review called out: the card is held anyway, and this
+        bounds how much longer.
+        """
+        import gemini_engine as ge
+        import minimalist_engine as me
+
+        _, fast = ge.scene_rate_bounds()
+        shortest = (ge.SCENE_MIN_WORDS + 5) / fast + me.SPOKEN_CLOSE_HOLD
+        padding = max(0.0, me.PAYOUT_FLOOR_SECONDS - shortest)
+        assert padding <= 2.5, f"{padding:.1f}s of silent card at {fast:.2f} w/s"
+
+    def test_the_spread_is_not_wishful(self):
+        """Measured takes ranged 1.90-2.18 on one instruction, which is +-7%
+        of their centre. Narrowing this is how the floor gets breached."""
+        import gemini_engine as ge
+
+        assert ge.SCENE_RATE_SPREAD >= 0.07
 
     def test_there_is_a_floor_under_it_regardless(self):
         """Belt and braces, and the braces are what caught the 56.29s render:

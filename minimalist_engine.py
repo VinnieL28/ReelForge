@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import shutil
 import threading
 import time
@@ -35,6 +36,7 @@ import vector_rig as rig
 from paths import resolve_font
 from video_engine import (_SCRATCH_RENDERS, DELIVERY_SAMPLE_RATE,
                           burn_ass_subtitles, normalise_loudness,
+                          spoken_numbers_as_figures,
                           purge_scratch_renders, video_encoder, write_ass_file,
                           write_clip)
 
@@ -386,6 +388,15 @@ def mix(colour: tuple[int, int, int], amount: float) -> tuple[int, int, int]:
 # The frame
 # ---------------------------------------------------------------------------
 
+def _align_offset(align: str, width: float) -> float:
+    """How far a line's centre sits from its anchor x, for an alignment."""
+    if align == "left":
+        return width / 2.0
+    if align == "right":
+        return -width / 2.0
+    return 0.0
+
+
 class Frame:
     """
     One supersampled drawing surface, in 1080x1920 coordinates.
@@ -508,6 +519,29 @@ class Frame:
     def text_boxes(self) -> list[tuple[str, float, float, float, float, int]]:
         return list(self._text_boxes or ())
 
+    # Every stick figure drawn, as (x0, y0, x1, y1). vector_rig reports each one
+    # through record_figure, so a label drawn across a figure's chest -- the
+    # comparison tiers did exactly that -- can be caught by measurement rather
+    # than by someone watching the render.
+    _figure_boxes: list[tuple[float, float, float, float]] | None = None
+
+    @property
+    def figure_boxes(self) -> list[tuple[float, float, float, float]]:
+        return list(self._figure_boxes or ())
+
+    def record_figure(self, skeleton: Any) -> None:
+        points = [getattr(skeleton, name) for name in (
+            "head", "neck", "chest", "hip", "shoulder_l", "elbow_l", "hand_l",
+            "shoulder_r", "elbow_r", "hand_r", "knee_l", "foot_l", "knee_r",
+            "foot_r")]
+        pad = float(getattr(skeleton, "head_radius", 0.0))
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        if self._figure_boxes is None:
+            self._figure_boxes = []
+        self._figure_boxes.append((min(xs) - pad * 0.5, min(ys) - pad,
+                                   max(xs) + pad * 0.5, max(ys) + pad * 0.3))
+
     def _record_text(self, body: str, centre_x: float, y: float,
                      advance: float, size: float) -> None:
         """Files one drawn line's ink box. Ink, not advance: see _INK_OVER_ADVANCE."""
@@ -549,8 +583,15 @@ class Frame:
 
     def text(self, body: str, centre: tuple[float, float], size: int = 56,
              colour: tuple[int, int, int] = WHITE, weight: str = "bold",
-             anchor: str = "mm", tracking: float = 0.0, clamp_safe: bool = True) -> None:
-        """Draws one line. `tracking` spaces the letters, which reads as premium."""
+             anchor: str = "mm", tracking: float = 0.0, clamp_safe: bool = True,
+             align: str = "center") -> None:
+        """
+        Draws one line. `tracking` spaces the letters, which reads as premium.
+
+        `align="left"` makes `centre[0]` the left edge instead of the middle,
+        and `"right"` the right edge, for a label that has to stay clear of
+        something beside it however long the model made it.
+        """
         if not body:
             return
         s = self.ss
@@ -562,8 +603,9 @@ class Frame:
 
         if tracking <= 0:
             width = float(self.draw.textlength(body, font=font))
-            x = (self.safe_x(centre[0], width * _INK_OVER_ADVANCE / s)
-                 if clamp_safe else centre[0])
+            wanted_x = centre[0] + _align_offset(align, width / s)
+            x = (self.safe_x(wanted_x, width * _INK_OVER_ADVANCE / s)
+                 if clamp_safe else wanted_x)
             self.draw.text((x * s, y * s), body, font=font,
                            fill=colour, anchor=anchor)
             self._record_text(body, x, y, width / s, size)
@@ -572,8 +614,9 @@ class Frame:
         gap = tracking * s
         widths = [self.draw.textlength(ch, font=font) for ch in body]
         total = sum(widths) + gap * (len(body) - 1)
-        centre_x = (self.safe_x(centre[0], total * _INK_OVER_ADVANCE / s)
-                    if clamp_safe else centre[0])
+        wanted_x = centre[0] + _align_offset(align, total / s)
+        centre_x = (self.safe_x(wanted_x, total * _INK_OVER_ADVANCE / s)
+                    if clamp_safe else wanted_x)
         x = centre_x * s - total / 2
         self._record_text(body, centre_x, y, total / s, size)
         for ch, w in zip(body, widths):
@@ -582,8 +625,15 @@ class Frame:
 
     def wrapped(self, body: str, centre: tuple[float, float], size: int = 44,
                 colour: tuple[int, int, int] = WHITE, weight: str = "light",
-                max_width: float = 860.0, leading: float = 1.28) -> None:
-        """Centre-wraps a sentence around `centre`."""
+                max_width: float = 860.0, leading: float = 1.28,
+                tracking: float = 0.0) -> None:
+        """
+        Centre-wraps a sentence around `centre`.
+
+        `tracking` spaces the letters as text() does, and is counted when the
+        lines are measured -- otherwise a tracked line breaks late and runs
+        past `max_width`.
+        """
         if not body:
             return
         if not self.reserved and self.annotation_alpha < 1.0:
@@ -594,9 +644,13 @@ class Frame:
 
         lines: list[str] = []
         current = ""
+        def measured(line: str) -> float:
+            return (self.draw.textlength(line, font=font)
+                    + tracking * self.ss * max(0, len(line) - 1))
+
         for word in body.split():
             trial = f"{current} {word}".strip()
-            if self.draw.textlength(trial, font=font) <= limit or not current:
+            if measured(trial) <= limit or not current:
                 current = trial
             else:
                 lines.append(current)
@@ -617,7 +671,7 @@ class Frame:
         try:
             for i, line in enumerate(lines):
                 self.text(line, (centre[0], top + i * step), size, colour, weight,
-                          clamp_safe=False)
+                          clamp_safe=False, tracking=tracking)
         finally:
             self._hold_group = False
 
@@ -845,6 +899,47 @@ def missing_label_slots(template: str, labels: Any) -> list[str]:
             if not str(given.get(slot) or "").strip()]
 
 
+# Spelled-out quantities as a label shows them. "ACTIVE 88 PERCENT" is
+# seventeen characters and was cut to "ACTIVE 88 PERCEN"; "ACTIVE 88%" is ten.
+_LABEL_SHORTHAND: tuple[tuple[str, str], ...] = (
+    (r"(\d)\s*(?:PER\s*CENT(?:AGE)?)\b", r"\1%"),
+    (r"(\d)\s*BASIS\s+POINTS?\b", r"\1 BPS"),
+    (r"(\d)\s*THOUSAND\b", r"\1K"),
+    (r"(\d)\s*MILLION\b", r"\1M"),
+    (r"(\d)\s*BILLION\b", r"\1B"),
+    (r"(\d[\d,.]*[KMB]?)\s*DOLLARS?\b", r"$\1"),
+)
+
+
+def fit_label(value: str, limit: int = LABEL_MAX_CHARS) -> tuple[str, bool]:
+    """
+    A label as it will be drawn, and whether anything had to be dropped.
+
+    Shorthand first, then whole words off the end -- never a cut through a
+    word. A single word longer than the limit is the one case that still has
+    to be cut, because an empty label would say less than a shortened one.
+    """
+    # Spoken numbers first -- "THREE BASIS POINTS" is the same figure as
+    # "3 BASIS POINTS", and only the second one has shorthand.
+    words = [{"text": token, "raw": token, "start": 0.0, "end": 0.0}
+             for token in str(value or "").split()]
+    text = " ".join(str(word["text"]) for word in spoken_numbers_as_figures(words))
+    text = " ".join(text.upper().split())
+    for pattern, replacement in _LABEL_SHORTHAND:
+        text = re.sub(pattern, replacement, text)
+    if len(text) <= limit:
+        return text, False
+
+    kept: list[str] = []
+    for word in text.split():
+        if len(" ".join(kept + [word])) > limit:
+            break
+        kept.append(word)
+    if not kept:
+        return text[:limit], True
+    return " ".join(kept), True
+
+
 def label(spec: dict[str, Any], slot: str, fallback: str = "",
           wrap: bool = False) -> str:
     """
@@ -863,15 +958,15 @@ def label(spec: dict[str, Any], slot: str, fallback: str = "",
     if isinstance(supplied, dict):
         value = str(supplied.get(slot) or "").strip()
         if value:
-            return value.upper()[:limit]
+            return fit_label(value, limit)[0]
 
     if spec.get("planned"):
-        return (fallback or "").upper()[:limit]
+        return fit_label(fallback or "", limit)[0]
     # The caller's fallback wins over the template's placeholder. It used to
     # be the other way around, so scene_vessel asking for "YEAR" on a
     # thirty-year axis still got the template's "DAY".
     defaults = LABEL_SLOTS.get(str(spec.get("template") or ""), {})
-    return (fallback or defaults.get(slot, "")).upper()[:limit]
+    return fit_label(fallback or defaults.get(slot, ""), limit)[0]
 
 
 def draw_ambient(frame: Frame, t: float, phases: Phases, spec: dict[str, Any]) -> None:
@@ -935,6 +1030,11 @@ _EASY_CONTROL = [(120, 1020), (330, 1010), (520, 1015), (680, 1040),
                  (820, 1280), (900, 1480), (960, 1510)]
 
 
+# Over the flat stretch of the easy path (y~1010 from x=330 to 680), clear of
+# the steep path's down-stroke (x~150 at this height) and up-stroke (x~700).
+_EASY_LABEL = (430.0, 966.0)
+
+
 def _spikes(frame: Frame, x0: float, x1: float, base: float, height: float,
             count: int, colour: tuple[int, int, int]) -> None:
     step = (x1 - x0) / max(count, 1)
@@ -982,8 +1082,12 @@ def scene_curve(frame: Frame, t: float, spec: dict[str, Any], duration: float) -
     if u > 0.66:
         frame.text(label(spec, "far"), (760, 690), 46,
                    mix(WHITE, fade(t, lead + span * 0.66, 0.5)), tracking=3)
+    # Directly above the flat grey path it names, between the two strokes of
+    # the steep one. It sat at (312, 906) -- where the bright path begins --
+    # so the white stroke ran through its first character and the reviewer of
+    # a fees video read the fee as the curve that climbs.
     if easy_u > 0.78:
-        frame.text(label(spec, "easy"), (312, 906), 36,
+        frame.text(label(spec, "easy"), (_EASY_LABEL[0], _EASY_LABEL[1]), 36,
                    mix(GREY, fade(t, lead + span * 0.64, 0.5)), tracking=3)
 
 
@@ -1135,7 +1239,13 @@ def scene_vessel(frame: Frame, t: float, spec: dict[str, Any], duration: float) 
     # line, so the clamp lifted them to within 21px of each other and drew 38px
     # type through 62px type. Above the glass it is also never on the fill,
     # which is what made it vanish once the white reached it.
-    unit = label(spec, "unit", fallback=_AXIS_UNITS.get(axis_suffix.lower(), "DAY"))
+    # The line under the readout is where on the axis the level is, so it is
+    # counted in the axis's own unit. It used to prefer the free-text "unit"
+    # slot, and a model that filled that with the readout's unit put "74%"
+    # over "PERCENT 21" beside an axis marked in years. The slot still names
+    # the counter when the axis has no time unit -- reps, pages, sessions.
+    unit = (_AXIS_UNITS.get(axis_suffix.lower())
+            or label(spec, "unit", fallback="STEP"))
     # 96px apart, not 66. The ink of a 66px line reaches 56px either side of
     # its anchor and a 30px line reaches 26, so anything closer than 82px
     # between centres overlaps -- and at 66 apart these two were drawn through
@@ -1151,7 +1261,15 @@ def scene_vessel(frame: Frame, t: float, spec: dict[str, Any], duration: float) 
 # ---------------------------------------------------------------------------
 
 _STEPS = 6
-_STAIR_BOX = (110.0, 780.0, 900.0, 1420.0)
+# Raised clear of the caption band (1334-1466). The box ran to 1420 and the
+# bars under it to 1560, so their captions were hoisted by the safe clamp into
+# the bottom steps, and the stair line ran through "RETAIN GAINS".
+#
+# The top is 700, not higher: the figure stands up on the top tread at the end
+# and its head reached the end of the subtitle at 640.
+_STAIR_BOX = (110.0, 700.0, 900.0, 1150.0)
+_STAIR_BARS = (1275.0, 95.0)                     # base, height
+_STAIR_PHASE_Y = 560.0
 
 
 def _stair_points() -> list[tuple[float, float]]:
@@ -1204,7 +1322,10 @@ def scene_staircase(frame: Frame, t: float, spec: dict[str, Any], duration: floa
         bx, by = point_at(stairs, lengths, climb)
         frame.circle((bx, by - 34), 32, WHITE)
         _stick_figure(frame, (bx - 74, by), 1.0, GREY)
-        frame.text(label(spec, "before"), (frame.w / 2, 700), 40, mix(GREY, caption), tracking=4)
+        # Upper-left, where a rising staircase leaves room, and above the
+        # figure's head until it is well past the middle of the climb.
+        frame.text(label(spec, "before"), (SAFE_X[0], _STAIR_PHASE_Y), 38,
+                   mix(GREY, caption), tracking=4, align="left")
     else:
         # Over the top: the sphere runs away downhill and the figure stands up.
         roll = ease_in(clamp((u - 0.80) / 0.20))
@@ -1214,14 +1335,11 @@ def scene_staircase(frame: Frame, t: float, spec: dict[str, Any], duration: floa
         frame.line((top_x, top_y), (top_x + 130, top_y + 360), GREY, 6)
         frame.circle((bx, by), 32 + roll * 8, WHITE)
         _stick_figure(frame, (top_x - 96, top_y), 1.0, WHITE)
-        frame.text(label(spec, "after"), (frame.w / 2, 700), 46,
-                   mix(WHITE, fade(t, lead + span * 0.82, 0.5)), tracking=6)
+        frame.text(label(spec, "after"), (SAFE_X[0], _STAIR_PHASE_Y), 44,
+                   mix(WHITE, fade(t, lead + span * 0.82, 0.5)), tracking=6, align="left")
 
     # Effort is linear; reward is not. The crossing is the whole argument.
-    # The base sits 40px higher than it reads like it should: the payoff line
-    # now bottom-aligns inside the safe area at ~1626, and these captions used
-    # to be drawn straight through it.
-    base, height = 1560.0, 140.0
+    base, height = _STAIR_BARS
     for i, (caption, value, colour) in enumerate((
         (label(spec, "left"), clamp(u), GREY),
         (label(spec, "right"), clamp(u ** 3.2), WHITE),
@@ -1229,7 +1347,7 @@ def scene_staircase(frame: Frame, t: float, spec: dict[str, Any], duration: floa
         x = 220 + i * 640
         frame.line((x, base), (x, base - height), DIM, 5)
         frame.line((x, base), (x, base - height * value), colour, 11)
-        frame.text(caption, (x, base + 44), 26, colour, weight="light", tracking=3)
+        frame.text(caption, (x, base + 33), 24, colour, weight="light", tracking=3)
 
 
 # ---------------------------------------------------------------------------
@@ -1355,6 +1473,13 @@ _SCALE_PIVOT = (540.0, 880.0)
 _SCALE_ARM = 372.0
 _SCALE_MAX_TILT = 0.30              # radians
 _SCALE_STAND = 500.0                # pivot to floor
+
+# Where each pan's label may sit: the space either side of the stand, which
+# spreads to +-92px of the pivot at the floor and is narrower above it.
+_BALANCE_LABEL_LANES: dict[str, tuple[float, float]] = {
+    "left": (SAFE_X[0], _SCALE_PIVOT[0] - 110.0),
+    "right": (_SCALE_PIVOT[0] + 110.0, SAFE_X[1]),
+}
 _WEIGHT_W, _WEIGHT_H = 128.0, 34.0
 _WEIGHT_SLOTS = 5
 
@@ -1426,11 +1551,23 @@ def scene_balance(frame: Frame, t: float, spec: dict[str, Any], duration: float)
     _pan(frame, left, GREY, now_load)
     _pan(frame, right, WHITE, min(1.0, later_load))
 
+    # Each label stays on its own side of the stand, and wraps rather than
+    # spreading across it. They were centred on the pans, and the right pan
+    # sits near the frame edge, so the safe clamp pushed "LAGGING INDEX" left
+    # across both legs.
     won = ph.after(t, 0.7)
-    frame.text(label(spec, "left"), (left[0], left[1] + 132 + 54), 40,
-               mix(GREY, fade(t, ph.lead + 0.2, 0.5)), tracking=5)
-    frame.text(label(spec, "right"), (right[0], right[1] + 132 + 54), 44,
-               mix(WHITE, fade(t, ph.lead + 0.6, 0.5) * (0.5 + 0.5 * won)), tracking=5)
+    for pan, slot, size, colour in (
+        (left, "left", 36, mix(GREY, fade(t, ph.lead + 0.2, 0.5))),
+        (right, "right", 38, mix(WHITE, fade(t, ph.lead + 0.6, 0.5) * (0.5 + 0.5 * won))),
+    ):
+        text = label(spec, slot)
+        if not text:
+            continue
+        lo, hi = _BALANCE_LABEL_LANES[slot]
+        half = (hi - lo) / 2.0
+        x = min(max(pan[0], lo + half), hi - half)
+        frame.wrapped(text, (x, pan[1] + 132 + 54), size, colour, weight="bold",
+                      max_width=hi - lo, leading=1.12, tracking=5)
 
 
 # ---------------------------------------------------------------------------
@@ -1625,6 +1762,7 @@ _TIERS = (
     (1420.0, "flexing", "tier3", 1.00),
 )
 _TIER_FIGURE_H = 200.0
+_TIER_LABEL_X = 360.0            # the track's left end
 
 
 def scene_comparison(frame: Frame, t: float, spec: dict[str, Any], duration: float) -> None:
@@ -1653,8 +1791,12 @@ def scene_comparison(frame: Frame, t: float, spec: dict[str, Any], duration: flo
         fill = reach * (ease_out_cubic(progress) if best else ease_in_out(progress))
         _track(frame, 360, 950, floor - 46, fill, colour)
 
-        frame.text(label(spec, slot), (380, floor - 122), 32,
-                   mix(WHITE if best else GREY, alpha), tracking=4)
+        # Left-aligned at the track's own start, so a long tier name grows to
+        # the right and never back over the figure standing at x=210. It was
+        # centred at 380, which put the first half of "ACTIVE 88 PERCEN"
+        # across that figure's chest.
+        frame.text(label(spec, slot), (_TIER_LABEL_X, floor - 122), 32,
+                   mix(WHITE if best else GREY, alpha), tracking=4, align="left")
         if best and ph.after(t, 0.5) > 0:
             frame.text("100%", (930, floor - 122), 30,
                        mix(WHITE, ph.after(t, 0.5)), tracking=3)
@@ -1664,6 +1806,8 @@ def scene_comparison(frame: Frame, t: float, spec: dict[str, Any], duration: flo
 
 _CLIMB_STEPS = 5
 _CLIMB_BOX = (150.0, 940.0, 640.0, 1420.0)      # left, right, top, floor
+# Above the climber's head on the third step (~724) and left of it.
+_CLIMB_CAPTION_Y = 680.0
 
 
 def _climb_points() -> list[tuple[float, float]]:
@@ -1717,17 +1861,23 @@ def scene_climb(frame: Frame, t: float, spec: dict[str, Any], duration: float) -
     frame.polyline(steps, DIM, 6)
     frame.polyline(slice_to(steps, lengths, reveal), WHITE, 7)
 
-    # Stage labels on each tread, lighting as the figure passes them.
+    # The stage the figure is on, named once, in the empty upper-left.
+    #
+    # There used to be a label on every tread. Five sixteen-character labels
+    # do not fit on 158px treads beside a 210px climber: each one ran back
+    # over the step below, where the figure was standing. One caption that
+    # changes as the figure climbs is also the easier read on a phone.
     walk = ph.travel(t, ease_in_out)
     reached = walk * _CLIMB_STEPS
     slots = ("stage1", "stage2", "stage3", "stage4", "stage5")
-    for i in range(_CLIMB_STEPS):
-        text = label(spec, slots[i])
-        if not text:
-            continue
-        lit = clamp(reached - i)
-        frame.text(text, (left + i * run + run / 2, floor - i * rise - 42),
-                   28, mix(WHITE if lit > 0.5 else DIM, 0.35 + 0.65 * lit), tracking=3)
+    arrived = ph.after(t, 0.5) > 0.4
+    stage = min(_CLIMB_STEPS - 1, int(reached))
+    stage_text = label(spec, slots[stage])
+    if stage_text and not arrived:
+        settle = clamp((reached - stage) / 0.15) if stage else 1.0
+        frame.text(stage_text, (left, _CLIMB_CAPTION_Y), 34,
+                   mix(WHITE, fade(t, ph.lead, 0.5) * (0.35 + 0.65 * settle)),
+                   tracking=5, align="left")
 
     # The prize on the top tread, lighting as the climb closes on it.
     _trophy(frame, (right + 40, top), 86,
@@ -1742,7 +1892,7 @@ def scene_climb(frame: Frame, t: float, spec: dict[str, Any], duration: float) -
                     height=210, colour=WHITE, weight=6.0)
 
     # At the top: the pose changes to say arrival.
-    if ph.after(t, 0.5) > 0.4:
+    if arrived:
         # The upper-left is the empty quadrant of a rising staircase, and the
         # figure finishes on the top tread at the right -- so the summit label
         # goes left, not above it.
@@ -1759,6 +1909,7 @@ def scene_climb(frame: Frame, t: float, spec: dict[str, Any], duration: float) -
 # either the scene or the clamp having to know about the other.
 _MIRROR_FLOOR = 1250.0
 _MIRROR_CAPTION_Y = _MIRROR_FLOOR + 46.0
+_MIRROR_GAP_Y = 880.0            # above the real figure's head (~930)
 _MIRROR_BOX = (560.0, 560.0, 960.0, _MIRROR_FLOOR)   # left, top, right, bottom
 
 
@@ -1799,11 +1950,20 @@ def scene_mirror(frame: Frame, t: float, spec: dict[str, Any], duration: float) 
 
     # The gap between them, stated at the beat. Above the two captions rather
     # than level with the knees.
+    #
+    # Above the real figure's head, not level with its body: there is only
+    # 190px between the figure and the mirror, and a sixteen-character label is
+    # wider than that, so at waist height it ran across the figure's arm. The
+    # rule sits at the real head's height, which is also the point -- the
+    # reflection stands taller than it.
     gap = ph.after(t, 0.8)
     if gap > 0:
-        frame.line((380, 1030), (left - 30, 1030), mix(WHITE, gap * 0.7), 4)
-        frame.text(label(spec, "gap"), ((380 + left) / 2, 986), 30,
-                   mix(WHITE, gap), tracking=4)
+        frame.line((380, _MIRROR_GAP_Y + 38), (left - 30, _MIRROR_GAP_Y + 38),
+                   mix(WHITE, gap * 0.7), 4)
+        # Right-aligned short of the mirror: the reflection flexes, and its
+        # arm reaches past the frame to x~574.
+        frame.text(label(spec, "gap"), (left - 12, _MIRROR_GAP_Y), 30,
+                   mix(WHITE, gap), tracking=4, align="right")
 
 
 # --- 4. The Chain & Anchor --------------------------------------------------
@@ -1897,7 +2057,12 @@ def scene_chains(frame: Frame, t: float, spec: dict[str, Any], duration: float) 
 
 # --- 5. Growth & Consistency ------------------------------------------------
 
-_PLANT_ROOT = (700.0, 1380.0)
+# The floor was 1380, and the captions under it were asked for at 1442 --
+# below the safe line, so the clamp hoisted "input" to ~1305, across the shins
+# of a figure standing at 1380. Same fault the mirror had, same fix: raise the
+# floor. The full-grown tree measures 600px, so its crown still clears the
+# subtitle.
+_PLANT_ROOT = (700.0, 1250.0)
 
 
 def _tree(frame: Frame, root: tuple[float, float], growth: float,
@@ -1987,10 +2152,10 @@ def scene_growth(frame: Frame, t: float, spec: dict[str, Any], duration: float) 
         if dy < floor:
             frame.circle((dx, dy), 6, mix(GREY, 1.0 - drop * 0.6))
 
-    frame.text(label(spec, "input"), (300, floor + 62), 30,
+    frame.text(label(spec, "input"), (300, floor + 46), 30,
                mix(GREY, fade(t, ph.lead + 0.4, 0.6)), tracking=4)
     if growth > 0.7:
-        frame.text(label(spec, "output"), (_PLANT_ROOT[0], floor + 62), 34,
+        frame.text(label(spec, "output"), (_PLANT_ROOT[0], floor + 46), 34,
                    mix(WHITE, clamp((growth - 0.7) / 0.25)), tracking=4)
 
 
@@ -2006,6 +2171,8 @@ _SLOPE = (110.0, 1430.0, 960.0, 700.0)      # base x/y, summit x/y
 _BOULDER_R = 78.0
 _PUSHER_H = 300.0
 _CHECKPOINTS = 4
+# Above the pusher's head at mid-climb (~735) and left of it.
+_SISYPHUS_CAPTION_Y = 700.0
 
 
 def _boulder(frame: Frame, centre: tuple[float, float], radius: float,
@@ -2081,11 +2248,25 @@ def scene_sisyphus(frame: Frame, t: float, spec: dict[str, Any], duration: float
         frame.line((cx - math.cos(notch) * 22, cy + math.sin(notch) * 22),
                    (cx + math.cos(notch) * 22, cy - math.sin(notch) * 22),
                    WHITE if passed else DIM, 6)
-        text = label(spec, f"mark{i}")
+
+    # The checkpoint most recently passed, named once in the empty upper-left.
+    #
+    # Each mark used to carry its own label beside its notch, and the pusher
+    # walks the whole slope, so it walked through every one of them. Under the
+    # slope was tried next: the right-hand marks have no room there before the
+    # safe edge, and clamping them back stacked mark 3 on mark 4. One caption
+    # that changes as the stone climbs has neither problem -- same answer as
+    # the staircase.
+    arrived = ph.after(t, 0.6) > 0.3
+    passed_marks = [i for i in range(1, _CHECKPOINTS + 1)
+                    if position >= i / (_CHECKPOINTS + 1)]
+    if passed_marks and not arrived:
+        current = passed_marks[-1]
+        text = label(spec, f"mark{current}")
         if text:
-            frame.text(text, (cx + 30, cy - 54), 26,
-                       mix(WHITE if passed else DIM, 0.4 + 0.6 * clamp(position - share + 1)),
-                       tracking=2)
+            since = clamp((position - current / (_CHECKPOINTS + 1)) / 0.04)
+            frame.text(text, (SAFE_X[0], _SISYPHUS_CAPTION_Y), 30,
+                       mix(WHITE, 0.35 + 0.65 * since), tracking=4, align="left")
 
     # Stone and pusher.
     #
@@ -2106,9 +2287,11 @@ def scene_sisyphus(frame: Frame, t: float, spec: dict[str, Any], duration: float
     _boulder(frame, stone, _BOULDER_R, -position * 9.0, WHITE)
     _ = along
 
-    frame.text(label(spec, "slope"), (330, by + 74), 32,
-               mix(GREY, fade(t, ph.lead + 0.3, 0.6)), tracking=4)
-    if ph.after(t, 0.6) > 0.3:
+    # Bottom right, under the hill. At (330, by+74) the clamp lifted it into
+    # the pusher's starting position.
+    frame.text(label(spec, "slope"), (600, by - 130), 28,
+               mix(GREY, fade(t, ph.lead + 0.3, 0.6)), tracking=4, align="left")
+    if arrived:
         # Upper-left is the empty quadrant of a rising slope, and the stone
         # finishes at the top right.
         frame.text(label(spec, "summit"), (330, sy - 30), 40,
@@ -2175,7 +2358,11 @@ def scene_iceberg(frame: Frame, t: float, spec: dict[str, Any], duration: float)
     above = label(spec, "above")
     below = label(spec, "below", wrap=True)
     if above:
-        frame.text(above, (_BERG_X, _WATERLINE - 320), 40,
+        # Beside the peak, right-aligned short of it. Above it is the figure
+        # standing on the tip, and above that the subtitle -- centred at
+        # WATERLINE-320 the label was drawn straight through the figure.
+        frame.text(above, (_BERG_X - 70, _WATERLINE - 140), 34, align="right",
+                   colour=
                    mix(WHITE, fade(t, ph.lead + 0.2, 0.6)), tracking=4)
     if below and sink > 0.35:
         frame.wrapped(below, (_BERG_X, _WATERLINE + 300), 36,
@@ -2314,7 +2501,15 @@ TEMPLATES: dict[str, dict[str, Any]] = {
         "subtitle": "buys fifty years of comfort",
         "payoff": "Choose your hard.",
         "climax": 0.72,
-        "suits": "trade-offs, delayed reward, two ways to spend the same decade",
+        # Spelled out, because the shape has a direction the model was not
+        # being told about: the bright path is the one that WINS. A fees video
+        # labelled the grey path "1.5% FEE" and a reviewer, reasonably, read
+        # the climbing white curve as the fee.
+        "suits": "delayed reward: the BRIGHT steep path dips first and ends HIGH "
+                 "(the harder choice that wins), the GREY flat path cruises and "
+                 "ends on SPIKES (the comfortable choice that loses). 'easy' names "
+                 "the grey path; 'near' and 'far' are points in time on the bright "
+                 "one. Only use it when the comfortable option is the one that loses",
     },
     "compounding_jar": {
         "label": "② Compounding Skill Jar",
@@ -2325,7 +2520,9 @@ TEMPLATES: dict[str, dict[str, Any]] = {
         "subtitle": "every single day for a year",
         "payoff": "37x. That is the whole secret.",
         "climax": 0.88,
-        "suits": "compounding, habits, why early progress is invisible",
+        "suits": "compounding, habits, why early progress is invisible -- and, "
+                 "with direction \"drain\", a quantity compounding AWAY: fees, "
+                 "interest owed, attrition",
     },
     "staircase_progress": {
         "label": "③ Exponential Staircase",
@@ -2336,7 +2533,9 @@ TEMPLATES: dict[str, dict[str, Any]] = {
         "subtitle": "and the hill starts pushing back",
         "payoff": "Resistance becomes leverage.",
         "climax": 0.80,
-        "suits": "discipline, systems over motivation, slow steady effort",
+        "suits": "discipline, systems over motivation: effort ('left') rises "
+                 "in a straight line while reward ('right') stays flat and then "
+                 "shoots past it; 'before' and 'after' name the two phases",
     },
     "balance_scale": {
         "label": "④ Balance Scale",
@@ -2347,7 +2546,9 @@ TEMPLATES: dict[str, dict[str, Any]] = {
         "subtitle": "one of them keeps paying",
         "payoff": "The slow pan always wins.",
         "climax": 0.74,
-        "suits": "instant gratification, patience, choosing between two payoffs",
+        "suits": "instant gratification versus patience: the LEFT pan is the "
+                 "quick payoff that loads first, the RIGHT pan is the slow one "
+                 "that ends up heavier and wins. Put the recommended choice right",
     },
     "gravity_funnel": {
         "label": "⑤ Gravity Funnel",
@@ -2380,7 +2581,11 @@ TEMPLATES: dict[str, dict[str, Any]] = {
         "subtitle": "same hours, three outcomes",
         "payoff": "Effort is not the variable.",
         "climax": 0.80,
-        "suits": "comparing approaches, working hard versus working well, tiers of skill",
+        # Which row wins was never stated, and a fees video put "INDEX FUNDS"
+        # on the row that stalls and "92% FAIL" on the only one that finishes.
+        "suits": "three approaches ranked WORST to BEST: tier1 (top row) stalls, "
+                 "tier3 (bottom row, bright) is the only one that finishes. Put "
+                 "the approach the video recommends in tier3, never a failure",
     },
     "steep_staircase": {
         "label": "⑧ The Steep Staircase",
@@ -2457,7 +2662,9 @@ TEMPLATES: dict[str, dict[str, Any]] = {
         "subtitle": "both of them stay open",
         "payoff": "Walk through one of them.",
         "climax": 0.78,
-        "suits": "a decision, two futures, the cost of not choosing",
+        "suits": "a decision between two futures: the LEFT door is the "
+                 "comfortable one that dims, the RIGHT door lights up and opens -- "
+                 "the one the video recommends",
     },
     "custom": {
         "label": "⑮ Dynamic AI Scene",
@@ -2576,6 +2783,10 @@ def normalise_spec(raw: dict[str, Any] | None) -> dict[str, Any]:
         # What the closing card asks for. The model may write it; if it does
         # not, every video still ends on an ask rather than on a full stop.
         "cta": str(raw.get("cta") or DEFAULT_CTA).strip()[:40],
+        # Set by build_minimalist_video when the payoff is read aloud: the
+        # second the closing card starts coming up. 0 means "the last
+        # CLOSING_SECONDS", which is what a silent render still gets.
+        "closing_at": _positive(raw.get("closing_at")),
         "thesis": str(raw.get("thesis") or "").strip(),
         "duration": duration,
         "climax": climax,
@@ -2734,18 +2945,26 @@ ACT_OVERLAP = 0.7
 TRANSITION_BLACK_AT = 0.5
 
 
-def allocate_acts(spec: dict[str, Any], duration: float) -> list[dict[str, Any]]:
+def allocate_acts(spec: dict[str, Any], duration: float,
+                  starts: Sequence[float] | None = None) -> list[dict[str, Any]]:
     """
-    Gives each act its share of the runtime, proportional to the words it
-    carries.
+    Gives each act its share of the runtime.
 
-    Proportional to narration rather than equal thirds: an act whose thesis is
-    two sentences should not hold the screen as long as one with five, or the
-    picture and the voice drift apart over the course of the video.
+    With `starts` -- the measured second each act's narration begins -- every
+    act cuts in on its own first word, placed so the handover's black point
+    lands just before it. That is the picture following the voice rather than
+    a guess about it.
+
+    Without them, the share is proportional to the words each act carries:
+    an act whose thesis is two sentences should not hold the screen as long as
+    one with five.
     """
     acts = [dict(act) for act in (spec.get("acts") or [])]
     if not acts:
         return []
+
+    if starts is not None and len(starts) == len(acts):
+        return _acts_on_starts(acts, duration, [float(s) for s in starts])
 
     weights = [max(1, len(str(act.get("thesis") or "").split())) for act in acts]
     total_weight = float(sum(weights))
@@ -2776,6 +2995,59 @@ def allocate_acts(spec: dict[str, Any], duration: float) -> list[dict[str, Any]]
     for act in acts:
         act["over_cap"] = max(0.0, act["seconds"] - MAX_ACT_SECONDS)
     return acts
+
+
+# The shortest an act may be when placed on measured starts. Below this the
+# handover is most of the act.
+_MIN_MEASURED_ACT = 2.0
+
+
+def _acts_on_starts(acts: list[dict[str, Any]], duration: float,
+                    starts: list[float]) -> list[dict[str, Any]]:
+    """allocate_acts for measured narration: each act begins on its first word."""
+    lead = ACT_OVERLAP * TRANSITION_BLACK_AT
+    placed: list[float] = []
+    for index, spoken in enumerate(starts):
+        start = 0.0 if index == 0 else max(spoken - lead, 0.0)
+        if placed:
+            start = max(start, placed[-1] + _MIN_MEASURED_ACT)
+        placed.append(min(start, max(0.0, duration - _MIN_MEASURED_ACT)))
+
+    for index, act in enumerate(acts):
+        start = placed[index]
+        end = placed[index + 1] if index + 1 < len(acts) else duration
+        seconds = max(0.1, end - start)
+        act["start"] = start
+        act["seconds"] = seconds
+        act["climax"] = max(0.5, min(seconds - 0.4,
+                                     seconds * float(act["climax_fraction"])))
+        act["draw_end"] = 0.0
+        act["over_cap"] = max(0.0, seconds - MAX_ACT_SECONDS)
+    return acts
+
+
+def spoken_close(acts: Sequence[dict[str, Any]], payoff: str) -> tuple[str, int]:
+    """
+    (the sentence to append to the narration, how many words precede it).
+
+    The payoff is read aloud as the narration's last sentence. When the last
+    act already ends on it, nothing is appended and the card starts where the
+    act says it.
+    """
+    body = " ".join(str(act.get("thesis") or "").strip() for act in acts).split()
+    line = " ".join(str(payoff or "").split())
+    if not line:
+        return "", len(body)
+
+    def key(tokens: Sequence[str]) -> list[str]:
+        return [re.sub(r"[^a-z0-9]", "", token.lower()) for token in tokens]
+
+    tail = key(line.split())
+    if tail and key(body[-len(tail):]) == tail:
+        return "", len(body) - len(tail)
+    if line[-1] not in ".!?":
+        line += "."
+    return line, len(body)
 
 
 def plan_act_count(seconds: float) -> int:
@@ -2909,12 +3181,22 @@ CLOSING_FADE = 1.0
 # several callers and tests reach for it.
 CAPTION_LEAD_SECONDS = CLOSING_SECONDS
 
+# How long the card holds after the voice finishes reading the payoff, fade
+# included. The card used to sit silent for CLOSING_SECONDS; now the payoff is
+# spoken over it, and this is only the beat after the last word.
+SPOKEN_CLOSE_HOLD = 1.6
+
+# The least the card may be on screen when the payoff is spoken over it: long
+# enough to read the line once and see the ask under it.
+SPOKEN_CLOSE_MIN_VISIBLE = 3.4
+
 # What the closing card asks for. A video that argues something and then stops
 # has spent its whole retention budget and banked nothing.
 DEFAULT_CTA = "Follow for more"
 
 
-def closing_alpha_at(t: float, duration: float) -> float:
+def closing_alpha_at(t: float, duration: float,
+                     start: float | None = None) -> float:
     """
     How much of the frame the closing card owns at `t`, 0-1.
 
@@ -2922,7 +3204,8 @@ def closing_alpha_at(t: float, duration: float) -> float:
     scaled by the complement, so the two never share the frame -- same
     guarantee as the act handover, for the same reason.
     """
-    start = max(0.0, float(duration) - CLOSING_SECONDS)
+    if start is None or start <= 0:
+        start = max(0.0, float(duration) - CLOSING_SECONDS)
     if t <= start:
         return 0.0
     return min(1.0, (t - start) / max(CLOSING_FADE, 1e-6))
@@ -2938,7 +3221,10 @@ def draw_closing_card(frame: Frame, spec: dict[str, Any], alpha: float) -> None:
     """
     if alpha <= 0.01:
         return
-    line = str(spec.get("payoff") or "").upper()
+    # No trailing full stop: this is set like a title, three lines of 74px
+    # type with nothing after it, and the rules the model is given for titles
+    # say the same. A comma or semicolon at the end goes too.
+    line = str(spec.get("payoff") or "").upper().rstrip().rstrip(".,;:")
     cta = str(spec.get("cta") or DEFAULT_CTA)
 
     frame.reserved = True
@@ -2958,14 +3244,16 @@ def draw_closing_card(frame: Frame, spec: dict[str, Any], alpha: float) -> None:
         frame.reserved = False
 
 
-def annotation_alpha_at(t: float, duration: float) -> float:
+def annotation_alpha_at(t: float, duration: float,
+                        start: float | None = None) -> float:
     """
     How visible the scene's own labels are at `t`, 0-1.
 
     Full until the closing caption starts, then down to nothing over
     CAPTION_DUCK_SECONDS so the caption is never read against competing type.
     """
-    start = max(0.0, float(duration) - CAPTION_LEAD_SECONDS)
+    if start is None or start <= 0:
+        start = max(0.0, float(duration) - CAPTION_LEAD_SECONDS)
     if t < start:
         return 1.0
     return max(0.0, 1.0 - (t - start) / max(1e-6, CAPTION_DUCK_SECONDS))
@@ -3017,11 +3305,14 @@ def make_scene_frame(spec: dict[str, Any], t: float, duration: float) -> np.ndar
 def _draw_act(spec: dict[str, Any], act: dict[str, Any], local_t: float,
               act_seconds: float, t: float, duration: float) -> np.ndarray:
     """One act's frame, with the whole-video furniture on top."""
-    closing = closing_alpha_at(t, duration)
+    # When the payoff is spoken, the card starts where the voice does; when it
+    # is not, it owns the last CLOSING_SECONDS as it always has.
+    closing_at = _positive(spec.get("closing_at")) or None
+    closing = closing_alpha_at(t, duration, closing_at)
 
     frame = Frame(reuse=False)
     # The scene's labels clear out from under the closing card.
-    frame.annotation_alpha = annotation_alpha_at(t, duration)
+    frame.annotation_alpha = annotation_alpha_at(t, duration, closing_at)
     scene: SceneFn = TEMPLATES[str(act["template"])]["fn"]
     scene(frame, local_t, act, act_seconds)
     draw_titles(frame, act, local_t)
@@ -3316,7 +3607,11 @@ def build_minimalist_video(
     narrate: bool = False,
     voice: str = "Charon",
     tts_provider: str = "gemini",
-    tts_style: str = "Calm, certain, unhurried. Almost cold.",
+    # "Brisk", not "unhurried". Measured on one 133-word script: unhurried
+    # read at 1.90 words a second (114 a minute), brisk at 2.32 (139). Two
+    # separate reviews called the pace slow, and 139 is where short-form
+    # narration normally sits.
+    tts_style: str = "Calm and certain, at a brisk, confident pace. Almost cold.",
     captions: bool = True,
     progress_callback: ProgressFn | None = None,
 ) -> dict[str, Any]:
@@ -3349,6 +3644,8 @@ def build_minimalist_video(
     narration_path = ""
     narration_trimmed = 0.0
     narration_words: list[dict[str, Any]] = []
+    act_starts: list[float] | None = None
+    caption_timing = ""
 
     # With acts, the narration is the acts read end to end. It is synthesized
     # as one take rather than three: three takes joined leave an audible seam
@@ -3363,10 +3660,16 @@ def build_minimalist_video(
             thesis = joined
             spec["thesis"] = joined
 
+    # The payoff is the last thing said, not only the last thing shown.
+    close_line, close_index = ("", 0)
+    if spec.get("acts"):
+        close_line, close_index = spoken_close(spec["acts"], str(spec.get("payoff") or ""))
+    spoken_text = f"{thesis} {close_line}".strip() if close_line else thesis
+
     if narrate and thesis:
         stage("Stage 1/5 - Narration: synthesizing the thesis...")
         take = synthesize_narration(
-            thesis, provider=tts_provider, voice=voice,
+            spoken_text, provider=tts_provider, voice=voice,
             output_path=scratch_wav("mmvoice"), style=tts_style,
         )
         # No leading dead air: the voice starts on the first frame, with the
@@ -3388,6 +3691,8 @@ def build_minimalist_video(
             _SCRATCH_RENDERS.append(narration_path)
 
         spoken = float(cleaned["duration"])
+        caption_timing = str(take.get("timing_source")
+                             or ("exact" if take.get("timings_exact") else "estimated"))
 
         # Room for the whole argument AND the card that follows it.
         #
@@ -3397,7 +3702,35 @@ def build_minimalist_video(
         # screen while act 6's own thesis was still being read. The tail has to
         # be at least as long as the beat that lives in it.
         tail = CLOSING_SECONDS + 0.4
-        if spoken + tail > duration:
+
+        # Where the voice starts the payoff, and where each act's narration
+        # starts -- both read off the word timings, which are measured when the
+        # speech model is available. Any count mismatch falls back to the old
+        # timing rather than trusting an index into the wrong list.
+        expected = len(spoken_text.split())
+        timed = len(narration_words) == expected and spec.get("acts")
+        if timed and close_index < expected:
+            said = float(narration_words[close_index]["start"])
+            before = float(narration_words[close_index - 1]["end"]) if close_index else 0.0
+            # Timed so the card is fully black-to-visible as the first word of
+            # the payoff lands. The previous word's end is respected, but only
+            # up to a point: the recogniser tends to stretch a word's end into
+            # the pause after it, and trusting that would bring the card up
+            # halfway through the line it is supposed to arrive with.
+            lead_in = CLOSING_FADE * TRANSITION_BLACK_AT
+            closing_at = max(min(before, said - 0.15), said - lead_in)
+            spec["closing_at"] = closing_at
+            visible_from = closing_at + CLOSING_FADE * TRANSITION_BLACK_AT
+            tail = max(SPOKEN_CLOSE_HOLD,
+                       visible_from + SPOKEN_CLOSE_MIN_VISIBLE + END_FADE_SECONDS - spoken)
+        if timed:
+            counts = [len(str(act.get("thesis") or "").split()) for act in spec["acts"]]
+            firsts, cursor = [], 0
+            for count in counts:
+                firsts.append(float(narration_words[min(cursor, expected - 1)]["start"]))
+                cursor += count
+            act_starts = firsts
+        if spoken + tail > duration or spec.get("closing_at"):
             grown = min(MAX_DURATION, spoken + tail)
             # Keep the climax at the same point in the story, not the clock.
             spec["climax"] = float(spec["climax"]) * (grown / duration)
@@ -3418,9 +3751,13 @@ def build_minimalist_video(
 
     climax = float(spec["climax"])
 
-    # The runtime is final now, so the acts can be given their share of it.
+    # The runtime is final now, so the acts can be given their share of it --
+    # up to the card, which covers everything after.
     if spec.get("acts"):
-        spec["acts"] = allocate_acts(spec, duration)
+        span = duration
+        if spec.get("closing_at"):
+            span = float(spec["closing_at"]) + CLOSING_FADE * TRANSITION_BLACK_AT
+        spec["acts"] = allocate_acts(spec, span, act_starts)
 
     # --- 2. bed ------------------------------------------------------------
     tracks: list[Any] = []
@@ -3493,12 +3830,18 @@ def build_minimalist_video(
     # written the way it is -- reaches nobody with the sound off.
     subtitle_path = ""
     if captions and narration_words:
+        # The payoff is on the card in 74px type; captioning it underneath
+        # showed the same words twice, out of step with each other.
+        captioned = narration_words
+        if spec.get("closing_at") and 0 < close_index < len(narration_words):
+            captioned = narration_words[:close_index]
         subtitle_path = scratch_wav("mmsubs").replace(".wav", ".ass")
         write_ass_file(
-            narration_words, subtitle_path, size=CANVAS,
+            captioned, subtitle_path, size=CANVAS,
             position="bottom", margin_v=CAPTION_MARGIN_V,
             max_words=CAPTION_WORDS_PER_PHRASE,
             font_scale=CAPTION_FONT_SCALE,
+            figures=True,
         )
         _SCRATCH_RENDERS.append(subtitle_path)
 
@@ -3523,6 +3866,8 @@ def build_minimalist_video(
         "sfx": bool(sfx),
         "captions": bool(subtitle_path),
         "caption_words": len(narration_words) if subtitle_path else 0,
+        "caption_timing": caption_timing if subtitle_path else "",
+        "payoff_spoken": bool(close_line and spec.get("closing_at")),
         "thesis": thesis,
         "spec": spec,
         "publish": normalise_publish(spec),
