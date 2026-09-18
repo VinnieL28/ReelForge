@@ -1002,6 +1002,34 @@ def label(spec: dict[str, Any], slot: str, fallback: str = "",
     return fit_label(fallback or defaults.get(slot, ""), limit)[0]
 
 
+# The two halves a paired label may occupy, with a gap down the middle.
+#
+# 370px each. A label at the sixteen-character limit measures about 450px at
+# 34px with tracking, so it wraps to two lines inside its lane instead of
+# crossing into its partner -- which is what "AUTOMATIC CUE" and "CONSCIOUS
+# CHOICE" did, meeting exactly at x=475.
+LEFT_LANE: tuple[float, float] = (SAFE_X[0], 470.0)
+RIGHT_LANE: tuple[float, float] = (530.0, SAFE_X[1])
+
+
+def lane_label(frame: Frame, text: str, lane: tuple[float, float], y: float,
+               size: int, colour: tuple[int, int, int],
+               tracking: float = 4.0) -> None:
+    """
+    One label of a pair, kept inside its own half of the frame.
+
+    Wraps rather than overflowing, because the alternative is two labels that
+    touch and read as one. Used by every template that names two things at
+    once.
+    """
+    if not text:
+        return
+    lo, hi = lane
+    frame.wrapped(text, ((lo + hi) / 2.0, y), size=size, colour=colour,
+                  weight="bold", max_width=hi - lo, leading=1.12,
+                  tracking=tracking)
+
+
 def draw_ambient(frame: Frame, t: float, phases: Phases, spec: dict[str, Any]) -> None:
     """The background pass every template runs before its own geometry."""
     level = float(spec.get("ambient", 1.0) or 0.0)
@@ -1986,6 +2014,7 @@ def scene_climb(frame: Frame, t: float, spec: dict[str, Any], duration: float) -
 # either the scene or the clamp having to know about the other.
 _MIRROR_FLOOR = 1250.0
 _MIRROR_CAPTION_Y = _MIRROR_FLOOR + 46.0
+
 _MIRROR_GAP_Y = 880.0            # above the real figure's head (~930)
 _MIRROR_BOX = (560.0, 560.0, 960.0, _MIRROR_FLOOR)   # left, top, right, bottom
 
@@ -2002,8 +2031,12 @@ def scene_mirror(frame: Frame, t: float, spec: dict[str, Any], duration: float) 
     rig.draw_figure(frame, "idle", phase=(t * 0.35) % 1.0,
                     anchor=(300, _MIRROR_FLOOR),
                     height=320, colour=GREY, weight=6.0, facing=1)
-    frame.text(label(spec, "real"), (300, _MIRROR_CAPTION_Y), 34,
-               mix(GREY, fade(t, ph.lead + 0.3, 0.6)), tracking=4)
+    # Left-aligned inside its own lane. Both captions were centred -- one on
+    # the figure at x=300, one on the mirror at x=760 -- and with labels near
+    # the sixteen-character limit their boxes met exactly at x=475, so
+    # "AUTOMATIC CUE" and "CONSCIOUS CHOICE" read as one run of text.
+    lane_label(frame, label(spec, "real"), LEFT_LANE, _MIRROR_CAPTION_Y, 34,
+               mix(GREY, fade(t, ph.lead + 0.3, 0.6)))
 
     # The mirror.
     frame.rect((left, top, right, bottom), mix(WHITE, 0.75), width=7, radius=14)
@@ -2022,8 +2055,8 @@ def scene_mirror(frame: Frame, t: float, spec: dict[str, Any], duration: float) 
         frame.circle(skeleton.head, skeleton.head_radius * (1.7 + ring * 0.85),
                      mix(WHITE, glow_level * 0.30 / (ring + 1)), 3)
 
-    frame.text(label(spec, "imagined"), ((left + right) / 2, _MIRROR_CAPTION_Y), 36,
-               mix(WHITE, fade(t, ph.lead + 0.8, 0.6) * glow_level), tracking=4)
+    lane_label(frame, label(spec, "imagined"), RIGHT_LANE, _MIRROR_CAPTION_Y, 36,
+               mix(WHITE, fade(t, ph.lead + 0.8, 0.6) * glow_level))
 
     # The gap between them, stated at the beat. Above the two captions rather
     # than level with the knees.
@@ -2081,7 +2114,11 @@ def _anchor_block(frame: Frame, centre: tuple[float, float], size: float,
         inset = top + (base - top) * share
         frame.line((x - inset, band_y), (x + inset, band_y), mix(colour, 0.42), 3)
     if text:
-        frame.text(text, (x, y + half * 0.7 + 52 + text_drop), 26, colour, tracking=2)
+        # Whichever half of the frame this block sits in. Two named weights at
+        # the character limit were 328px and 364px wide and overlapped by 36.
+        lane = LEFT_LANE if x < 540 else RIGHT_LANE
+        lane_label(frame, text, lane, y + half * 0.7 + 52 + text_drop, 26,
+                   colour, tracking=2)
 
 
 def scene_chains(frame: Frame, t: float, spec: dict[str, Any], duration: float) -> None:
@@ -2229,10 +2266,10 @@ def scene_growth(frame: Frame, t: float, spec: dict[str, Any], duration: float) 
         if dy < floor:
             frame.circle((dx, dy), 6, mix(GREY, 1.0 - drop * 0.6))
 
-    frame.text(label(spec, "input"), (300, floor + 46), 30,
+    lane_label(frame, label(spec, "input"), LEFT_LANE, floor + 46, 30,
                mix(GREY, fade(t, ph.lead + 0.4, 0.6)), tracking=4)
     if growth > 0.7:
-        frame.text(label(spec, "output"), (_PLANT_ROOT[0], floor + 46), 34,
+        lane_label(frame, label(spec, "output"), RIGHT_LANE, floor + 46, 34,
                    mix(WHITE, clamp((growth - 0.7) / 0.25)), tracking=4)
 
 
@@ -2531,10 +2568,10 @@ def scene_doors(frame: Frame, t: float, spec: dict[str, Any], duration: float) -
     # Gated on `reveal`, which is how far the doors themselves have drawn.
     # These two used to fade in on a clock of their own, so "COMFORT" appeared
     # at 41s naming a door that did not finish drawing until 43.
-    frame.text(label(spec, "left"), (_DOOR_LEFT_X, floor + 70), 34,
+    lane_label(frame, label(spec, "left"), LEFT_LANE, floor + 70, 34,
                mix(GREY, fade(t, ph.lead + 0.3, 0.6) * reveal * (1.0 - 0.4 * chosen)),
                tracking=4)
-    frame.text(label(spec, "right"), (_DOOR_RIGHT_X, floor + 70), 38,
+    lane_label(frame, label(spec, "right"), RIGHT_LANE, floor + 70, 38,
                mix(WHITE, fade(t, ph.lead + 0.5, 0.6) * reveal), tracking=4)
 
     # The figure starts between the doors and walks to the lit one, then keeps

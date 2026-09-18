@@ -36,9 +36,21 @@ COPY = {
     "thesis": "word " * 24,
 }
 
+# The longest label the engine will draw, at the character limit.
+#
+# The sweep used to label every slot "ACTIVE 88 PERCENT", which fit_label
+# shortens to "ACTIVE 88%" -- ten characters. So it tested short labels and
+# passed while a real render drew "AUTOMATIC CUE" and "CONSCIOUS CHOICE" into
+# each other. Sixteen characters of wide letters is the worst case that can
+# actually reach a frame.
+WIDEST_LABEL = "AUTOMATIC CUE XW"[:me.LABEL_MAX_CHARS]
+
 
 def _act(template: str, **extra) -> dict:
-    act = me.normalise_act({"template": template, **COPY, **extra})
+    slots = me.LABEL_SLOTS.get(template) or {}
+    labels = {slot: WIDEST_LABEL for slot in slots}
+    act = me.normalise_act({"template": template, "labels": labels,
+                            **COPY, **extra})
     act.update({"seconds": ACT_SECONDS, "start": 0.0,
                 "climax": ACT_SECONDS * 0.75})
     return act
