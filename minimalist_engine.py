@@ -623,6 +623,22 @@ class Frame:
             self.draw.text((x, y * s), ch, font=font, fill=colour, anchor="lm")
             x += w + gap
 
+    def fitted_size(self, body: str, sizes: Sequence[int], max_width: float,
+                    weight: str = "bold", tracking: float = 0.0) -> int:
+        """
+        The largest of `sizes` that sets `body` on one line, else the smallest.
+
+        Measured with the face that will draw it, so it is the real width and
+        not an estimate from the character count.
+        """
+        for size in sizes:
+            font = load_face(int(size * self.ss), weight)
+            width = (self.draw.textlength(body, font=font)
+                     + tracking * self.ss * max(0, len(body) - 1))
+            if width <= max_width * self.ss:
+                return int(size)
+        return int(sizes[-1])
+
     def wrapped(self, body: str, centre: tuple[float, float], size: int = 44,
                 colour: tuple[int, int, int] = WHITE, weight: str = "light",
                 max_width: float = 860.0, leading: float = 1.28,
@@ -657,6 +673,23 @@ class Frame:
                 current = word
         if current:
             lines.append(current)
+
+        # A greedy wrap leaves "THE AUTOMATIC / DEFAULT" -- one word alone on
+        # the second line. For two lines, the split that makes them closest in
+        # width reads as a designed break instead of an accident.
+        if len(lines) == 2:
+            words = body.split()
+            best = None
+            for cut in range(1, len(words)):
+                head = " ".join(words[:cut])
+                tail = " ".join(words[cut:])
+                if measured(head) > limit or measured(tail) > limit:
+                    continue
+                spread = abs(measured(head) - measured(tail))
+                if best is None or spread < best[0]:
+                    best = (spread, [head, tail])
+            if best is not None:
+                lines = best[1]
 
         step = size * leading
         top = centre[1] - step * (len(lines) - 1) / 2
@@ -982,27 +1015,48 @@ def draw_ambient(frame: Frame, t: float, phases: Phases, spec: dict[str, Any]) -
 # Shared furniture
 # ---------------------------------------------------------------------------
 
-def draw_titles(frame: Frame, spec: dict[str, Any], t: float) -> None:
+# Sizes a title may be set at, largest first.
+#
+# Balancing a two-line wrap fixed "RESTRUCTURING THE / CUE" and could not fix
+# "THE AUTOMATIC / DEFAULT" -- three words, one of them long, and every split
+# leaves an orphan. One line at 64 or 58 has no orphan to fix, and the drop is
+# small enough that nobody reads it as a different size; a title too long for
+# even the smallest still wraps, balanced.
+TITLE_SIZES: tuple[int, ...] = (72, 64, 58)
+
+
+def draw_titles(frame: Frame, spec: dict[str, Any], t: float,
+                instant: bool = False) -> None:
     """
     Title and subtitle, fading in over the first beat.
 
     Quickly. This used to take 0.85s to reach full, which on the opening act is
     a third of the time the viewer is deciding with, spent on a fade.
+
+    `instant` skips the fade altogether, and the opening act sets it. Even at
+    0.35s the title band measured 40/255 at t=0 on a delivered render -- and
+    frame zero is the thumbnail every platform picks by default, and the frame
+    the scroll decision is made on. Five dominoes on black is not a hook.
     """
-    alpha = fade(t, 0.05, attack=0.35)
+    alpha = 1.0 if instant else fade(t, 0.05, attack=0.35)
     if alpha <= 0.01:
         return
     title = str(spec.get("title") or "").upper()
     subtitle = str(spec.get("subtitle") or "")
-    frame.wrapped(title, (frame.w / 2, 300), size=72, colour=mix(WHITE, alpha),
-                  weight="bold", max_width=900, leading=1.15)
+    frame.wrapped(title, (frame.w / 2, 300), size=frame.fitted_size(
+                      title, TITLE_SIZES, 900, weight="bold"),
+                  colour=mix(WHITE, alpha), weight="bold",
+                  max_width=900, leading=1.15)
     if subtitle:
         # 44, not 38, and mixed brighter. At 38px light grey it was the
         # smallest type in the frame on the device most of the audience is
         # holding -- the report called it "too small/thin for mobile", and a
         # subtitle nobody reads is a line of the argument thrown away.
-        frame.wrapped(subtitle, (frame.w / 2, 432), size=44,
-                      colour=mix((170, 170, 170), fade(t, 0.30, attack=0.45)),
+        # 48 now, and brighter still: at 44px and 170 grey a reviewer
+        # reading a delivered render on a phone still could not make it out.
+        frame.wrapped(subtitle, (frame.w / 2, 436), size=48,
+                      colour=mix((205, 205, 205),
+                                 1.0 if instant else fade(t, 0.30, attack=0.45)),
                       weight="light", max_width=880)
 
 
@@ -1183,8 +1237,26 @@ def scene_vessel(frame: Frame, t: float, spec: dict[str, Any], duration: float) 
     else:
         start, end = 0.0, clamp(end_value or 1.0)
         level = clamp(start + (end - start) * curve)
+    try:
+        multiple = float(spec.get("end_multiple") or 0.0)
+    except (TypeError, ValueError):
+        multiple = 0.0
     # What the counter says. Draining counts what is left, as a share.
-    readout = f"{100.0 * level:.0f}%" if draining else f"{growth:.2f}x"
+    # What the counter says.
+    #
+    # It used to print `growth` -- 1.01^365, which reaches 37.78x -- for every
+    # filling act, whatever the act was about. That figure belongs to the "one
+    # percent a day" argument this template was written for; on a habits video
+    # it appeared over "150,000 choices compound over thirty years" as a number
+    # from nowhere, and was read as a claim. A multiple is now shown only when
+    # the plan supplies one, which it is told to do only if the narration says
+    # it. Otherwise the counter reads what it can prove: how full the vessel is.
+    if draining:
+        readout = f"{100.0 * level:.0f}%"
+    elif multiple > 1.0:
+        readout = f"{1.0 + (multiple - 1.0) * curve:.2f}x"
+    else:
+        readout = f"{100.0 * level:.0f}%"
 
     # Fluid first, so the outline sits on top of it.
     if level > 0.002:
@@ -1653,7 +1725,10 @@ _DOMINO_COUNT = 6
 _DOMINO_GROWTH = 1.46               # last tile is ~6.6x the first
 _DOMINO_GAP = 0.55                  # gap as a fraction of the tile that pushes
 _DOMINO_BOX = (90.0, 990.0)         # left, right
-_DOMINO_FLOOR = 1330.0
+# 1200, not 1330. The "first" label goes under the floor line, and at 1330
+# that put it at y=1404 -- below TEXT_SAFE_Y, so the clamp hoisted it back up
+# into the tiles it was labelling.
+_DOMINO_FLOOR = 1200.0
 _DOMINO_MAX_H = 520.0
 
 
@@ -1728,8 +1803,10 @@ def scene_dominoes(frame: Frame, t: float, spec: dict[str, Any], duration: float
                    (tip - 12 + nudge * 56, _DOMINO_FLOOR - tiles[0][1] * 0.7),
                    mix(GREY, 1.0 - nudge), 7)
 
-    frame.text(label(spec, "first"), (tiles[0][0] + 60, _DOMINO_FLOOR + 74), 32,
-               mix(GREY, fade(t, ph.lead, 0.5)), tracking=4)
+    # Left-aligned from the box edge: centred on the first tile it ran off
+    # the left of the frame and the clamp pushed it back across the tiles.
+    frame.text(label(spec, "first"), (_DOMINO_BOX[0], _DOMINO_FLOOR + 62), 32,
+               mix(GREY, fade(t, ph.lead, 0.5)), tracking=4, align="left")
     last_x, last_h, _ = tiles[-1]
     frame.text(label(spec, "last"), (min(last_x + 40, frame.w - 170), _DOMINO_FLOOR - last_h - 60), 38,
                mix(WHITE, fade(t, ph.impact - 0.5, 0.6)), tracking=4)
@@ -2868,6 +2945,10 @@ def normalise_act(raw: dict[str, Any]) -> dict[str, Any]:
                       in ("drain", "down", "loss", "decreasing") else "fill"),
         "axis_max": max(1, int(raw.get("axis_max") or 365)),
         "end_value": _positive(raw.get("end_value")),
+        # A multiple the narration actually states, for the vessel's counter.
+        # Absent, the counter shows how full the vessel is instead of a figure
+        # nobody claimed.
+        "end_multiple": _positive(raw.get("end_multiple")),
         "axis_suffix": str(raw.get("axis_suffix") or "d").strip()[:3],
         "ambient": max(0.0, min(1.5, float(raw.get("ambient", 1.0) or 0.0))),
         "climax_fraction": max(0.15, min(0.9, fraction)),
@@ -3315,7 +3396,7 @@ def _draw_act(spec: dict[str, Any], act: dict[str, Any], local_t: float,
     frame.annotation_alpha = annotation_alpha_at(t, duration, closing_at)
     scene: SceneFn = TEMPLATES[str(act["template"])]["fn"]
     scene(frame, local_t, act, act_seconds)
-    draw_titles(frame, act, local_t)
+    draw_titles(frame, act, local_t, instant=float(act.get("start") or 0.0) <= 0.001)
     draw_progress(frame, t, duration)
     base = frame.finish()
 

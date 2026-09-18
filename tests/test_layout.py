@@ -277,3 +277,109 @@ class TestNoLabelIsDrawnAcrossAFigure:
                     assert not me.text_boxes_overlap((x0, y0, x1, y1), figure), (
                         f"{template} at t={t:.1f}s drew {body!r} across a figure "
                         f"at {tuple(round(v) for v in figure)}")
+
+class TestThePictureClaimsNothingOfItsOwn:
+    """
+    The vessel printed "37.78x" on every filling act. That is 1.01^365 -- the
+    figure the template was written to illustrate, hardcoded -- and on a video
+    about habits it appeared over "150,000 choices compound over thirty years"
+    as a statistic from nowhere, in 66px type. A reviewer read it as a claim
+    the video was making, which is exactly what it looked like.
+    """
+
+    @staticmethod
+    def _readout(**extra) -> list[str]:
+        act = me.normalise_act({"template": "compounding_jar", "title": "T",
+                                "subtitle": "s", "thesis": "word " * 20,
+                                "labels": {}, "axis_max": 30,
+                                "axis_suffix": "y", **extra})
+        act.update({"seconds": 11.0, "start": 0.0, "climax": 8.0})
+        frame = me.Frame()
+        me.scene_vessel(frame, 10.4, act, 11.0)
+        return [box[0] for box in frame.text_boxes]
+
+    def test_no_multiple_is_shown_unless_the_plan_states_one(self):
+        assert not any("x" in text and any(c.isdigit() for c in text)
+                       for text in self._readout()), self._readout()
+
+    def test_the_counter_still_says_something_true(self):
+        """How full the vessel is, which the picture can prove."""
+        assert "100%" in self._readout()
+
+    def test_a_stated_multiple_is_shown(self):
+        assert "2.40x" in self._readout(end_multiple=2.4)
+
+    def test_a_draining_act_reads_as_a_share(self):
+        texts = self._readout(direction="drain", end_value=0.75)
+        assert any(text.endswith("%") for text in texts), texts
+
+
+class TestTheFirstFrameIsAThumbnail:
+    """
+    Frame zero is what every platform picks as the thumbnail and what the
+    scroll decision is made on. Measured on a delivered render, the title band
+    held a maximum brightness of 40 of 255 at t=0 -- five dominoes on black --
+    and reached 255 by t=0.2.
+    """
+
+    def test_the_opening_title_is_up_on_the_first_frame(self):
+        import numpy as np
+
+        act = me.normalise_act({"template": "domino_chain", "title": "The automatic default",
+                                "subtitle": "43 percent of daily behaviour is habit.",
+                                "thesis": "word " * 20})
+        frame = me.Frame()
+        me.draw_titles(frame, act, 0.0, instant=True)
+        band = np.asarray(frame.finish())[240:540]
+        assert band.max() > 200, f"title band peaked at {band.max()}"
+
+    def test_a_later_act_still_fades_its_title_in(self):
+        """Only the opening act skips the fade. Mid-video, a title appearing
+        instantly reads as a cut rather than as a new beat."""
+        import numpy as np
+
+        act = me.normalise_act({"template": "domino_chain", "title": "The second act",
+                                "subtitle": "s", "thesis": "word " * 20})
+        frame = me.Frame()
+        me.draw_titles(frame, act, 0.0, instant=False)
+        assert np.asarray(frame.finish())[240:540].max() < 60
+
+    def test_the_first_act_is_the_one_that_gets_it(self):
+        import inspect
+
+        source = inspect.getsource(me._draw_act)
+        assert 'instant=float(act.get("start") or 0.0) <= 0.001' in source
+
+
+class TestTitlesFitBeforeTheyWrap:
+
+    @pytest.mark.parametrize("title", [
+        "THE AUTOMATIC DEFAULT",
+        "RESTRUCTURING THE CUE",
+        "THE CROSSOVER YEAR",
+    ])
+    def test_a_three_word_title_sets_on_one_line(self, title):
+        """
+        Balancing the wrap could not help these: three words with one long one
+        orphans whichever way it splits. A step down in size removes the
+        second line entirely.
+        """
+        frame = me.Frame()
+        size = frame.fitted_size(title, me.TITLE_SIZES, 900, weight="bold")
+        frame.wrapped(title, (540, 300), size=size, max_width=900,
+                      weight="bold", leading=1.15)
+        assert len(frame.text_boxes) == 1, [b[0] for b in frame.text_boxes]
+
+    def test_the_largest_size_is_used_when_it_fits(self):
+        frame = me.Frame()
+        assert frame.fitted_size("SHORT", me.TITLE_SIZES, 900) == me.TITLE_SIZES[0]
+
+    def test_a_long_title_wraps_balanced_rather_than_orphaning(self):
+        frame = me.Frame()
+        frame.wrapped("THE ILLUSION OF OUTPERFORMANCE", (540, 300), size=58,
+                      max_width=900, weight="bold", leading=1.15)
+        lines = [box[0] for box in frame.text_boxes]
+        assert len(lines) == 2
+        assert min(len(line.split()) for line in lines) >= 1
+        widths = [box[3] - box[1] for box in frame.text_boxes]
+        assert max(widths) / min(widths) < 2.2, lines

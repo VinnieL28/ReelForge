@@ -1411,6 +1411,12 @@ WEAK_PHRASE_ENDINGS: frozenset[str] = frozenset({
     "of", "to", "in", "on", "at", "for", "with", "by", "from", "as", "into",
     "over", "per", "like", "your", "my", "our", "their", "his", "her", "its",
     "is", "are", "was", "were", "be", "this", "these", "those", "every",
+    # Added after a render broke on "CUE DIRECTLY RATHER" and "SEQUENCE
+    # WITHOUT ACTIVE": the list had the prepositions and none of the adverbs.
+    "rather", "without", "whether", "toward", "towards", "unless", "while",
+    "upon", "about", "after", "before", "between", "during", "through",
+    "under", "across", "against", "within", "until", "since", "because",
+    "though", "although", "when", "where", "which", "own", "more", "less",
 })
 
 # Words that belong to the figure before them. "FAIL OVER 15 / YEARS" put a

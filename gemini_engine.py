@@ -1091,6 +1091,38 @@ in its thesis. A video titled "the year X happens" that never names a year has
 broken its own promise, and the viewer who came for the number leaves without
 it. Decide the figure first, then build the act that lands it.
 
+HOW THE SENTENCES HAVE TO READ. Three rules, each from a delivered render.
+
+  LENGTH. The first sentence is at most 12 words and opens ON the figure. One
+  render began "Forty-three percent of daily human actions occur without
+  conscious decision, executing as automatic neural chunks that bypass
+  executive deliberation entirely once an environmental cue appears" -- 25
+  words, and the scroll decision is made in three. "Forty-three percent of
+  your day is automatic." is the same claim in eight.
+
+  Every other sentence is at most 16 words, and long ones carry a comma. The
+  captions break at punctuation, so a sentence with none in it breaks in the
+  middle of a thought: that same render produced "43% OF DAILY" and "INTO THE
+  BASAL" on screen.
+
+  PLAIN WORDS. No term a fifteen-year-old would not know, unless the same
+  sentence defines it. "Prefrontal control", "executive deliberation" and
+  "automatic neural chunks" all reached a delivered video.
+
+  NO INVENTED AGGREGATES. "Approximately one hundred fifty thousand repeated
+  choices over thirty years" has no source and sounds like it has one. If you
+  did not read a figure somewhere, do not state one -- and never compute a
+  figure yourself, because arithmetic done in a sentence comes out wrong: one
+  render claimed a 2% fee overtakes returns in "year twenty-three" when it is
+  year 31, and that it destroys "three hundred sixty thousand dollars" of a
+  million-dollar portfolio when it destroys 3.46 million.
+
+  NO CONTESTED FINDINGS AS FACT. Ego depletion -- willpower as a resource that
+  fatigue uses up -- has largely failed to replicate, and a render asserted it
+  flatly. The same goes for power posing, the Stanford prison experiment,
+  priming effects on behaviour, and learning styles. Where a finding is
+  disputed, either say so or choose a different mechanism.
+
 LABEL THE RANKED TEMPLATES IN THE RIGHT ORDER. comparison_split fills only
 its bottom bar, so tier3 is the row that WINS. A fees video labelled it
 "SPIVA 92% LAG" and the picture then showed a failure statistic winning:
@@ -1112,6 +1144,12 @@ climbing to 9.75x, which told the viewer the opposite of the narration. So:
      {{"axis_max": 30, "axis_suffix": "y"}} for something that plays out over
      thirty years, {{"axis_max": 90, "axis_suffix": "d"}} for ninety days.
      Compounding in money is a decades-long argument.
+  "end_multiple": for compounding_jar ONLY, and only when the narration states
+     the multiple out loud -- 2.4 for "your money two and a half times over".
+     Leave it out otherwise: the counter then shows how full the vessel is
+     rather than a figure nobody claimed. It used to print 37.78x on every
+     filling act, which is 1.01^365, and on a habits video that was a
+     statistic from nowhere in 66px type.
   "end_value": 0.0-1.0, where the quantity ENDS as a share of where it began.
      A 1% annual fee over thirty years leaves about 0.75, so write 0.75 -- not
      0, which would say the fee took everything. Overstating it is as wrong as
@@ -1127,6 +1165,7 @@ Return ONE JSON object and nothing else:
      "labels": {{}},
      "direction": "fill" | "drain",
      "axis_max": 30, "axis_suffix": "y", "end_value": 0.75,
+     "end_multiple": 0,
      "thesis": "this act's narration"}},
    ... exactly {act_count} ...
  ],
@@ -1216,6 +1255,13 @@ def relabel_note(titles: Sequence[str]) -> str:
     )
 
 
+def _positive_float(value: Any) -> float:
+    try:
+        return max(0.0, float(value or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def parse_scene_plan(raw: str, acts: int = 0, concept: str = "") -> dict[str, Any]:
     """
     Validates a multi-act plan into something normalise_spec can take.
@@ -1256,6 +1302,7 @@ def parse_scene_plan(raw: str, acts: int = 0, concept: str = "") -> dict[str, An
             "axis_max": axis_max,
             "axis_suffix": str(entry.get("axis_suffix") or "d").strip()[:3],
             "end_value": end_value,
+            "end_multiple": _positive_float(entry.get("end_multiple")),
             "thesis": thesis,
         })
 
