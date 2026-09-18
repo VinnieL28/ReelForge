@@ -700,6 +700,23 @@ def render_checks(result: dict[str, Any] | None,
     # own placeholder copy, which is how a short about fund fees carried
     # "WHO YOU ARE / WHO YOU THINK".
     acts = spec.get("acts") or []
+
+    # A finished render with no acts is one metaphor held for the whole
+    # minute -- either the multi-act plan failed and the caller fell back, or
+    # a single template was asked for by name. Both look the same on screen
+    # and both lose the viewer, so this reads as a failure either way rather
+    # than guessing which happened.
+    #
+    # Gated on `duration`, which every finished render has: this check used to
+    # live inside `if acts:` and simply vanished when there were no acts, so
+    # the one render it should have caught showed a clean card. Firing it with
+    # no duration would be the opposite mistake -- a false failure about a
+    # render this function cannot see.
+    if not acts and duration > 0:
+        add("act_count", False, "Enough scenes to hold a minute",
+            "1 scene for the whole video — one piece of geometry cannot hold "
+            "a minute, and its script comes from the single-scene prompt")
+
     if acts:
         try:
             from minimalist_engine import LABEL_SLOTS, missing_label_slots

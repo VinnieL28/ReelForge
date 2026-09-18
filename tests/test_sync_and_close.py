@@ -587,3 +587,72 @@ class TestPromptRules:
 
     def test_the_payoff_is_written_to_be_said(self, prompt):
         assert "payoff is read aloud" in prompt
+
+class TestAFailedPlanCannotHide:
+    """
+    The six-act plan failed once, transiently -- the same concept planned fine
+    on the next attempt -- and the render fell back to a single metaphor held
+    for 71 seconds, with a script from the single-scene prompt that carries
+    none of the evidence rules. Domain Specificity came back 3.0: one
+    checkable detail in 150 words.
+
+    The card looked normal. Both checks that would have caught it lived inside
+    `if acts:` and simply were not rendered, because there were no acts. A
+    check that disappears when the thing it guards is missing is not a check.
+    """
+
+    @staticmethod
+    def _checks(spec):
+        return compliance.render_checks({
+            "duration": 71.3, "captions": True, "caption_words": 150,
+            "caption_timing": "measured", "fps": 30,
+            "loudness": {"after": {"lufs": -14.3}}, "spec": spec})
+
+    def test_a_render_with_no_acts_fails_loudly(self):
+        checks = self._checks({"template": "comparison_split"})
+        failing = {check["key"] for check in compliance.failing_checks(checks)}
+        assert "act_count" in failing
+
+    def test_the_failure_says_what_happened(self):
+        checks = self._checks({"template": "comparison_split"})
+        detail = next(c["detail"] for c in checks if c["key"] == "act_count")
+        assert "1 scene" in detail and "single-scene prompt" in detail
+
+    def test_it_stays_quiet_when_there_was_no_render_at_all(self):
+        """The opposite mistake: a false failure about something this cannot
+        see. An empty result must produce no checks."""
+        assert compliance.render_checks({}) == []
+        assert compliance.render_checks({"spec": {"template": "two_doors"}}) == []
+
+    def test_a_planned_render_still_passes(self):
+        acts = [{"template": "compounding_jar", "title": "A", "labels": {"unit": "YEAR"}},
+                {"template": "two_doors", "title": "B",
+                 "labels": {"left": "L", "right": "R", "through": "T"}},
+                {"template": "balance_scale", "title": "C", "labels": {"left": "L", "right": "R"}},
+                {"template": "gravity_funnel", "title": "D", "labels": {"pull": "P"}},
+                {"template": "split_path", "title": "E",
+                 "labels": {"near": "N", "far": "F", "easy": "E"}},
+                {"template": "domino_chain", "title": "F",
+                 "labels": {"first": "1", "last": "2"}}]
+        checks = self._checks({"acts": acts})
+        assert not [c for c in compliance.failing_checks(checks)
+                    if c["key"] == "act_count"]
+
+    def test_the_planner_asks_twice_before_giving_up(self):
+        """The caller's fallback is so much worse than any plan that another
+        round of asking is cheap by comparison."""
+        import inspect
+
+        import gemini_engine as ge
+
+        source = inspect.getsource(ge.generate_scene_plan)
+        assert "MODEL_CANDIDATES * 2" in source
+
+    def test_the_fallback_tells_the_user(self):
+        import inspect
+
+        import app
+
+        source = inspect.getsource(app._magic_minimalist)
+        assert "fell_back = True" in source
+        assert "weaker than usual" in source

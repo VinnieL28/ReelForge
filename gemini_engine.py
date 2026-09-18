@@ -1361,7 +1361,13 @@ def generate_scene_plan(concept: str,
     prompt = build_scene_plan_prompt(concept, acts=count, duration=duration)
     last: Exception | None = None
 
-    for model in MODEL_CANDIDATES:
+    # Two rounds of the candidates, not one.
+    #
+    # The caller's fallback is a single metaphor held for the whole video --
+    # much worse than any plan -- so another round of asking is cheap by
+    # comparison. A delivered render lost its six acts to a failure that the
+    # very next attempt on the same concept did not reproduce.
+    for model in MODEL_CANDIDATES * 2:
         try:
             if progress:
                 progress(f"Asking {model} for a {count}-act plan...")

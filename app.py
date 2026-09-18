@@ -6768,13 +6768,21 @@ def _magic_minimalist(prompt: str, ctx: dict[str, Any], report: Report) -> dict[
     """
     concept = magic_studio.scene_concept(prompt)
 
-    report("script", 0.2, "Writing Hook \u2014 planning three acts...")
+    report("script", 0.2, "Writing Hook — planning the scenes...")
+    fell_back = False
     try:
         spec = gemini_engine.generate_scene_plan(concept)
     except Exception:
-        # One metaphor still renders a video. A failed plan is a worse video,
-        # not a failed render.
-        report("script", 0.5, "Writing Hook \u2014 planning one scene...")
+        # One metaphor still renders a video. A failed plan is a worse
+        # video, not a failed render -- but it IS a worse video, and this
+        # used to happen in silence: one piece of geometry held for 71
+        # seconds, and a script from the single-scene prompt, which
+        # carries none of the evidence rules the plan prompt does. The
+        # render checks fail on it now, and so does this line.
+        fell_back = True
+        report("script", 0.5,
+               "Writing Hook — the multi-act plan failed; falling back "
+               "to ONE scene. This render will be weaker than usual.")
         spec = generate_scene_spec(concept)
     report("script", 1.0)
 
@@ -6818,6 +6826,7 @@ def _magic_minimalist(prompt: str, ctx: dict[str, Any], report: Report) -> dict[
     # for had nothing to read.
     return {"path": out_path, "duration": float(result["duration"]),
             "script": str(spec.get("thesis") or concept), "entry": entry,
+            "fell_back": fell_back,
             "render": {key: value for key, value in result.items()
                        if key != "output_path"}}
 
